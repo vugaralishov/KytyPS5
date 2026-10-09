@@ -758,6 +758,18 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+// RDNA2 DPP16 controls: quad_perm, row_shl/shr/ror 1-15, row_mirror, row_half_mirror, row_share
+// and row_xmask. Everything else (including the GFX9 wave shifts/broadcasts) is reserved.
+bool IsValidDppOperand(const Operand& operand) {
+	if (operand.dpp8) {
+		return true;
+	}
+	const auto ctrl = operand.dpp_ctrl;
+	return ctrl <= 0xffu || (ctrl >= 0x101u && ctrl <= 0x10fu) ||
+	       (ctrl >= 0x111u && ctrl <= 0x11fu) || (ctrl >= 0x121u && ctrl <= 0x12fu) ||
+	       ctrl == 0x140u || ctrl == 0x141u || (ctrl >= 0x150u && ctrl <= 0x16fu);
+}
+
 void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 	operand.dpp = true;
 	if (encoding == 233u) {
@@ -794,6 +806,10 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src_count = 1;
 
+	if (!IsValidDppOperand(inst.src0)) {
+		SetUnsupported(inst, Family::VOP1, opcode, "VOP1 DPP control is reserved");
+		return;
+	}
 	if (!IsVop1FloatSourceOpcode(inst.opcode) && (inst.src0.negate || inst.src0.absolute)) {
 		SetUnsupported(inst, Family::VOP1, opcode,
 		               "VOP1 DPP integer source modifiers are not supported");
@@ -1148,6 +1164,10 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
+	if (!IsValidDppOperand(inst.src0)) {
+		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 DPP control is reserved");
+		return;
+	}
 	if (!inst.src0.dpp8) {
 		inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 		inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
@@ -1262,6 +1282,10 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
+	if (!IsValidDppOperand(inst.src0)) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP control is reserved");
+		return;
+	}
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
 	inst.src_count     = 2;

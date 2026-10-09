@@ -287,7 +287,11 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	if (f.remapped) {
+		// SDL already reports buttons and axes through the new mapping; nothing to rebind.
+		LOGF("Controller %d: mapping changed\n", f.id);
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {

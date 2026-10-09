@@ -25,7 +25,7 @@
             "request": "launch",
             "program": "${workspaceFolder}\\_Build\\vscode-clang\\kyty_emulator.exe",
             "args": [
-                "--game", "D:/gamesps5/PPSA07429",
+                "--game", "${input:gameDirectory}",
                 "--printf-direction", "File",
                 "--graphics-debug-dump", "True"
             ],
@@ -66,6 +66,13 @@
                     }
                 ]
             }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "gameDirectory",
+            "type": "promptString",
+            "description": "Game directory or archive passed to kyty_emulator --game"
         }
     ]
 }

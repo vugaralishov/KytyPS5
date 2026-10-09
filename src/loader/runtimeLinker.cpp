@@ -31,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -115,6 +116,8 @@ struct RelocationInfo {
 	std::string name;
 	std::string dbg_name;
 	bool        bind_self = false;
+	bool        tls       = false;
+	uint32_t    size      = 8; // bytes patched at vaddr
 };
 
 struct StubbedImportRecord {
@@ -127,6 +130,8 @@ struct StubbedImportRecord {
 	std::string program;
 };
 
+// Guest threads read records from the stub while other threads load modules and append to it.
+static Common::Mutex                    g_stubbed_imports_mutex;
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
@@ -178,6 +183,8 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
+	Common::LockGuard lock(g_stubbed_imports_mutex);
+
 	for (const auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
 			return record.thunk_vaddr;
@@ -201,8 +208,16 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
+		StubbedImportRecord record {};
+		bool                found = false;
+		{
+			Common::LockGuard lock(g_stubbed_imports_mutex);
+			if (record_id < g_stubbed_imports.size()) {
+				record = g_stubbed_imports[record_id];
+				found  = true;
+			}
+		}
+		if (found) {
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
@@ -777,32 +792,129 @@ static void KYTY_SYSV_ABI ProgramExitHandler() {
 	LOGF("exit!!!\n");
 }
 
+// Returns nullptr unless offset starts a NUL-terminated string inside the dynamic string table.
+static const char* GetDynString(const DynamicInfo& info, uint64_t offset) {
+	return (info.str_table != nullptr && offset < info.str_table_terminated_size
+	            ? info.str_table + offset
+	            : nullptr);
+}
+
 template <class T>
-static void GetDynModules(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) {
+static bool GetDynModules(Elf64* elf, T* out, const DynamicInfo& info, Elf64_Sxword tag) {
 	std::vector<uint64_t> needed_modules;
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
+		const char* name = GetDynString(info, need & 0xffffffff);
+		if (name == nullptr) {
+			return false;
+		}
 		ModuleId id {};
 		// id.id            = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
 		id.version_major = static_cast<int>((need >> 40u) & 0xffu);
 		id.version_minor = static_cast<int>((need >> 32u) & 0xffu);
-		id.name          = names + (need & 0xffffffff);
+		id.name          = name;
 		out->push_back(id);
 	}
+	return true;
 }
 
 template <class T>
-static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) {
+static bool GetDynLibs(Elf64* elf, T* out, const DynamicInfo& info, Elf64_Sxword tag) {
 	std::vector<uint64_t> needed_modules;
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
+		const char* name = GetDynString(info, need & 0xffffffff);
+		if (name == nullptr) {
+			return false;
+		}
 		LibraryId id {};
 		// id.id      = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
 		id.version = static_cast<int>((need >> 32u) & 0xffffu);
-		id.name    = names + (need & 0xffffffff);
+		id.name    = name;
 		out->push_back(id);
+	}
+	return true;
+}
+
+static bool IsTlsRelocation(Elf64_Word type) {
+	return type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64 ||
+	       type == R_X86_64_DTPOFF32 || type == R_X86_64_TPOFF32;
+}
+
+static bool IsSymbolRelocation(Elf64_Word type) {
+	return type == R_X86_64_64 || type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT;
+}
+
+// A TLS relocation names its symbol by index; index 0 or a symbol defined in this module refers
+// to the module's own TLS block, anything else is imported from another module.
+static bool IsImportedTlsSymbol(const Program& program, uint32_t symbol) {
+	if (symbol == 0) {
+		return false;
+	}
+	const auto& sym = program.dynamic_info->symbol_table[symbol];
+	return sym.GetBind() != STB_LOCAL && sym.st_shndx == SHN_UNDEF;
+}
+
+// TLS relocations, following the TLS layout already used by TlsGetAddr and the fs:[0] handler:
+//   DTPMOD64      module handle passed to __tls_get_addr (the defining Program*)
+//   DTPOFF64/32   symbol offset inside that module's TLS block
+//   TPOFF64/32    offset from the thread pointer (fs:0 = TCB at block + tcb_offset); only the
+//                 main executable has static TLS, which ParseProgramDynamicInfo enforces
+static void GetTlsRelocationInfo(Elf64_Rela* r, Program* program, RelocationInfo* ret) {
+	const auto type   = r->GetType();
+	const auto symbol = r->GetSymbol();
+
+	ret->tls      = true;
+	ret->size     = (type == R_X86_64_DTPOFF32 || type == R_X86_64_TPOFF32 ? 4 : 8);
+	ret->type     = (type == R_X86_64_DTPMOD64 ? SymbolType::TlsModule : SymbolType::Tls);
+	ret->bind     = BindType::Local;
+	ret->dbg_name = Common::PathToString(program->file_name);
+
+	const Program* module = program;
+	uint64_t       offset = 0;
+	bool           found  = true;
+	if (symbol != 0) {
+		const auto& sym = program->dynamic_info->symbol_table[symbol];
+		ret->name       = program->dynamic_info->str_table + sym.st_name;
+		if (sym.GetBind() != STB_LOCAL) {
+			ret->bind = (sym.GetBind() == STB_WEAK ? BindType::Weak : BindType::Global);
+		}
+		if (IsImportedTlsSymbol(*program, symbol)) {
+			SymbolRecord sr {};
+			program->rt->Resolve(ret->name, SymbolType::Tls, program, &sr, &ret->bind_self);
+			module        = sr.tls_program;
+			offset        = sr.vaddr;
+			found         = (module != nullptr);
+			ret->name     = sr.name;
+			ret->dbg_name = (found ? Common::PathToString(module->file_name) : sr.dbg_name);
+		} else {
+			offset = sym.st_value;
+		}
+	}
+
+	const auto value = offset + static_cast<uint64_t>(r->r_addend);
+	switch (type) {
+		case R_X86_64_DTPMOD64:
+			// An unresolved import keeps the old behaviour (own module) and is retried later.
+			ret->value = reinterpret_cast<uint64_t>(found ? module : program);
+			break;
+		case R_X86_64_DTPOFF64:
+		case R_X86_64_DTPOFF32: ret->value = (found ? value : 0); break;
+		case R_X86_64_TPOFF64:
+		case R_X86_64_TPOFF32: ret->value = value - program->tls.tcb_offset; break;
+		default: EXIT("unexpected TLS relocation type: %u\n", type);
+	}
+	ret->resolved = found;
+
+	if (found && ret->size == 4) {
+		const auto as_signed = static_cast<int64_t>(ret->value);
+		if (as_signed < INT32_MIN || as_signed > INT32_MAX) {
+			LOGF("Relocate: 32-bit TLS offset out of range for %s\n", ret->name.c_str());
+			ret->value    = 0;
+			ret->resolved = false;
+		}
 	}
 }
 
@@ -821,6 +933,8 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	ret.vaddr            = ret.base_vaddr + r->r_offset;
 	ret.bind_self        = false;
 
+	// ParseProgramDynamicInfo validated r_offset, the relocation type, the symbol index, its
+	// type and bind, and st_name, so the defaults below are internal invariants.
 	switch (type) {
 		case R_X86_64_GLOB_DAT:
 		case R_X86_64_JUMP_SLOT: addend = 0; [[fallthrough]];
@@ -834,7 +948,7 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 				case STT_NOTYPE: ret.type = SymbolType::NoType; break;
 				case STT_FUNC: ret.type = SymbolType::Func; break;
 				case STT_OBJECT: ret.type = SymbolType::Object; break;
-				default: EXIT("unknown symbol type: %d\n", (int)sym_type);
+				default: EXIT("unexpected symbol type: %d\n", (int)sym_type);
 			}
 			switch (bind) {
 				case STB_LOCAL:
@@ -848,7 +962,7 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 					program->rt->Resolve(ret.name, ret.type, program, &sr, &ret.bind_self);
 					symbol_vaddr = sr.vaddr;
 				} break;
-				default: EXIT("unknown bind: %d\n", (int)bind);
+				default: EXIT("unexpected bind: %d\n", (int)bind);
 			}
 			ret.resolved = (symbol_vaddr != 0);
 			ret.value    = (ret.resolved ? symbol_vaddr + addend : 0);
@@ -859,17 +973,26 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 			ret.value    = ret.base_vaddr + addend;
 			ret.resolved = true;
 			break;
-		case R_X86_64_DTPMOD64:
-			ret.value    = reinterpret_cast<uint64_t>(program);
+		case R_X86_64_NONE:
 			ret.resolved = true;
-			ret.type     = SymbolType::TlsModule;
-			ret.bind     = BindType::Local;
-			ret.dbg_name = Common::PathToString(program->file_name);
+			ret.size     = 0;
 			break;
-		default: EXIT("unknown type: %d\n", (int)type);
+		case R_X86_64_DTPMOD64:
+		case R_X86_64_DTPOFF64:
+		case R_X86_64_TPOFF64:
+		case R_X86_64_DTPOFF32:
+		case R_X86_64_TPOFF32: GetTlsRelocationInfo(r, program, &ret); break;
+		default: EXIT("unexpected relocation type: %d\n", (int)type);
 	}
 
 	return ret;
+}
+
+static bool PatchGuestMemory32(uint64_t vaddr, uint32_t value) {
+	auto* ptr     = reinterpret_cast<uint32_t*>(vaddr);
+	bool  changed = (*ptr != value);
+	std::memcpy(ptr, &value, sizeof(value));
+	return changed;
 }
 
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
@@ -878,6 +1001,9 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
+	if (ri.size == 0) {
+		return true;
+	}
 	if (!ri.resolved) {
 		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
 		if (!weak) {
@@ -886,7 +1012,11 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
 			                 ri.dbg_name).c_str());
 		}
-		if (ri.type == SymbolType::Object) {
+		if (ri.tls) {
+			// TLS values are module handles and offsets, never call targets: keep the value
+			// computed above and retry when another module is loaded.
+			LOGF("Relocate: unresolved TLS import %s\n", ri.name.c_str());
+		} else if (ri.type == SymbolType::Object) {
 			value = g_invalid_memory;
 		} else {
 			value   = RegisterStubbedImport(index, program, ri);
@@ -894,7 +1024,8 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		}
 	}
 
-	const bool patched = PatchGuestMemory64(ri.vaddr, value);
+	const bool patched = (ri.size == 4 ? PatchGuestMemory32(ri.vaddr, static_cast<uint32_t>(value))
+	                                   : PatchGuestMemory64(ri.vaddr, value));
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
@@ -998,10 +1129,18 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
 			    inst_ptr[4] == tls_pattern[4] &&
 			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
-				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
-
 				const auto reg = (modrm >> 3u) & 7u;
-				EXIT_NOT_IMPLEMENTED(reg == 4u);
+				// The raw byte scan can match inside other instructions or data. A real
+				// `mov rsp, fs:[0]` is not emitted by compilers, and there is no TlsRegStub for
+				// rsp, so leave such a match untouched. Telling code from data reliably would need
+				// a full decoder pass.
+				if (reg == 4u) {
+					LOGF("Skip tls pattern with rsp output at addr: [%016" PRIx64 "]\n",
+					     reinterpret_cast<uint64_t>(inst_ptr));
+					continue;
+				}
+
+				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
 
 				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
 				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
@@ -1132,8 +1271,17 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 			auto&      bits      = importer->rela_bits[bit_index >> 3u];
 			const auto mask      = 1u << (bit_index & 7u);
 			const auto type      = r->GetType();
-			if ((bits & mask) == 0 || (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT &&
-			                           type != R_X86_64_JUMP_SLOT)) {
+			if ((bits & mask) != 0 && IsTlsRelocation(type) &&
+			    IsImportedTlsSymbol(*importer, r->GetSymbol())) {
+				// The import may name the unloaded module (a DTPMOD64 value is its Program*), so
+				// resolve again without it; an unresolved import falls back to the importer.
+				bits &= ~mask;
+				if (RelocateRecord(index, r, importer, jmprela)) {
+					bits |= mask;
+				}
+				return;
+			}
+			if ((bits & mask) == 0 || !IsSymbolRelocation(type)) {
 				return;
 			}
 			const auto& symbol = info.symbol_table[r->GetSymbol()];
@@ -1175,6 +1323,59 @@ RuntimeLinker::~RuntimeLinker() {
 	Clear();
 }
 
+// Checks the program headers that LoadProgramToMemory trusts, so a malformed file is rejected
+// before anything is mapped instead of overflowing the mapping.
+static bool ValidateProgramHeaders(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
+	if (ehdr == nullptr || phdr == nullptr) {
+		return false;
+	}
+
+	uint64_t base_size = 0;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		const auto& p = phdr[i];
+		if (p.p_type != PT_LOAD && p.p_type != PT_OS_RELRO && p.p_type != PT_TLS) {
+			continue;
+		}
+		if (p.p_align != 0 && p.p_memsz > UINT64_MAX - (p.p_align - 1)) {
+			LOGF("ELF: phdr[%u] memory size overflows\n", static_cast<unsigned>(i));
+			return false;
+		}
+		const auto aligned_size = GetAlignedSize(&p);
+		if (aligned_size < p.p_memsz || p.p_vaddr > UINT64_MAX - aligned_size) {
+			LOGF("ELF: phdr[%u] has an invalid size or alignment\n", static_cast<unsigned>(i));
+			return false;
+		}
+		if (p.p_type != PT_TLS && p.p_memsz != 0) {
+			if (p.p_filesz > p.p_memsz) {
+				LOGF("ELF: phdr[%u] file size exceeds memory size\n", static_cast<unsigned>(i));
+				return false;
+			}
+			base_size = (std::max)(base_size, p.p_vaddr + aligned_size);
+		}
+	}
+
+	bool has_proc_param = false;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		const auto& p = phdr[i];
+		if (p.p_type == PT_TLS) {
+			// The initial TLS image is copied from the loaded image.
+			const auto init_size = (std::min)(p.p_filesz, GetAlignedSize(&p));
+			if (p.p_vaddr >= base_size || init_size > base_size - p.p_vaddr) {
+				LOGF("ELF: TLS segment is outside the image\n");
+				return false;
+			}
+		}
+		if (p.p_type == PT_OS_PROCPARAM) {
+			if (has_proc_param || p.p_vaddr >= base_size) {
+				LOGF("ELF: invalid process parameter segment\n");
+				return false;
+			}
+			has_proc_param = true;
+		}
+	}
+	return true;
+}
+
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1194,13 +1395,18 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	program->elf = std::make_unique<Elf64>();
 	program->elf->Open(elf_name);
 
-	if (program->elf->IsValid()) {
-		LoadProgramToMemory(program);
-		ParseProgramDynamicInfo(program);
-		CreateSymbolDatabase(program);
-	} else {
-		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+	if (!program->elf->IsValid() ||
+	    !ValidateProgramHeaders(program->elf->GetEhdr(), program->elf->GetPhdr())) {
+		LOGF("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+		return nullptr;
 	}
+
+	if (!LoadProgramToMemory(program) || !ParseProgramDynamicInfo(program)) {
+		LOGF("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+		DeleteProgram(program_owner.release());
+		return nullptr;
+	}
+	CreateSymbolDatabase(program);
 
 	m_programs.push_back(program_owner.release());
 
@@ -1311,7 +1517,10 @@ void RuntimeLinker::Clear() {
 	}
 	g_unresolved_stub_thunk_pages.clear();
 	g_unresolved_stub_thunk_offset = 0;
-	g_stubbed_imports.clear();
+	{
+		Common::LockGuard lock(g_stubbed_imports_mutex);
+		g_stubbed_imports.clear();
+	}
 	g_unresolved_stub_call_log_count.store(0);
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
@@ -1420,7 +1629,12 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 				return;
 			}
 
-			EXIT("l == nullptr || m == nullptr");
+			// The import names a library/module id the ELF does not declare. Leave it
+			// unresolved so the relocation gets the logging unresolved-import stub.
+			LOGF("Resolve: missing lib/module metadata for %s\n", name.c_str());
+			out_info->vaddr    = 0;
+			out_info->name     = name;
+			out_info->dbg_name = "";
 		}
 	} else {
 		out_info->vaddr    = 0;
@@ -1553,6 +1767,11 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	// A module without DT_INIT has nothing to run; calling base_vaddr would execute garbage.
+	if (program->dynamic_info->init_vaddr == 0) {
+		return 0;
+	}
+
 	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
 	                                                program->base_vaddr)(args, argp, func);
 }
@@ -1568,8 +1787,11 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Stop module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
-	int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
-	                                                      program->base_vaddr)(args, argp, func);
+	int result = 0;
+	if (program->dynamic_info->fini_vaddr != 0) {
+		result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
+		                                                  program->base_vaddr)(args, argp, func);
+	}
 
 	Libs::LibKernel::PthreadDeleteStaticObjects(program);
 
@@ -1644,7 +1866,7 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RuntimeLinker::LoadProgramToMemory(Program* program) {
+bool RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(program == nullptr || program->base_vaddr != 0 || program->base_size != 0 ||
@@ -1655,7 +1877,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	bool is_shared   = program->elf->IsShared();
 	bool is_next_gen = program->elf->IsNextGen();
 
-	EXIT_NOT_IMPLEMENTED(!is_shared && !is_next_gen);
+	if (!is_shared && !is_next_gen) {
+		LOGF("ELF: PS4 (non next-gen) executables are not supported\n");
+		return false;
+	}
 
 	const auto* ehdr = program->elf->GetEhdr();
 	const auto* phdr = program->elf->GetPhdr();
@@ -1735,7 +1960,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
 			     magic_enum::enum_name(mode));
 
-			program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size);
+			// The caller releases the partially loaded image through DeleteProgram.
+			if (!program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size)) {
+				return false;
+			}
 
 			bool skip_protect = (phdr[i].p_type == PT_LOAD && is_next_gen &&
 			                     mode == Common::VirtualMemory::Mode::NoAccess);
@@ -1848,6 +2076,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
+	return true;
 }
 
 void RuntimeLinker::DeleteProgram(Program* p) {
@@ -1859,10 +2088,13 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
 	}
-	for (auto& record: g_stubbed_imports) {
-		if (record.patch_vaddr >= program->base_vaddr &&
-		    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
-			record.patch_vaddr = 0;
+	{
+		Common::LockGuard lock(g_stubbed_imports_mutex);
+		for (auto& record: g_stubbed_imports) {
+			if (record.patch_vaddr >= program->base_vaddr &&
+			    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
+				record.patch_vaddr = 0;
+			}
 		}
 	}
 
@@ -1876,7 +2108,146 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	}
 }
 
-void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
+// True when [table, table + size) lies in PT_OS_DYNLIBDATA or in the loaded image.
+static bool IsDynamicTableInRange(const Program& program, const void* table, uint64_t size) {
+	if (program.elf->IsDynamicDataRange(table, size)) {
+		return true;
+	}
+	const auto addr = reinterpret_cast<uint64_t>(table);
+	return addr >= program.base_vaddr && addr - program.base_vaddr <= program.base_size &&
+	       size <= program.base_size - (addr - program.base_vaddr);
+}
+
+// Validates everything later code indexes without checks: table ranges, symbol indexes,
+// symbol names and relocation targets.
+static bool ValidateDynamicTables(Program* program) {
+	auto& info = *program->dynamic_info;
+
+	const auto table_ok = [&](const void* table, uint64_t size) {
+		return size == 0 || (table != nullptr && IsDynamicTableInRange(*program, table, size));
+	};
+	if (!table_ok(info.str_table, info.str_table_size) ||
+	    !table_ok(info.symbol_table, info.symbol_table_total_size) ||
+	    !table_ok(info.rela_table, info.rela_table_total_size) ||
+	    !table_ok(info.jmprela_table, info.jmprela_table_size)) {
+		LOGF("ELF: dynamic table is outside the image\n");
+		return false;
+	}
+	if (info.symbol_table_total_size % sizeof(Elf64_Sym) != 0) {
+		LOGF("ELF: symbol table size is not a multiple of the entry size\n");
+		return false;
+	}
+
+	// Strings must end inside the table; anything after the last NUL is unusable.
+	info.str_table_terminated_size = 0;
+	if (info.str_table != nullptr) {
+		for (uint64_t i = info.str_table_size; i > 0; i--) {
+			if (info.str_table[i - 1] == '\0') {
+				info.str_table_terminated_size = i;
+				break;
+			}
+		}
+	}
+
+	const auto symbol_count = info.symbol_table_total_size / sizeof(Elf64_Sym);
+	for (uint64_t i = 0; i < symbol_count; i++) {
+		if (GetDynString(info, info.symbol_table[i].st_name) == nullptr) {
+			LOGF("ELF: symbol %" PRIu64 " name is outside the string table\n", i);
+			return false;
+		}
+	}
+
+	// Without a symbol table size tag, bound relocation symbol indexes by the table's backing
+	// memory instead.
+	const auto symbol_ok = [&](uint64_t index) {
+		if (info.symbol_table == nullptr) {
+			return false;
+		}
+		if (info.symbol_table_total_size != 0) {
+			return index < symbol_count;
+		}
+		return index < UINT64_MAX / sizeof(Elf64_Sym) &&
+		       IsDynamicTableInRange(*program, info.symbol_table,
+		                             (index + 1) * sizeof(Elf64_Sym)) &&
+		       GetDynString(info, info.symbol_table[index].st_name) != nullptr;
+	};
+
+	// Everything GetRelocationInfo relies on is checked here, so an unsupported relocation fails
+	// the load instead of aborting during relocation.
+	const auto reloc_ok = [&](const Elf64_Rela& r) {
+		const auto type = r.GetType();
+		const bool tls  = IsTlsRelocation(type);
+		if (type != R_X86_64_NONE && type != R_X86_64_RELATIVE && !tls &&
+		    !IsSymbolRelocation(type)) {
+			LOGF("ELF: unsupported relocation type %u\n", static_cast<unsigned>(type));
+			return false;
+		}
+		const uint64_t width =
+		    (type == R_X86_64_DTPOFF32 || type == R_X86_64_TPOFF32 ? sizeof(uint32_t)
+		                                                           : sizeof(uint64_t));
+		if (program->base_size < width || r.r_offset > program->base_size - width) {
+			LOGF("ELF: relocation target 0x%016" PRIx64 " is outside the image\n", r.r_offset);
+			return false;
+		}
+
+		const auto symbol = r.GetSymbol();
+		if (IsSymbolRelocation(type) || (tls && symbol != 0)) {
+			if (!symbol_ok(symbol)) {
+				LOGF("ELF: relocation symbol index %u is out of range\n",
+				     static_cast<unsigned>(symbol));
+				return false;
+			}
+			const auto& sym  = info.symbol_table[symbol];
+			const auto  bind = sym.GetBind();
+			const auto  st   = sym.GetType();
+			if (bind != STB_LOCAL && bind != STB_GLOBAL && bind != STB_WEAK) {
+				LOGF("ELF: unsupported symbol bind %u\n", static_cast<unsigned>(bind));
+				return false;
+			}
+			const bool type_ok = (tls ? (st == STT_TLS || st == STT_NOTYPE)
+			                          : (st == STT_NOTYPE || st == STT_FUNC || st == STT_OBJECT));
+			if (!type_ok) {
+				LOGF("ELF: unsupported symbol type %u for relocation type %u\n",
+				     static_cast<unsigned>(st), static_cast<unsigned>(type));
+				return false;
+			}
+		}
+
+		if (type == R_X86_64_TPOFF64 || type == R_X86_64_TPOFF32) {
+			// Only the main executable's TLS block sits at a fixed offset from fs:0; shared
+			// modules get their blocks from __tls_get_addr.
+			if (program->elf->IsShared() || program->tls.image_size == 0 ||
+			    IsImportedTlsSymbol(*program, symbol)) {
+				LOGF("ELF: static TLS (TPOFF) relocations are only supported for TLS defined in "
+				     "the main executable\n");
+				return false;
+			}
+		}
+		if (width == sizeof(uint32_t) && !IsImportedTlsSymbol(*program, symbol)) {
+			const uint64_t offset = (symbol == 0 ? 0 : info.symbol_table[symbol].st_value);
+			const auto     value =
+			    static_cast<int64_t>(offset + static_cast<uint64_t>(r.r_addend) -
+			                         (type == R_X86_64_TPOFF32 ? program->tls.tcb_offset : 0));
+			if (value < INT32_MIN || value > INT32_MAX) {
+				LOGF("ELF: 32-bit TLS relocation value is out of range\n");
+				return false;
+			}
+		}
+		return true;
+	};
+	const auto relocs_ok = [&](const Elf64_Rela* table, uint64_t size) {
+		for (uint64_t i = 0; i < size / sizeof(Elf64_Rela); i++) {
+			if (!reloc_ok(table[i])) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return relocs_ok(info.rela_table, info.rela_table_total_size) &&
+	       relocs_ok(info.jmprela_table, info.jmprela_table_size);
+}
+
+bool RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(program == nullptr);
@@ -1887,20 +2258,39 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 
 	auto* elf = program->elf.get();
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_HASH) && elf->HasDynValue(DT_HASH));
+	// The OS-specific and the standard form of a tag must not both be present.
+	static constexpr std::pair<Elf64_Sxword, Elf64_Sxword> exclusive_tags[] = {
+	    {DT_OS_HASH, DT_HASH},
+	    {DT_OS_STRTAB, DT_STRTAB},
+	    {DT_OS_STRSZ, DT_STRSZ},
+	    {DT_OS_SYMTAB, DT_SYMTAB},
+	    {DT_OS_SYMENT, DT_SYMENT},
+	    {DT_OS_PLTREL, DT_PLTREL},
+	    {DT_OS_JMPREL, DT_JMPREL},
+	    {DT_OS_PLTRELSZ, DT_PLTRELSZ},
+	    {DT_OS_RELA, DT_RELA},
+	    {DT_OS_NEEDED_MODULE, DT_OS_NEEDED_MODULE_1},
+	    {DT_OS_MODULE_INFO, DT_OS_MODULE_INFO_1},
+	    {DT_OS_IMPORT_LIB, DT_OS_IMPORT_LIB_1},
+	    {DT_OS_EXPORT_LIB, DT_OS_EXPORT_LIB_1},
+	};
+	for (const auto& [first, second]: exclusive_tags) {
+		if (elf->HasDynValue(first) && elf->HasDynValue(second)) {
+			LOGF("ELF: conflicting dynamic tags 0x%" PRIx64 " and 0x%" PRIx64 "\n",
+			     static_cast<uint64_t>(first), static_cast<uint64_t>(second));
+			return false;
+		}
+	}
+
 	GetDynDataOs(elf, &program->dynamic_info->hash_table, DT_OS_HASH);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->hash_table, DT_HASH);
 	GetDynValue(elf, &program->dynamic_info->hash_table_size, DT_OS_HASHSZ);
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_STRTAB) && elf->HasDynValue(DT_STRTAB));
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_STRSZ) && elf->HasDynValue(DT_STRSZ));
 	GetDynDataOs(elf, &program->dynamic_info->str_table, DT_OS_STRTAB);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->str_table, DT_STRTAB);
 	GetDynValue(elf, &program->dynamic_info->str_table_size, DT_OS_STRSZ);
 	GetDynValue(elf, &program->dynamic_info->str_table_size, DT_STRSZ);
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_SYMTAB) && elf->HasDynValue(DT_SYMTAB));
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_SYMENT) && elf->HasDynValue(DT_SYMENT));
 	GetDynDataOs(elf, &program->dynamic_info->symbol_table, DT_OS_SYMTAB);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->symbol_table, DT_SYMTAB);
 	GetDynValue(elf, &program->dynamic_info->symbol_table_total_size, DT_OS_SYMTABSZ);
@@ -1917,70 +2307,72 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &program->dynamic_info->preinit_array_size, DT_PREINIT_ARRAYSZ);
 
 	Elf64_Sxword jmprel_type = 0;
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTREL) && elf->HasDynValue(DT_PLTREL));
 	GetDynValue(elf, &jmprel_type, DT_OS_PLTREL);
 	GetDynValue(elf, &jmprel_type, DT_PLTREL);
 
-	EXIT_NOT_IMPLEMENTED(jmprel_type != DT_RELA);
-	if (jmprel_type == DT_RELA) {
-		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_JMPREL) && elf->HasDynValue(DT_JMPREL));
-		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTRELSZ) && elf->HasDynValue(DT_PLTRELSZ));
-		GetDynDataOs(elf, &program->dynamic_info->jmprela_table, DT_OS_JMPREL);
-		GetDynData(elf, program->base_vaddr, &program->dynamic_info->jmprela_table, DT_JMPREL);
-		GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_OS_PLTRELSZ);
-		GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_PLTRELSZ);
+	if (jmprel_type != DT_RELA) {
+		LOGF("ELF: unsupported PLT relocation format %" PRId64 "\n",
+		     static_cast<int64_t>(jmprel_type));
+		return false;
 	}
+	GetDynDataOs(elf, &program->dynamic_info->jmprela_table, DT_OS_JMPREL);
+	GetDynData(elf, program->base_vaddr, &program->dynamic_info->jmprela_table, DT_JMPREL);
+	GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_OS_PLTRELSZ);
+	GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_PLTRELSZ);
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_RELA) && elf->HasDynValue(DT_RELA));
 	GetDynDataOs(elf, &program->dynamic_info->rela_table, DT_OS_RELA);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->rela_table, DT_RELA);
 	GetDynValue(elf, &program->dynamic_info->rela_table_total_size, DT_OS_RELASZ);
 	GetDynValue(elf, &program->dynamic_info->rela_table_total_size, DT_RELASZ);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_OS_RELAENT);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_RELAENT);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_total_size % sizeof(Elf64_Rela) != 0 ||
-	                     program->dynamic_info->jmprela_table_size % sizeof(Elf64_Rela) != 0);
-	const auto rela_count = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
-	const auto jmprela_count = program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
+	auto& info = *program->dynamic_info;
+	if (info.rela_table_total_size % sizeof(Elf64_Rela) != 0 ||
+	    info.jmprela_table_size % sizeof(Elf64_Rela) != 0) {
+		LOGF("ELF: relocation table size is not a multiple of the entry size\n");
+		return false;
+	}
+	// Relocate() relies on these.
+	if (info.symbol_table_entry_size != sizeof(Elf64_Sym) ||
+	    info.rela_table_entry_size != sizeof(Elf64_Rela) || info.jmprela_table == nullptr ||
+	    info.rela_table == nullptr || info.symbol_table == nullptr) {
+		LOGF("ELF: missing or unsupported symbol/relocation tables\n");
+		return false;
+	}
+	if (!ValidateDynamicTables(program)) {
+		return false;
+	}
+	const auto rela_count    = info.rela_table_total_size / sizeof(Elf64_Rela);
+	const auto jmprela_count = info.jmprela_table_size / sizeof(Elf64_Rela);
 	program->rela_bits.resize((rela_count + jmprela_count + 7u) / 8u);
 
-	GetDynValue(elf, &program->dynamic_info->relative_count, DT_RELACOUNT);
+	GetDynValue(elf, &info.relative_count, DT_RELACOUNT);
 
-	GetDynValue(elf, &program->dynamic_info->debug, DT_DEBUG);
-	GetDynValue(elf, &program->dynamic_info->flags, DT_FLAGS);
-	GetDynValue(elf, &program->dynamic_info->textrel, DT_TEXTREL);
+	GetDynValue(elf, &info.debug, DT_DEBUG);
+	GetDynValue(elf, &info.flags, DT_FLAGS);
+	GetDynValue(elf, &info.textrel, DT_TEXTREL);
 
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->debug != 0);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->textrel != 0);
+	if (info.debug != 0 || info.textrel != 0) {
+		LOGF("ELF: DT_DEBUG / DT_TEXTREL are not supported\n");
+		return false;
+	}
 
 	uint64_t so_name = 0;
 	GetDynValue(elf, &so_name, DT_SONAME);
-	program->dynamic_info->so_name = program->dynamic_info->str_table + so_name;
+	info.so_name = GetDynString(info, so_name);
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_NEEDED_MODULE) &&
-	                     elf->HasDynValue(DT_OS_NEEDED_MODULE_1));
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_MODULE_INFO) &&
-	                     elf->HasDynValue(DT_OS_MODULE_INFO_1));
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_IMPORT_LIB) &&
-	                     elf->HasDynValue(DT_OS_IMPORT_LIB_1));
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_EXPORT_LIB) &&
-	                     elf->HasDynValue(DT_OS_EXPORT_LIB_1));
-	GetDynModules(elf, &program->dynamic_info->import_modules, program->dynamic_info->str_table,
-	              DT_OS_NEEDED_MODULE);
-	GetDynModules(elf, &program->dynamic_info->import_modules, program->dynamic_info->str_table,
-	              DT_OS_NEEDED_MODULE_1);
-	GetDynModules(elf, &program->dynamic_info->export_modules, program->dynamic_info->str_table,
-	              DT_OS_MODULE_INFO);
-	GetDynModules(elf, &program->dynamic_info->export_modules, program->dynamic_info->str_table,
-	              DT_OS_MODULE_INFO_1);
-	GetDynLibs(elf, &program->dynamic_info->import_libs, program->dynamic_info->str_table,
-	           DT_OS_IMPORT_LIB);
-	GetDynLibs(elf, &program->dynamic_info->import_libs, program->dynamic_info->str_table,
-	           DT_OS_IMPORT_LIB_1);
-	GetDynLibs(elf, &program->dynamic_info->export_libs, program->dynamic_info->str_table,
-	           DT_OS_EXPORT_LIB);
-	GetDynLibs(elf, &program->dynamic_info->export_libs, program->dynamic_info->str_table,
-	           DT_OS_EXPORT_LIB_1);
+	if (!GetDynModules(elf, &info.import_modules, info, DT_OS_NEEDED_MODULE) ||
+	    !GetDynModules(elf, &info.import_modules, info, DT_OS_NEEDED_MODULE_1) ||
+	    !GetDynModules(elf, &info.export_modules, info, DT_OS_MODULE_INFO) ||
+	    !GetDynModules(elf, &info.export_modules, info, DT_OS_MODULE_INFO_1) ||
+	    !GetDynLibs(elf, &info.import_libs, info, DT_OS_IMPORT_LIB) ||
+	    !GetDynLibs(elf, &info.import_libs, info, DT_OS_IMPORT_LIB_1) ||
+	    !GetDynLibs(elf, &info.export_libs, info, DT_OS_EXPORT_LIB) ||
+	    !GetDynLibs(elf, &info.export_libs, info, DT_OS_EXPORT_LIB_1)) {
+		LOGF("ELF: module or library name is outside the string table\n");
+		return false;
+	}
+	return true;
 }
 
 void RuntimeLinker::Relocate(Program* program) {
@@ -1997,11 +2389,10 @@ void RuntimeLinker::Relocate(Program* program) {
 	LOGF_COLOR(Log::Color::White, "--- Relocate program: %s ---\n",
 	           Common::PathToString(program->file_name).c_str());
 
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table_entry_size != sizeof(Elf64_Sym));
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_entry_size != sizeof(Elf64_Rela));
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->jmprela_table == nullptr);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
+	// Validated by ParseProgramDynamicInfo.
+	EXIT_IF(program->dynamic_info->jmprela_table == nullptr ||
+	        program->dynamic_info->rela_table == nullptr ||
+	        program->dynamic_info->symbol_table == nullptr);
 
 	const auto rela_count = static_cast<uint32_t>(
 	    program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
@@ -2090,10 +2481,14 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 			if (ids.size() == 3) {
 				const auto* l = FindLibrary(*program, ids.at(1));
 				const auto* m = FindModule(*program, ids.at(2));
+				// A TLS symbol's st_value is a block offset and may be 0 when defined.
+				const bool defined =
+				    (type == STT_TLS ? sym->st_shndx != SHN_UNDEF : sym->st_value != 0);
 
 				if (l != nullptr && m != nullptr && (bind == STB_GLOBAL || bind == STB_WEAK) &&
-				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
-				    is_export == (sym->st_value != 0)) {
+				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE ||
+				     type == STT_TLS) &&
+				    is_export == defined) {
 					SymbolResolve sr {};
 					sr.name                 = ids.at(0);
 					sr.library              = l->name;
@@ -2105,9 +2500,14 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 						case STT_NOTYPE: sr.type = SymbolType::NoType; break;
 						case STT_FUNC: sr.type = SymbolType::Func; break;
 						case STT_OBJECT: sr.type = SymbolType::Object; break;
+						case STT_TLS: sr.type = SymbolType::Tls; break;
 						default: sr.type = SymbolType::Unknown; break;
 					}
-					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
+					if (type == STT_TLS && is_export) {
+						symbols->AddTls(sr, sym->st_value, program);
+					} else {
+						symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
+					}
 				}
 			}
 		}
@@ -2188,5 +2588,137 @@ void* RuntimeLinker::ApplicationHeapMalloc(uint64_t size) {
 
 	return m_application_heap_malloc != nullptr ? m_application_heap_malloc(size) : nullptr;
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+// Relocates a file-less, in-memory program (the image is a host buffer) to check the TLS
+// relocation values and that ParseProgramDynamicInfo's relocation checks reject unsupported
+// content instead of aborting.
+bool TestTlsRelocations(std::string* failure) {
+	constexpr uint64_t RELOC_AREA = 0x000;
+	constexpr uint64_t RELA_AREA  = 0x100;
+	constexpr uint64_t SYM_AREA   = 0x200;
+	constexpr uint64_t STR_AREA   = 0x300;
+	constexpr uint64_t TCB_OFFSET = 0x40;
+
+	std::vector<uint64_t> storage(0x400 / sizeof(uint64_t), 0);
+	auto*                 image = reinterpret_cast<uint8_t*>(storage.data());
+
+	static constexpr char names[] = "\0tls_var\0func";
+	std::memcpy(image + STR_AREA, names, sizeof(names));
+
+	auto* syms = reinterpret_cast<Elf64_Sym*>(image + SYM_AREA);
+	// [1] global TLS variable defined at block offset 0x10, [2] a function.
+	syms[1].st_name  = 1;
+	syms[1].st_info  = static_cast<unsigned char>((STB_GLOBAL << 4u) | STT_TLS);
+	syms[1].st_shndx = 1;
+	syms[1].st_value = 0x10;
+	syms[2].st_name  = 9;
+	syms[2].st_info  = static_cast<unsigned char>((STB_GLOBAL << 4u) | STT_FUNC);
+	syms[2].st_shndx = 1;
+	syms[2].st_value = 0x20;
+
+	Program program;
+	program.elf                  = std::make_unique<Elf64>(); // no file: a non-shared main program
+	program.base_vaddr           = reinterpret_cast<uint64_t>(image);
+	program.base_size            = 0x400;
+	program.tls.image_size       = TCB_OFFSET;
+	program.tls.tcb_offset       = TCB_OFFSET;
+	program.dynamic_info         = std::make_unique<DynamicInfo>();
+	auto& info                   = *program.dynamic_info;
+	info.str_table               = reinterpret_cast<char*>(image + STR_AREA);
+	info.str_table_size          = sizeof(names);
+	info.symbol_table            = syms;
+	info.symbol_table_total_size = 3 * sizeof(Elf64_Sym);
+	info.symbol_table_entry_size = sizeof(Elf64_Sym);
+	info.rela_table_entry_size   = sizeof(Elf64_Rela);
+
+	auto* relas = reinterpret_cast<Elf64_Rela*>(image + RELA_AREA);
+	auto  set   = [&](int i, uint64_t offset, uint32_t symbol, uint32_t type, int64_t addend) {
+		relas[i].r_offset = RELOC_AREA + offset;
+		relas[i].r_info   = (static_cast<uint64_t>(symbol) << 32u) | type;
+		relas[i].r_addend = addend;
+	};
+	set(0, 0x00, 0, R_X86_64_DTPMOD64, 0);
+	set(1, 0x08, 1, R_X86_64_DTPOFF64, 4);
+	set(2, 0x10, 1, R_X86_64_TPOFF64, 4);
+	set(3, 0x18, 0, R_X86_64_TPOFF32, 8);
+	set(4, 0x1c, 1, R_X86_64_DTPOFF32, 0);
+	set(5, 0x20, 0, R_X86_64_NONE, 0);
+	constexpr int count = 6;
+
+	const auto validate = [&](int n) {
+		info.rela_table            = relas;
+		info.rela_table_total_size = n * sizeof(Elf64_Rela);
+		info.jmprela_table         = relas;
+		info.jmprela_table_size    = 0;
+		return ValidateDynamicTables(&program);
+	};
+	const auto fail = [&](const char* message) {
+		*failure = message;
+		return false;
+	};
+
+	if (!validate(count)) {
+		return fail("valid TLS relocations were rejected");
+	}
+	std::memset(image + RELOC_AREA + 0x20, 0xAB, 8);
+	for (int i = 0; i < count; i++) {
+		if (!RelocateRecord(i, relas + i, &program, false)) {
+			return fail("local TLS relocation did not resolve");
+		}
+	}
+
+	const auto read64 = [&](uint64_t offset) {
+		uint64_t value = 0;
+		std::memcpy(&value, image + RELOC_AREA + offset, sizeof(value));
+		return value;
+	};
+	const auto read32 = [&](uint64_t offset) {
+		int32_t value = 0;
+		std::memcpy(&value, image + RELOC_AREA + offset, sizeof(value));
+		return value;
+	};
+	if (read64(0x00) != reinterpret_cast<uint64_t>(&program)) {
+		return fail("DTPMOD64 is not the defining module");
+	}
+	if (read64(0x08) != 0x14) {
+		return fail("DTPOFF64 is not symbol offset + addend");
+	}
+	if (static_cast<int64_t>(read64(0x10)) != 0x14 - static_cast<int64_t>(TCB_OFFSET)) {
+		return fail("TPOFF64 is not relative to the TCB");
+	}
+	if (read32(0x18) != 8 - static_cast<int32_t>(TCB_OFFSET)) {
+		return fail("TPOFF32 is not relative to the TCB");
+	}
+	if (read32(0x1c) != 0x10) {
+		return fail("DTPOFF32 is not the symbol offset");
+	}
+	if (read64(0x20) != 0xABABABABABABABABull) {
+		return fail("R_X86_64_NONE modified memory");
+	}
+
+	set(0, 0x00, 0, 37, 0); // R_X86_64_IRELATIVE is not supported
+	if (validate(1)) {
+		return fail("unsupported relocation type was accepted");
+	}
+	set(0, 0x00, 2, R_X86_64_DTPOFF64, 0);
+	if (validate(1)) {
+		return fail("TLS relocation against a function symbol was accepted");
+	}
+	set(0, 0x400 - 4, 1, R_X86_64_DTPOFF64, 0);
+	if (validate(1)) {
+		return fail("relocation past the image was accepted");
+	}
+	set(0, 0x00, 7, R_X86_64_GLOB_DAT, 0);
+	if (validate(1)) {
+		return fail("out-of-range symbol index was accepted");
+	}
+	set(0, 0x00, 0, R_X86_64_TPOFF32, 0x7fffffffLL + TCB_OFFSET + 1);
+	if (validate(1)) {
+		return fail("out-of-range TPOFF32 was accepted");
+	}
+	return true;
+}
+#endif
 
 } // namespace Loader

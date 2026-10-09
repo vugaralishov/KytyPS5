@@ -226,6 +226,12 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	}
 	ensure_chunks_loaded();
 
+	// A NULL list is a size query that reports the total chunk count.
+	if (out_chunk_id_list == nullptr) {
+		*out_entries = g_chunks_num;
+		return OK;
+	}
+
 	const uint32_t entries = std::min(number_of_entries, g_chunks_num);
 	for (uint32_t i = 0; i < entries; i++) {
 		out_chunk_id_list[i] = static_cast<uint16_t>(i);

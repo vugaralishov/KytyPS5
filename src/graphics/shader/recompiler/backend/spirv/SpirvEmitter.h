@@ -9,8 +9,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const ShaderHostFeatures& host_features = {});
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

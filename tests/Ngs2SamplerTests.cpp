@@ -88,6 +88,19 @@ void TestStreamingResample() {
 	      "streaming progress does not match consumed source data");
 }
 
+// A system registered through Ngs2SystemCreate, as rack and render calls require.
+struct TestSystem {
+	alignas(Ngs2Internal) std::byte storage[sizeof(Ngs2Internal)];
+	uintptr_t handle = 0;
+
+	TestSystem() {
+		Ngs2ContextBufferInfo buffer {storage, sizeof(storage)};
+		Check(Ngs2SystemCreate(nullptr, &buffer, &handle) == OK, "system creation failed");
+	}
+	~TestSystem() { Check(Ngs2SystemDestroy(handle, nullptr) == OK, "system destroy failed"); }
+	Ngs2Internal& Get() { return *reinterpret_cast<Ngs2Internal*>(handle); }
+};
+
 // One encoded mono block with one nonzero spectral coefficient.
 constexpr std::array<uint8_t, 36> ATRAC9_MONO_BLOCK {0, 0, 0x04, 0x20, 0x04, 0xc0, 0, 0, 0x1f, 0xc0};
 
@@ -304,7 +317,8 @@ void TestSubmixerSetupAndRouting() {
 }
 
 void TestPcm16RenderOutput() {
-	Ngs2Internal system;
+	TestSystem    test_system;
+	Ngs2Internal& system            = test_system.Get();
 	system.option                   = Ngs2DefaultSystemOption();
 	system.option.num_grain_samples = 4;
 	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
@@ -537,8 +551,9 @@ void TestPlayStateBeforeRender() {
 }
 
 void TestStatePublication() {
-	Ngs2Internal system;
-	system.option = Ngs2DefaultSystemOption();
+	TestSystem    test_system;
+	Ngs2Internal& system = test_system.Get();
+	system.option        = Ngs2DefaultSystemOption();
 	Ngs2RackOptionUnion option {};
 	Ngs2FillDefaultRackOption(0x1000, &option);
 	option.common.max_voices = 1;
@@ -977,6 +992,200 @@ void TestUpstreamCustomSamplerControls() {
 	      "custom sampler state layout regressed");
 }
 
+int g_allocations = 0, g_frees = 0;
+
+int32_t KYTY_SYSV_ABI TestAlloc(Ngs2ContextBufferInfo* buffer) {
+	buffer->host_buffer = std::malloc(buffer->host_buffer_size);
+	++g_allocations;
+	return buffer->host_buffer != nullptr ? OK : -1;
+}
+
+int32_t KYTY_SYSV_ABI TestFree(Ngs2ContextBufferInfo* buffer) {
+	std::free(buffer->host_buffer);
+	++g_frees;
+	return OK;
+}
+
+void TestSystemDestroyReleasesResources() {
+	g_allocations = g_frees = 0;
+	const Ngs2BufferAllocator allocator {TestAlloc, TestFree, 0};
+	uintptr_t                 system_handle = 0, rack_handle = 0;
+	Check(Ngs2SystemCreateWithAllocator(nullptr, &allocator, &system_handle) == OK &&
+	          Ngs2RackCreateWithAllocator(system_handle, 0x3000, nullptr, &allocator,
+	                                      &rack_handle) == OK,
+	      "allocator system or rack creation failed");
+	Ngs2ContextBufferInfo released {};
+	Check(Ngs2SystemDestroy(system_handle, &released) == OK && g_allocations == 2 &&
+	          g_frees == 2,
+	      "system destroy did not free the system and its remaining rack");
+	Ngs2SystemInfo info {};
+	Check(Ngs2SystemGetInfo(system_handle, &info, sizeof(info)) ==
+	              NGS2_ERROR_INVALID_SYSTEM_HANDLE &&
+	          Ngs2SystemDestroy(system_handle, nullptr) == NGS2_ERROR_INVALID_SYSTEM_HANDLE &&
+	          Ngs2RackDestroy(rack_handle, nullptr) == NGS2_ERROR_INVALID_RACK_HANDLE,
+	      "destroyed system or its rack is still reachable");
+
+	alignas(Ngs2Internal) std::byte storage[sizeof(Ngs2Internal)];
+	Ngs2ContextBufferInfo buffer {storage, sizeof(storage)};
+	Check(Ngs2SystemCreate(nullptr, &buffer, &system_handle) == OK &&
+	          Ngs2SystemDestroy(system_handle, &released) == OK &&
+	          released.host_buffer == storage && released.host_buffer_size == sizeof(storage),
+	      "system destroy did not return the caller buffer");
+}
+
+void TestRackCreateValidation() {
+	TestSystem          system;
+	Ngs2RackOptionUnion option {};
+	Ngs2FillDefaultRackOption(0x1000, &option);
+	option.common.max_voices = 2;
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte         storage[sizeof(Ngs2RackInternal) + 2 * sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo small {storage, sizeof(storage) - 1};
+	uintptr_t             rack_handle = 0;
+	Check(Ngs2RackCreate(system.handle, 0x1000, &option.common, &small, &rack_handle) ==
+	          NGS2_ERROR_INVALID_OUT_SIZE,
+	      "rack accepted a buffer too small for its voices");
+	Ngs2Internal          unregistered;
+	Ngs2ContextBufferInfo buffer {storage, sizeof(storage)};
+	Check(Ngs2RackCreate(reinterpret_cast<uintptr_t>(&unregistered), 0x1000, &option.common,
+	                     &buffer, &rack_handle) == NGS2_ERROR_INVALID_SYSTEM_HANDLE,
+	      "rack accepted an unknown system");
+	Ngs2FillDefaultRackOption(0x4001, &option);
+	option.common.max_voices                             = 2;
+	option.custom_sampler.custom_rack_option.num_modules = 25;
+	Check(Ngs2RackCreate(system.handle, 0x4001, &option.common, &buffer, &rack_handle) ==
+	          NGS2_ERROR_INVALID_OUT_SIZE,
+	      "custom rack accepted more modules than its tables hold");
+	option.custom_sampler.custom_rack_option.num_modules         = 1;
+	option.custom_sampler.custom_rack_option.module[0].module_id = 0x1f;
+	Check(Ngs2RackCreate(system.handle, 0x4001, &option.common, &buffer, &rack_handle) ==
+	          NGS2_ERROR_INVALID_OUT_SIZE,
+	      "custom rack accepted a user FX module without options");
+	Ngs2SystemInfo info {};
+	Check(Ngs2SystemGetInfo(system.handle, &info, sizeof(info)) == OK && info.rack_count == 0,
+	      "rejected rack was registered");
+}
+
+void TestInvalidMatrixControls() {
+	Fixture f(48000, 2);
+	f.voice.ports.resize(1);
+	f.voice.matrices.resize(1);
+	struct Command {
+		uint32_t id;
+		uint8_t  flags, type;
+		uint16_t count;
+		union {
+			int32_t      i;
+			float        f;
+			const float* levels;
+		} value;
+	};
+	static_assert(sizeof(Command) == 16);
+	const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
+	Command    command {(1u << 24u) | 7u, 0, 3, 0, {}};
+	command.value.i = 0;
+	Check(Ngs2VoiceRunCommands(handle, &command, 1) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "port matrix accepted an unknown port");
+	command.id      = 7;
+	command.value.i = 1;
+	Check(Ngs2VoiceRunCommands(handle, &command, 1) == NGS2_ERROR_INVALID_OUT_SIZE &&
+	          f.voice.ports[0].matrix == -1,
+	      "port matrix accepted an unknown matrix");
+	command              = {5, 0, 0x11, 2, {}};
+	command.value.levels = nullptr;
+	Check(Ngs2VoiceRunCommands(handle, &command, 1) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "matrix accepted missing levels");
+	command = {0x123456, 0, 0, 0, {}};
+	Check(Ngs2VoiceRunCommands(handle, &command, 1) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "unknown voice command was accepted");
+	Ngs2VoicePortMatrixParam port_matrix {{sizeof(Ngs2VoicePortMatrixParam), 0, 3}, 0, 5};
+	Check(Ngs2VoiceControl(handle, &port_matrix.header) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "port matrix control accepted an unknown matrix");
+}
+
+void TestMasteringOutputValidation() {
+	TestSystem          test_system;
+	Ngs2RackOptionUnion option {};
+	Ngs2FillDefaultRackOption(0x3000, &option);
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte         storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo buffer {storage, sizeof(storage)};
+	uintptr_t             rack_handle = 0;
+	test_system.Get().option.num_grain_samples = 2;
+	Check(Ngs2RackCreate(test_system.handle, 0x3000, &option.common, &buffer, &rack_handle) == OK,
+	      "mastering rack creation failed");
+	auto& mastering = *reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(rack_handle) + 1);
+	const auto handle = reinterpret_cast<uintptr_t>(&mastering);
+
+	Ngs2VoiceMatrixLevelsParam levels {
+	    {sizeof(Ngs2VoiceMatrixLevelsParam), 0, 0x30000001}, 4, 1, nullptr};
+	Check(Ngs2VoiceControl(handle, &levels.header) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "mastering accepted an unknown output matrix");
+	struct Unknown {
+		Ngs2VoiceParamHeader header {16, 0, 0x30000009};
+		uint32_t             values[2] {};
+	} unknown;
+	Check(Ngs2VoiceControl(handle, &unknown.header) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "unknown mastering control was accepted");
+
+	// One level for a stereo voice: the missing levels must be silent, not out of range.
+	const float one_level = 0.5f;
+	levels = {{sizeof(Ngs2VoiceMatrixLevelsParam), 0, 0x30000001}, 5, 1, &one_level};
+	Check(Ngs2VoiceControl(handle, &levels.header) == OK, "mastering output matrix failed");
+	mastering.channels = 2;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+	// Mastering voices only render routed input; feed it through a sampler rack voice.
+	Ngs2RackOptionUnion sampler_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	sampler_option.common.max_voices = 1;
+	sampler_option.common.max_ports  = 1;
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte         sampler_storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo sampler_buffer {sampler_storage, sizeof(sampler_storage)};
+	uintptr_t             sampler_handle = 0;
+	Check(Ngs2RackCreate(test_system.handle, 0x1000, &sampler_option.common, &sampler_buffer,
+	                     &sampler_handle) == OK,
+	      "sampler rack creation failed");
+	auto& sampler = *reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(sampler_handle) + 1);
+	const int16_t pcm[4] = {16384, 16384, 16384, 16384};
+	sampler.SetupSampler({0x12, 2, 48000});
+	sampler.blocks.push_back({reinterpret_cast<const uint8_t*>(pcm), {0, sizeof(pcm), 0, 0, 2}});
+	sampler.ports[0].dest = &mastering;
+	sampler.SetEvent(1);
+	float                output_samples[4] = {};
+	Ngs2RenderBufferInfo output {output_samples, sizeof(output_samples), 0x18, 2};
+	Check(Ngs2SystemRender(test_system.handle, &output, 1) == OK && output_samples[0] == 0.25f &&
+	          output_samples[1] == 0.0f && output_samples[2] == 0.25f && output_samples[3] == 0.0f,
+	      "short output matrix was not treated as silent levels");
+
+	sampler.blocks.push_back({reinterpret_cast<const uint8_t*>(pcm), {0, sizeof(pcm), 0, 0, 2}});
+	sampler.SetEvent(1);
+	Ngs2RenderBufferInfo small {output_samples, sizeof(float), 0x18, 2};
+	Check(Ngs2SystemRender(test_system.handle, &small, 1) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "render accepted an output buffer that is too small");
+	Check(Ngs2RackDestroy(sampler_handle, nullptr) == OK &&
+	          Ngs2RackDestroy(rack_handle, nullptr) == OK,
+	      "mastering rack cleanup failed");
+}
+
+void TestCorruptAtrac9StopsVoice() {
+	Fixture f(24000);
+	f.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	// A whole superframe, so the decoder does not wait for more input. Header bits 01 mark a
+	// first block that reuses band parameters, which LibAtrac9 rejects.
+	Libs::Audio::Ajm::AjmSidebandDecAt9CodecInfo info {};
+	f.voice.decoder->WriteCodecInfo(&info, sizeof(info), {});
+	std::vector<uint8_t> corrupt(info.super_frame_size, 0x40);
+	f.voice.blocks.push_back({corrupt.data(), {0, corrupt.size(), 0, 0, 256}});
+	f.Render(64);
+	Check(f.voice.state != Ngs2VoicePlayState::Playing && f.voice.blocks.empty() &&
+	          !f.voice.has_samples,
+	      "corrupt ATRAC9 frame did not stop the voice");
+}
+
 void TestFilterTailDuringStarvation() {
 	Fixture reference(48000), stream(48000);
 	SetLowPass(reference);
@@ -1089,5 +1298,10 @@ int main() {
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
+	TestSystemDestroyReleasesResources();
+	TestRackCreateValidation();
+	TestInvalidMatrixControls();
+	TestMasteringOutputValidation();
+	TestCorruptAtrac9StopsVoice();
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

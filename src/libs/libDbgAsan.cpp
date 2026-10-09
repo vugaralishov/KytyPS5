@@ -195,7 +195,8 @@ static void KYTY_SYSV_ABI asan_register_elf_globals(uintptr_t* flag, Global* sta
 		AllocShadow(min_addr, max_addr);
 	}
 
-	*flag = 0;
+	// Mark the module registered so repeated calls are no-ops, as in compiler-rt.
+	*flag = 1;
 }
 
 static void KYTY_SYSV_ABI asan_before_dynamic_init(const char* module_name) {

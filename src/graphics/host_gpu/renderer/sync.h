@@ -42,6 +42,7 @@ void WriteAtEndOfPipeWithInterruptWriteBack64(uint64_t submit_id, CommandBuffer&
                                               uint64_t* dst_gpu_addr, uint64_t value, int event_id,
                                               uint32_t context_id = 0);
 
+// Returns 0 when the guest flip was invalid and dropped; the EOP writers accept that id.
 [[nodiscard]] uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index,
                                            int flip_mode, int64_t flip_arg);
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,

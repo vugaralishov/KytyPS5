@@ -4,6 +4,8 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+
 namespace Libs {
 
 namespace LibContentDelete {
@@ -170,7 +172,8 @@ struct ContentExportInitParam2 {
 	int64_t reserved1;
 };
 
-static bool g_initialized = false;
+// Set from whichever guest thread initializes the library.
+static std::atomic_bool g_initialized {false};
 
 static int KYTY_SYSV_ABI ContentExportInit2(const ContentExportInitParam2* init_param) {
 	PRINT_NAME();
@@ -215,7 +218,8 @@ struct ContentSearchInitParam {
 	size_t memory_size;
 };
 
-static bool g_initialized = false;
+// Set from whichever guest thread initializes the library.
+static std::atomic_bool g_initialized {false};
 
 static int KYTY_SYSV_ABI ContentSearchInit(const ContentSearchInitParam* init_param) {
 	PRINT_NAME();
@@ -255,7 +259,8 @@ struct ContentDeleteInitParam {
 	char   reserved2[32];
 };
 
-static bool g_initialized = false;
+// Set from whichever guest thread initializes the library.
+static std::atomic_bool g_initialized {false};
 
 static int KYTY_SYSV_ABI ContentDeleteInitialize(const ContentDeleteInitParam* init_param) {
 	PRINT_NAME();

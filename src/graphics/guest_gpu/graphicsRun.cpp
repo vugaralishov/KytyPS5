@@ -38,6 +38,9 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
+// Hardware has two indirect-buffer levels; allow headroom for AGC-generated nesting.
+static constexpr size_t MaxIndirectBufferDepth = 8;
+
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;
@@ -283,11 +286,33 @@ void CommandProcessor::IncrementCe() {
 	m_ce_count++;
 }
 
+bool CommandProcessor::IsConstRamRangeValid(uint32_t offset, uint32_t dw_num) const {
+	// Offset and size are guest packet fields; only their sum bounds the copy.
+	constexpr auto const_ram_dw =
+	    static_cast<uint64_t>(sizeof(m_const_ram) / sizeof(m_const_ram[0]));
+	if (static_cast<uint64_t>(offset / 4) + dw_num <= const_ram_dw) {
+		return true;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\t warning: const RAM range out of bounds, offset=0x%08" PRIx32 " dw_num=%" PRIu32
+		     ", packet skipped\n",
+		     offset, dw_num);
+	}
+	return false;
+}
+
 void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num) {
+	if (!IsConstRamRangeValid(offset, dw_num)) {
+		return;
+	}
 	memcpy(m_const_ram + offset / 4, src, static_cast<size_t>(dw_num) * 4);
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	if (!IsConstRamRangeValid(offset, dw_num)) {
+		return;
+	}
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -331,11 +356,40 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
 	switch (dst_sel) {
+		// AGC's default selector 0 is used for plain memory writes (AgcDcbWriteData dst 0 and the
+		// command-lane tests rely on it), so it stays a memory destination.
 		case 0:
 		case 2:
 		case 4:
-		case 5:
-		case 6: break;
+		case 5: break;
+		case 6: {
+			if (dw_num == 0) {
+				return;
+			}
+			// GDS selector: the address is a byte offset into the emulated GDS buffer.
+			auto&      buffer_cache = m_renderer.GetBufferCache();
+			const auto gds_offset   = reinterpret_cast<uint64_t>(dst);
+			const auto gds_size     = buffer_cache.GetGdsBuffer()->Size();
+			const auto write_bytes  = (write_one_address ? 1u : static_cast<uint64_t>(dw_num)) * 4u;
+			if ((gds_offset & 3u) != 0 || gds_offset > gds_size ||
+			    write_bytes > gds_size - gds_offset) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("\t warning: writeData GDS range out of bounds, offset=0x%016" PRIx64
+					     " dw_num=%" PRIu32 ", packet skipped\n",
+					     gds_offset, dw_num);
+				}
+				return;
+			}
+			if (write_one_address) {
+				buffer_cache.FillBuffer(gds_offset, 4u, src[dw_num - 1u], true);
+			} else {
+				for (uint32_t i = 0; i < dw_num; i++) {
+					buffer_cache.FillBuffer(gds_offset + i * 4u, 4u, src[i], true);
+				}
+			}
+			return;
+		}
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
 	if (dw_num == 0) {
@@ -586,10 +640,11 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::Compute: {
-			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
-			const auto*     buffer = submission.commands.data();
-			static uint32_t compute_batch_log_count = 0;
-			if (first_slice && num_dw <= 128 && compute_batch_log_count++ < 32) {
+			const auto                   num_dw = static_cast<uint32_t>(submission.commands.size());
+			const auto*                  buffer = submission.commands.data();
+			static std::atomic<uint32_t> compute_batch_log_count {0};
+			if (first_slice && num_dw <= 128 &&
+			    compute_batch_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 				LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
 				     reinterpret_cast<uint64_t>(buffer), num_dw);
 				for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
@@ -703,6 +758,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		// Handlers decode their body from the header length, so a truncated packet must not
+		// reach them.
+		if (KYTY_PM4_LEN(packet_header) > remaining_dw) {
+			static std::atomic<uint32_t> truncated_log_count {0};
+			if (truncated_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("\t error: truncated PM4 packet at offset=0x%05" PRIx32 ", cmd_id=0x%08" PRIx32
+				     ", len=%" PRIu32 ", remaining=%" PRIu32 ", rest of buffer dropped\n",
+				     total_dw - remaining_dw, packet_header, KYTY_PM4_LEN(packet_header),
+				     remaining_dw);
+			}
+			execution.m_buffer_stack.pop_back();
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
@@ -758,8 +828,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
-			if (execution.m_chain) {
+			// A call in tail position returns to an exhausted buffer, so it is equivalent to a
+			// chain; reusing the cursor keeps self-calling polling loops at constant depth.
+			if (execution.m_chain || cursor.offset_dw == cursor.commands.size()) {
 				cursor = {execution.m_next_buffer};
+			} else if (execution.m_buffer_stack.size() >= MaxIndirectBufferDepth) {
+				// A self-referencing call would otherwise grow the stack without bound.
+				static std::atomic<uint32_t> depth_log_count {0};
+				if (depth_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF(
+					    "\t error: indirect buffer nesting exceeds %u levels, call to 0x%016" PRIx64
+					    " skipped\n",
+					    static_cast<unsigned>(MaxIndirectBufferDepth),
+					    reinterpret_cast<uint64_t>(execution.m_next_buffer.data()));
+				}
 			} else {
 				execution.m_buffer_stack.push_back({execution.m_next_buffer});
 			}
@@ -872,7 +954,27 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	auto* index_addr = reinterpret_cast<const void*>(
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
-	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+	DrawIndex(
+	    {.index_count = ClampIndexCount(index_offset, index_count), .index_addr = index_addr});
+}
+
+uint32_t CommandProcessor::ClampIndexCount(uint32_t first_index, uint32_t index_count) const {
+	if (m_index_buffer_size == 0) {
+		return index_count;
+	}
+	// INDEX_BUFFER_SIZE bounds the whole buffer, so the draw may only use what follows its start.
+	const uint32_t available =
+	    (first_index < m_index_buffer_size ? m_index_buffer_size - first_index : 0u);
+	const uint32_t clamped = (std::min)(index_count, available);
+	if (clamped != index_count && GraphicsRunDebugDumpEnabled()) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("\t clamped index_count from %" PRIu32 " to %" PRIu32 " (first_index=%" PRIu32
+			     ", INDEX_BUFFER_SIZE=%" PRIu32 ")\n",
+			     index_count, clamped, first_index, m_index_buffer_size);
+		}
+	}
+	return clamped;
 }
 
 static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters registers,
@@ -954,17 +1056,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
 
 		const uint32_t index_count =
-		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
-				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
-			}
-		}
+		    ClampIndexCount(args->start_index_location, args->index_count_per_instance);
 
 		m_num_instances = args->instance_count;
 		DrawIndex({.index_count    = index_count,
@@ -1028,8 +1120,17 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	// Keep serving commands from guest threads waiting in SendCommandSync (page faults, unmaps)
+	// while the flip completes; blocking inside VideoOut would stall them until then. Flip
+	// completion does not wake the GPU thread, so poll briefly instead of suspending.
+	auto& video_out = m_renderer.GetVideoOut();
+	while (!video_out.IsFlipDone(static_cast<int>(video_out_handle),
+	                             static_cast<int>(display_buffer_index))) {
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->ProcessCommands();
+		}
+		Common::Thread::SleepMicro(200);
+	}
 }
 
 template <typename T>
@@ -1065,6 +1166,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
 
+	// The label and interrupt below are queued after these write-backs.
+	const bool defer_label = FlushUnprotectedGpuWrites();
+
 	bool with_interrupt = false;
 	switch (interrupt_selector) {
 		case 0x00:
@@ -1084,7 +1188,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		PublishLabel(dst, &data, sizeof(data), defer_label);
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1107,7 +1211,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					EmitHostReadBarrier();
 					SynchronizeGpu();
+					if (defer_label || m_deferred_labels->load(std::memory_order_acquire) != 0) {
+						// This label is written directly: let the write-backs and earlier
+						// deferred labels of the finished submission land first.
+						GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick() - 1);
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
@@ -1138,7 +1248,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					PublishLabel(dst, &value, sizeof(value), defer_label);
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1268,8 +1378,51 @@ void CommandProcessor::EmitGlobalBarrier() {
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 
+void CommandProcessor::EmitHostReadBarrier() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+
+	// Make GPU writes (for example to GDS) visible to host reads after the next wait.
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	GetScheduler().EndRendering();
+	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+}
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+	(void)FlushUnprotectedGpuWrites();
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
+}
+
+bool CommandProcessor::FlushUnprotectedGpuWrites() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+	const bool        buffers = m_renderer.GetBufferCache().FlushUnprotectedGpuWrites();
+	const bool        images  = m_renderer.GetTextureCache().FlushUnprotectedGpuWrites();
+	return buffers || images;
+}
+
+void CommandProcessor::PublishLabel(void* dst, const void* data, size_t size, bool defer) {
+	EXIT_IF(dst == nullptr || size > sizeof(uint64_t));
+	if (!defer && m_deferred_labels->load(std::memory_order_acquire) == 0) {
+		std::memcpy(dst, data, size);
+		return;
+	}
+	// Priority operations run in order, so the write-backs recorded for this tick and any
+	// earlier deferred label reach guest memory before this label does. The interrupt that may
+	// follow is queued after it as well.
+	uint64_t value = 0;
+	std::memcpy(&value, data, size);
+	m_deferred_labels->fetch_add(1, std::memory_order_acq_rel);
+	GetScheduler().DeferPriorityOperation([dst, value, size, pending = m_deferred_labels] {
+		std::memcpy(dst, &value, size);
+		pending->fetch_sub(1, std::memory_order_acq_rel);
+	});
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1356,6 +1509,7 @@ void CommandProcessor::Flip() {
 		LOGF("CommandProcessor::Flip()\n");
 	}
 
+	(void)FlushUnprotectedGpuWrites();
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1374,7 +1528,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	PublishLabel(dst_gpu_addr, &value, sizeof(value), FlushUnprotectedGpuWrites());
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -1397,9 +1551,15 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	}
 
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
-		EXIT("unknown event type\n");
+		// The marker payload is guest data; the flip still uses the write-back + interrupt path.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("\t warning: flip with interrupt uses unexpected event type 0x%08" PRIx32
+			     " / cache action 0x%08" PRIx32 "\n",
+			     eop_event_type, cache_action);
+		}
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	PublishLabel(dst_gpu_addr, &value, sizeof(value), FlushUnprotectedGpuWrites());
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

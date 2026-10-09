@@ -601,6 +601,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
+	// Guest group counts may exceed maxComputeWorkGroupCount; such dispatches are split with
+	// vkCmdDispatchBase, which requires this flag. A per-dispatch variant would duplicate the
+	// pipeline for a decision only known at dispatch time.
+	info.flags             = vk::PipelineCreateFlagBits::eDispatchBase;
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;

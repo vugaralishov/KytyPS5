@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <fmt/format.h>
 
@@ -357,8 +358,10 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
-void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
-	const uint32_t pc = word_index * sizeof(uint32_t);
+namespace {
+
+void DecodeInstructionWords(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                            Instruction& inst) {
 	switch (GetInstructionFamily(code[word_index])) {
 		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
 		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
@@ -380,6 +383,29 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
 			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+	}
+}
+
+} // namespace
+
+void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
+	EXIT_IF(word_index >= code.size());
+	const uint32_t pc = word_index * sizeof(uint32_t);
+	// The family decoders read extension, NSA and literal dwords without bounds checks. Near the
+	// end of the code, decode from a zero-padded copy and reject an instruction that does not fit.
+	constexpr uint32_t PaddedWords = MaxInstructionRawWords + 1u;
+	const auto         available   = code.size() - word_index;
+	if (available >= PaddedWords) {
+		DecodeInstructionWords(pc, code, word_index, inst);
+		return;
+	}
+	std::array<uint32_t, PaddedWords> padded {};
+	std::copy_n(code.begin() + word_index, available, padded.begin());
+	DecodeInstructionWords(pc, padded, 0, inst);
+	if (inst.word_count > available) {
+		SetUnsupported(inst, inst.family, inst.opcode_id,
+		               "instruction extends past the end of the shader code");
+		inst.word_count = static_cast<uint32_t>(available);
 	}
 }
 
@@ -407,7 +433,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.reserve(code.size());
 	program.code = code;
 
-	std::vector<bool> branch_targets;
+	// Code after S_ENDPGM is decoded only up to the furthest in-range direct branch target, which
+	// also covers blocks reached solely by a later backward branch. Out-of-range targets (including
+	// negative offsets that wrapped) are left for the CFG builder to reject.
+	bool     has_branch_target = false;
+	uint32_t max_target_index  = 0;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
@@ -417,13 +447,14 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
-			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+			if (target_index < code.size()) {
+				max_target_index =
+				    (std::max)(max_target_index, static_cast<uint32_t>(target_index));
+				has_branch_target = true;
 			}
-			branch_targets[target_index] = true;
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
+		    (word_index >= code.size() || !has_branch_target || word_index > max_target_index)) {
 			return;
 		}
 	}

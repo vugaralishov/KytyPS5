@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -211,6 +212,8 @@ struct ProtectionCall {
 };
 
 std::vector<ProtectionCall> g_protection_log;
+// Ranges the stubbed kernel reports as never protectable (guest stacks on Windows).
+std::vector<std::pair<uint64_t, uint64_t>> g_unprotectable_ranges;
 std::mutex g_protection_log_mutex;
 
 void ResetProtectionLog() {
@@ -599,6 +602,72 @@ void TestGpuDirtyBits() {
         "GPU dirty state did not restore write-only tracking");
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestUnprotectablePagesStayCpuDirty() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto stack = address + page_size;
+  g_unprotectable_ranges = {{stack, stack + page_size}};
+
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(stack + page_size, page_size) &&
+            tracker.IsRegionCpuModified(stack, page_size) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READWRITE,
+        "an unprotectable page was armed for write tracking");
+
+  uint32_t ranges = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false,
+      [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+        Check(upload_address == stack && upload_size == page_size,
+              "only the unprotectable page is uploaded again");
+        ranges++;
+      },
+      []() noexcept {});
+  Check(ranges == 1 && tracker.IsRegionCpuModified(stack, page_size),
+        "an unprotectable page was not re-uploaded on every use");
+
+  // A GPU write takes the page; read-only uploads must not make it CPU-dirty
+  // again until its owner writes it back.
+  tracker.ForEachUploadRange(
+      stack, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.IsRegionGpuModified(stack, page_size) &&
+            !tracker.IsRegionCpuModified(stack, page_size),
+        "a written unprotectable page did not become GPU-dirty");
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.IsRegionGpuModified(stack, page_size) &&
+            !tracker.IsRegionCpuModified(stack, page_size),
+        "a read-only upload took a GPU-owned unprotectable page");
+  tracker.UnmarkRegionAsGpuModified(stack, page_size);
+  tracker.MarkRegionAsCpuModified(stack, page_size);
+  Check(tracker.IsRegionCpuModified(stack, page_size) && IsWritable(memory + page_size),
+        "a written-back unprotectable page did not return to CPU ownership");
+  uint32_t reuploads = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false,
+      [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+        reuploads += upload_address == stack && upload_size == page_size;
+      },
+      []() noexcept {});
+  Check(reuploads == 1 && tracker.IsRegionCpuModified(stack, page_size),
+        "the next GPU read after a write-back did not re-upload the page");
+
+  g_unprotectable_ranges.clear();
+  tracker.MarkRegionAsCpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
   Release(memory);
 }
 
@@ -1026,6 +1095,32 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+void TestDestructionReleasesWatchers() {
+  uint8_t *memory = nullptr;
+  uint64_t page_size = 0;
+  {
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    page_size = harness.page_manager.GetPageSize();
+    memory = Allocate(harness.page_manager, 2);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    tracker.ForEachUploadRange(
+        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+    tracker.ForEachUploadRange(
+        address + page_size, page_size, false,
+        [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+    Check(Protection(memory) == PAGE_NOACCESS &&
+              Protection(memory + page_size) == PAGE_READONLY,
+          "destruction setup did not install read and write watchers");
+    // Shutdown leaves GPU-dirty pages behind. The page manager fails fast on
+    // leaked watchers when the harness is destroyed.
+  }
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "tracker destruction did not release its page watchers");
+  Release(memory);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1187,6 +1282,17 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+void GetUnprotectableGuestRanges(
+    uint64_t vaddr, uint64_t size,
+    std::vector<std::pair<uint64_t, uint64_t>> *out) {
+  const auto end = vaddr + size;
+  for (const auto &[start, stop] : g_unprotectable_ranges) {
+    if (start < end && stop > vaddr) {
+      out->emplace_back(std::max(start, vaddr), std::min(stop, end));
+    }
+  }
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -1206,6 +1312,7 @@ int main(int argc, char **argv) {
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
+  TestUnprotectablePagesStayCpuDirty();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
@@ -1214,6 +1321,7 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestDestructionReleasesWatchers();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

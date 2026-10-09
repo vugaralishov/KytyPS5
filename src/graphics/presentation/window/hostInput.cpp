@@ -133,6 +133,11 @@ public:
 				    std::clamp(std::isfinite(sensitivity) ? sensitivity : 1.0f, 0.1f, 5.0f);
 				continue;
 			}
+			// The launcher sends this marker when the user cleared every binding on purpose.
+			if (entry == "Custom=None") {
+				m_custom = true;
+				continue;
+			}
 			const auto split = entry.find('=');
 
 			Binding binding;
@@ -154,7 +159,7 @@ public:
 			Add(binding);
 		}
 	}
-	[[nodiscard]] bool  Custom() const { return m_size != 0; }
+	[[nodiscard]] bool  Custom() const { return m_custom || m_size != 0; }
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
 
 	[[nodiscard]] std::size_t FindKey(int key_code) const {
@@ -188,6 +193,7 @@ private:
 	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
 	std::size_t                              m_size              = 0;
 	float                                    m_mouse_sensitivity = 1.0f;
+	bool                                     m_custom            = false;
 };
 
 const InputMap& GetInputMap() {

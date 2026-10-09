@@ -73,15 +73,25 @@ static std::filesystem::path           g_output_file;
 static std::mutex                      g_logger_mutex;
 static std::shared_ptr<spdlog::logger> g_logger;
 
-void Flush() {
+static std::shared_ptr<spdlog::logger> GetLogger();
+
+// Caller holds g_logger_mutex.
+static void FlushUnlocked() {
 	if (g_logger != nullptr) {
 		g_logger->flush();
 	}
 }
 
+void Flush() {
+	// Copy under the lock: Shutdown and SetupLogger reset g_logger concurrently.
+	if (auto logger = GetLogger()) {
+		logger->flush();
+	}
+}
+
 static void SetupLogger() {
 	std::lock_guard lock(g_logger_mutex);
-	Flush();
+	FlushUnlocked();
 	g_logger.reset();
 
 	switch (g_direction) {

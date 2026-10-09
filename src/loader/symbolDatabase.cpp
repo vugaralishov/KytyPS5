@@ -1,6 +1,7 @@
 #include "loader/symbolDatabase.h"
 
 #include "common/file.h"
+#include "common/logging/log.h"
 
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -21,10 +22,21 @@ std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 	                   s.module_version_minor, magic_enum::enum_name(s.type));
 }
 
+// The last definition wins; report it when it changes the address a name resolves to.
+static void WarnOnOverride(const std::unordered_map<std::string, size_t>& map,
+                           const std::vector<SymbolRecord>& symbols, const SymbolRecord& r) {
+	if (auto it = map.find(r.name);
+	    it != map.end() && it->second < symbols.size() && symbols[it->second].vaddr != r.vaddr) {
+		LOGF("SymbolDatabase: %s redefined: %016" PRIx64 " -> %016" PRIx64 "\n", r.name.c_str(),
+		     symbols[it->second].vaddr, r.vaddr);
+	}
+}
+
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
 	SymbolRecord r {};
 	r.name  = GenerateName(s);
 	r.vaddr = vaddr;
+	WarnOnOverride(m_map, m_symbols, r);
 	m_map.insert_or_assign(r.name, m_symbols.size());
 	m_symbols.push_back(r);
 }
@@ -34,6 +46,17 @@ void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr, const std::stri
 	r.name     = GenerateName(s);
 	r.vaddr    = vaddr;
 	r.dbg_name = dbg_name;
+	WarnOnOverride(m_map, m_symbols, r);
+	m_map.insert_or_assign(r.name, m_symbols.size());
+	m_symbols.push_back(r);
+}
+
+void SymbolDatabase::AddTls(const SymbolResolve& s, uint64_t tls_offset, const Program* program) {
+	SymbolRecord r {};
+	r.name        = GenerateName(s);
+	r.vaddr       = tls_offset;
+	r.tls_program = program;
+	WarnOnOverride(m_map, m_symbols, r);
 	m_map.insert_or_assign(r.name, m_symbols.size());
 	m_symbols.push_back(r);
 }

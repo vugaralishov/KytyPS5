@@ -10,13 +10,15 @@ template <class T>
 class Singleton {
 public:
 	static T* Instance() {
-		if (!g_m_instance) {
+		// A function-local static is initialized exactly once even when several threads race
+		// the first call. The object is intentionally never destroyed.
+		static T* const instance = [] {
 			// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,hicpp-no-malloc)
-			g_m_instance = static_cast<T*>(std::malloc(sizeof(T)));
-			new (g_m_instance) T;
-		}
+			auto* storage = static_cast<T*>(std::malloc(sizeof(T)));
+			return new (storage) T;
+		}();
 
-		return g_m_instance;
+		return instance;
 	}
 
 	KYTY_CLASS_NO_COPY(Singleton);
@@ -24,9 +26,6 @@ public:
 protected:
 	Singleton();
 	~Singleton();
-
-private:
-	static inline T* g_m_instance = nullptr;
 };
 
 // template<class T> T* Singleton<T>::instance = 0;

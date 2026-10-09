@@ -202,6 +202,23 @@ union ShaderStageInputInfo {
 	const ShaderComputeInputInfo* compute = nullptr;
 };
 
+// Optional host-device shader capabilities that change the emitted SPIR-V. They are fixed for the
+// lifetime of the Vulkan device, so in-memory shader caches need no key for them.
+struct ShaderHostFeatures {
+	bool min_lod = true; // shaderResourceMinLod
+	// VkPhysicalDeviceFloatControlsProperties for 32- and 64-bit floats.
+	bool rounding_rte_f32     = false;
+	bool rounding_rtz_f32     = false;
+	bool rounding_rte_f64     = false;
+	bool rounding_rtz_f64     = false;
+	bool denorm_preserve_f32  = false;
+	bool denorm_flush_f32     = false;
+	bool denorm_preserve_f64  = false;
+	bool denorm_flush_f64     = false;
+	bool independent_rounding = false; // roundingModeIndependence != NONE
+	bool independent_denorm   = false; // denormBehaviorIndependence != NONE
+};
+
 inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType           stage,
                                                             ShaderStageInputInfo input) {
 	switch (stage) {

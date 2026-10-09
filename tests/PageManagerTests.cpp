@@ -1,6 +1,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
+#include <algorithm>
 #include <barrier>
 #include <cstdint>
 #include <cstdio>
@@ -170,6 +171,8 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+// Ranges the stubbed kernel reports as never protectable (guest stacks on Windows).
+std::vector<std::pair<uint64_t, uint64_t>> g_unprotectable_ranges;
 std::mutex g_protection_log_mutex;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
@@ -488,6 +491,83 @@ void TestRegionEndpointBatching() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestManySharedWriteWatchers() {
+  // Every image on a page holds its own write watcher; 128 of them must not overflow.
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  constexpr uint32_t watchers = 1000;
+  for (uint32_t count = 0; count < watchers; count++) {
+    manager.UpdatePageWatchers<true>(address, page_size);
+  }
+  Check(Protection(memory) == PAGE_READONLY,
+        "many write watchers did not protect the page");
+  for (uint32_t count = 1; count < watchers; count++) {
+    manager.UpdatePageWatchers<false>(address, page_size);
+  }
+  Check(Protection(memory) == PAGE_READONLY,
+        "releasing all but one write watcher unprotected the page");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(IsWritable(memory), "last of many write watchers did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestUnprotectablePageQuery() {
+  PageManager manager;
+  constexpr uint64_t base = 0x0000000200000000ull;
+  constexpr auto page = TRACKER_PAGE_SIZE;
+  g_unprotectable_ranges = {{base + page * 2, base + page * 4},
+                            {base + page * 10 + 16, base + page * 11}};
+  RegionBits first_half;
+  manager.MarkUnprotectablePages(base, 0, 8, first_half);
+  Check(!first_half.Get(1) && first_half.Get(2) && first_half.Get(3) &&
+            !first_half.Get(4) && !first_half.Get(10),
+        "unprotectable query escaped its page window");
+  RegionBits all;
+  manager.MarkUnprotectablePages(base, 0, 16, all);
+  Check(all.Get(2) && all.Get(3) && !all.Get(9) && all.Get(10) && !all.Get(11),
+        "unprotectable query did not cover partially stacked pages");
+  g_unprotectable_ranges.clear();
+  RegionBits none;
+  manager.MarkUnprotectablePages(base, 0, 16, none);
+  Check(none.None(), "protectable pages were reported unprotectable");
+}
+
+void TestAccessWatchedQuery() {
+  using Libs::Graphics::PageFaultAccess;
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(!manager.IsAccessWatched(address, PageFaultAccess::Write) &&
+            !manager.IsAccessWatched(address, PageFaultAccess::Read),
+        "unwatched page reported a watcher");
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(manager.IsAccessWatched(address + 17, PageFaultAccess::Write) &&
+            manager.IsAccessWatched(address, PageFaultAccess::Unknown) &&
+            !manager.IsAccessWatched(address, PageFaultAccess::Read) &&
+            !manager.IsAccessWatched(address, PageFaultAccess::Execute) &&
+            !manager.IsAccessWatched(address + page_size,
+                                     PageFaultAccess::Write),
+        "write watcher ownership was misreported");
+
+  RegionBits mask;
+  const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+  mask.Set(static_cast<size_t>((address - region_base) / page_size));
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  Check(manager.IsAccessWatched(address, PageFaultAccess::Read) &&
+            manager.IsAccessWatched(address, PageFaultAccess::Execute),
+        "access watcher did not own read faults");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(!manager.IsAccessWatched(address, PageFaultAccess::Write) &&
+            !manager.IsAccessWatched(address, PageFaultAccess::Read),
+        "released page still reported a watcher");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestReadWriteWatcherInteractions() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -613,7 +693,7 @@ void TestConcurrentSharedWatchers() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count <= 0x7fff; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -690,6 +770,17 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+void GetUnprotectableGuestRanges(
+    uint64_t vaddr, uint64_t size,
+    std::vector<std::pair<uint64_t, uint64_t>> *out) {
+  const auto end = vaddr + size;
+  for (const auto &[start, stop] : g_unprotectable_ranges) {
+    if (start < end && stop > vaddr) {
+      out->emplace_back(std::max(start, vaddr), std::min(stop, end));
+    }
+  }
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -703,6 +794,9 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
+  TestManySharedWriteWatchers();
+  TestUnprotectablePageQuery();
+  TestAccessWatchedQuery();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestFatalPaths();

@@ -11,7 +11,14 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 }
 
-MemoryTracker::~MemoryTracker() = default;
+MemoryTracker::~MemoryTracker() {
+	// The owner has stopped all callers. Unread GPU data is discarded at shutdown; return the
+	// remaining watchers so the shared page manager stays balanced and the pages accessible.
+	for (auto& manager: m_region_storage) {
+		std::scoped_lock lock(manager->lock);
+		manager->ReleaseWatchers();
+	}
+}
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,

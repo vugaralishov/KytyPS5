@@ -28,6 +28,9 @@
 #pragma clang diagnostic ignored "-Wsign-compare"
 #pragma clang diagnostic ignored "-Wunused-function"
 #endif
+// stb only asserts on unimplemented-but-harmless cases (cmap format 2, point-matched components,
+// rasterizer rounding); guest fonts must not be able to abort debug builds through them.
+#define STBTT_assert(x) ((void)0)
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 #if defined(__clang__)
@@ -208,6 +211,10 @@ struct FontState {
 	const uint8_t*                                                 ttf_data;
 	uint32_t                                                       ttf_size;
 	bool                                                           has_ttf;
+	// Host copy of validated guest font data (empty for the host fallback font).
+	std::vector<uint8_t> ttf_copy;
+	// Per glyph: 1 if stb can process it safely; empty means every glyph is trusted.
+	std::vector<uint8_t>                                           glyph_safe;
 	std::vector<uint8_t>                                           fallback_image;
 	FontTransImage                                                 trans_image;
 };
@@ -421,6 +428,22 @@ static void register_writing_state(FontWritingState* state) {
 static bool unregister_writing_state(void* state) {
 	std::scoped_lock lock(g_writing_mutex);
 	return g_writing_states.erase(state) != 0;
+}
+
+static void release_writing_states_of(const FontStringState* string) {
+	if (string == nullptr) {
+		return;
+	}
+	std::scoped_lock lock(g_writing_mutex);
+	for (auto it = g_writing_states.begin(); it != g_writing_states.end();) {
+		auto* state = static_cast<FontWritingState*>(*it);
+		if (state->string == string) {
+			it = g_writing_states.erase(it);
+			delete state;
+		} else {
+			++it;
+		}
+	}
 }
 
 static bool is_known_writing_state(void* state) {
@@ -767,20 +790,462 @@ static bool ttf_data_has_supported_magic(const uint8_t* data, uint32_t size) {
 	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O');
 }
 
-static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
+static uint32_t ttf_be16(const uint8_t* data, uint64_t off) {
+	return (static_cast<uint32_t>(data[off]) << 8u) | static_cast<uint32_t>(data[off + 1]);
+}
+
+static uint32_t ttf_be32(const uint8_t* data, uint64_t off) {
+	return (ttf_be16(data, off) << 16u) | ttf_be16(data, off + 2);
+}
+
+// stb_truetype trusts the sfnt table directory, so guest font memory must have every table
+// record inside the buffer (and the fixed-offset tables it reads large enough) before init.
+static bool ttf_data_has_valid_directory(const uint8_t* data, uint32_t size) {
+	const uint64_t num_tables = ttf_be16(data, 4);
+	if (num_tables == 0 || 12 + num_tables * 16 > size) {
+		return false;
+	}
+
+	for (uint64_t i = 0; i < num_tables; i++) {
+		const uint64_t record = 12 + i * 16;
+		const uint64_t offset = ttf_be32(data, record + 8);
+		const uint64_t length = ttf_be32(data, record + 12);
+		if (offset + length > size) {
+			return false;
+		}
+
+		uint64_t min_length = 0;
+		if (std::memcmp(data + record, "head", 4) == 0) {
+			min_length = 54;
+		} else if (std::memcmp(data + record, "hhea", 4) == 0) {
+			min_length = 36;
+		} else if (std::memcmp(data + record, "maxp", 4) == 0) {
+			min_length = 6;
+		} else if (std::memcmp(data + record, "cmap", 4) == 0) {
+			min_length = 4;
+		}
+		if (length < min_length) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// Limits for what stb may be asked to process from a guest font: composite nesting (stb recurses
+// per level), components per composite and vertices per glyph (stb's composite merge is
+// quadratic and uses int sizes), and total points walked by the validator itself.
+constexpr uint32_t TTF_MAX_COMPOSITE_HEIGHT     = 8;
+constexpr size_t   TTF_MAX_COMPOSITE_COMPONENTS = 128;
+constexpr uint64_t TTF_MAX_GLYPH_VERTICES       = 1u << 18u;
+constexpr uint64_t TTF_MAX_VALIDATED_POINTS     = 1u << 26u;
+constexpr uint32_t TTF_MAX_CMAP_GROUPS          = 0x110000;
+
+struct TtfTable {
+	uint64_t offset = 0;
+	uint64_t length = 0;
+
+	[[nodiscard]] bool     Present() const { return offset != 0; }
+	[[nodiscard]] uint64_t End() const { return offset + length; }
+};
+
+// Mirrors stbtt__find_table: the first record with the tag wins and offset 0 means missing.
+static TtfTable ttf_find_table(const uint8_t* data, const char* tag) {
+	const uint64_t num_tables = ttf_be16(data, 4);
+	for (uint64_t i = 0; i < num_tables; i++) {
+		const uint64_t record = 12 + i * 16;
+		if (std::memcmp(data + record, tag, 4) == 0) {
+			return {ttf_be32(data, record + 8), ttf_be32(data, record + 12)};
+		}
+	}
+	return {};
+}
+
+// Checks the cmap subtable stbtt_InitFont selects and every array stbtt_FindGlyphIndex reads
+// from it. The glyph ids it yields are range-checked separately at lookup time.
+static bool ttf_cmap_is_safe(const uint8_t* data, const TtfTable& cmap) {
+	const uint64_t end        = cmap.End();
+	const uint64_t num_tables = ttf_be16(data, cmap.offset + 2);
+	if (cmap.length < 4 + num_tables * 8) {
+		return false;
+	}
+
+	uint64_t index_map = 0;
+	for (uint64_t i = 0; i < num_tables; i++) {
+		const uint64_t record   = cmap.offset + 4 + 8 * i;
+		const uint32_t platform = ttf_be16(data, record);
+		const uint32_t encoding = ttf_be16(data, record + 2);
+		if (platform == STBTT_PLATFORM_ID_UNICODE ||
+		    (platform == STBTT_PLATFORM_ID_MICROSOFT &&
+		     (encoding == STBTT_MS_EID_UNICODE_BMP || encoding == STBTT_MS_EID_UNICODE_FULL))) {
+			index_map = cmap.offset + ttf_be32(data, record + 4);
+		}
+	}
+	if (index_map == 0 || index_map + 2 > end) {
+		return false;
+	}
+
+	switch (ttf_be16(data, index_map)) {
+		case 0: {
+			// Reads index_map + 6 + code for code < length - 6.
+			return index_map + 4 <= end && ttf_be16(data, index_map + 2) <= end - index_map;
+		}
+		case 6: {
+			return index_map + 10 <= end &&
+			       index_map + 10 + 2 * static_cast<uint64_t>(ttf_be16(data, index_map + 8)) <= end;
+		}
+		case 4: {
+			if (index_map + 14 > end) {
+				return false;
+			}
+			const uint64_t seg_count = ttf_be16(data, index_map + 6) >> 1u;
+			if (seg_count == 0 || index_map + 16 + 8 * seg_count > end) {
+				return false;
+			}
+			// The binary search trusts searchRange/entrySelector/rangeShift; only the values the
+			// spec derives from segCount keep it inside endCount[].
+			uint64_t range    = 1;
+			uint32_t selector = 0;
+			while (range * 2 <= seg_count) {
+				range *= 2;
+				selector++;
+			}
+			if ((ttf_be16(data, index_map + 8) >> 1u) != range ||
+			    ttf_be16(data, index_map + 10) != selector ||
+			    (ttf_be16(data, index_map + 12) >> 1u) != seg_count - range) {
+				return false;
+			}
+			for (uint64_t item = 0; item < seg_count; item++) {
+				const uint64_t last  = ttf_be16(data, index_map + 14 + 2 * item);
+				const uint64_t first = ttf_be16(data, index_map + 16 + 2 * seg_count + 2 * item);
+				const uint64_t range_offset = index_map + 16 + 6 * seg_count + 2 * item;
+				const uint64_t offset       = ttf_be16(data, range_offset);
+				if (offset != 0 && first <= last &&
+				    range_offset + offset + (last - first) * 2 + 2 > end) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case 12:
+		case 13: {
+			if (index_map + 16 > end) {
+				return false;
+			}
+			const uint64_t groups = ttf_be32(data, index_map + 12);
+			return groups <= TTF_MAX_CMAP_GROUPS && index_map + 16 + 12 * groups <= end;
+		}
+		// stb maps nothing through the other formats and reads only the format field.
+		default: return true;
+	}
+}
+
+enum class TtfGlyphKind : uint8_t { Empty, Simple, Composite, Bad };
+
+struct TtfGlyphInfo {
+	TtfGlyphKind          kind     = TtfGlyphKind::Empty;
+	uint64_t              vertices = 0;
+	std::vector<uint16_t> components;
+};
+
+// Mirrors the byte consumption of stbtt__GetGlyphShapeTT for a simple glyph at [start, end).
+static bool ttf_parse_simple_glyph(const uint8_t* data, uint64_t start, uint64_t end,
+                                   uint64_t contours, uint64_t* budget, std::vector<uint8_t>* flags,
+                                   uint64_t* vertices) {
+	uint64_t pos = start + 10 + 2 * contours + 2;
+	if (pos > end) {
+		return false;
+	}
+	// Strictly increasing end points keep stb's contour index inside endPtsOfContours.
+	uint64_t last_end = 0;
+	uint64_t prev_end = 0;
+	for (uint64_t c = 0; c < contours; c++) {
+		const uint64_t value = ttf_be16(data, start + 10 + 2 * c);
+		if (c > 0 && value <= last_end) {
+			return false;
+		}
+		prev_end = last_end;
+		last_end = value;
+	}
+	const uint64_t points = last_end + 1;
+	if (points > *budget) {
+		*budget = 0; // tells the caller to give up on the whole font
+		return false;
+	}
+	*budget -= points;
+	pos += ttf_be16(data, start + 10 + 2 * contours);
+
+	flags->resize(points);
+	uint8_t  flag   = 0;
+	uint32_t repeat = 0;
+	for (uint64_t i = 0; i < points; i++) {
+		if (repeat == 0) {
+			if (pos >= end) {
+				return false;
+			}
+			flag = data[pos++];
+			if ((flag & 8u) != 0) {
+				if (pos >= end) {
+					return false;
+				}
+				repeat = data[pos++];
+			}
+		} else {
+			repeat--;
+		}
+		(*flags)[i] = flag;
+	}
+	for (uint64_t i = 0; i < points; i++) {
+		const uint8_t f = (*flags)[i];
+		pos += ((f & 2u) != 0 ? 1 : ((f & 16u) != 0 ? 0 : 2));
+		pos += ((f & 4u) != 0 ? 1 : ((f & 32u) != 0 ? 0 : 2));
+	}
+	if (pos > end) {
+		return false;
+	}
+	// stb peeks at the point after an off-curve contour start; for a final one-point contour
+	// that is one past its vertex array.
+	const uint64_t last_start = (contours == 1 ? 0 : prev_end + 1);
+	if (last_start == points - 1 && ((*flags)[points - 1] & 1u) == 0) {
+		return false;
+	}
+
+	*vertices = points + 2 * contours;
+	return true;
+}
+
+// Mirrors the component walk of stbtt__GetGlyphShapeTT for a composite glyph.
+static bool ttf_parse_composite_glyph(const uint8_t* data, uint64_t start, uint64_t end,
+                                      std::vector<uint16_t>* components) {
+	uint64_t pos  = start + 10;
+	bool     more = true;
+	while (more) {
+		if (pos + 4 > end || components->size() >= TTF_MAX_COMPOSITE_COMPONENTS) {
+			return false;
+		}
+		const uint32_t flags = ttf_be16(data, pos);
+		components->push_back(static_cast<uint16_t>(ttf_be16(data, pos + 2)));
+		pos += 4;
+		if ((flags & 2u) != 0) {
+			pos += ((flags & 1u) != 0 ? 4 : 2);
+		}
+		if ((flags & 8u) != 0) {
+			pos += 2;
+		} else if ((flags & 0x40u) != 0) {
+			pos += 4;
+		} else if ((flags & 0x80u) != 0) {
+			pos += 8;
+		}
+		if (pos > end) {
+			return false;
+		}
+		more = (flags & 0x20u) != 0;
+	}
+	return true;
+}
+
+// Resolves composites: a glyph is safe when its own data is, every component it draws is, the
+// nesting is acyclic and shallow, and the merged vertex count stays bounded. Iterative so a long
+// component chain cannot exhaust the host stack.
+static void ttf_resolve_composites(std::vector<TtfGlyphInfo>* glyphs, std::vector<uint8_t>* safe) {
+	const auto            count = glyphs->size();
+	std::vector<uint8_t>  state(count, 0); // 0 new, 1 on stack, 2 done
+	std::vector<uint32_t> height(count, 0);
+	struct Frame {
+		uint32_t glyph;
+		size_t   next;
+	};
+	std::vector<Frame> stack;
+
+	auto combine = [&](uint32_t parent, uint32_t child) {
+		if ((*safe)[child] == 0) {
+			(*safe)[parent] = 0;
+			return;
+		}
+		auto& info     = (*glyphs)[parent];
+		height[parent] = (std::max)(height[parent], height[child] + 1);
+		info.vertices += (*glyphs)[child].vertices;
+		if (height[parent] > TTF_MAX_COMPOSITE_HEIGHT || info.vertices > TTF_MAX_GLYPH_VERTICES) {
+			(*safe)[parent] = 0;
+		}
+	};
+
+	for (uint32_t root = 0; root < count; root++) {
+		if (state[root] != 0) {
+			continue;
+		}
+		state[root] = 1;
+		stack.push_back({root, 0});
+		while (!stack.empty()) {
+			const uint32_t glyph = stack.back().glyph;
+			const auto&    info  = (*glyphs)[glyph];
+			if (info.kind == TtfGlyphKind::Composite && (*safe)[glyph] != 0 &&
+			    stack.back().next < info.components.size()) {
+				const uint32_t child = info.components[stack.back().next++];
+				if (child >= count) {
+					continue; // stb draws nothing for an out-of-range component
+				}
+				if (state[child] == 1) {
+					(*safe)[glyph] = 0; // cycle
+				} else if (state[child] == 0) {
+					state[child] = 1;
+					stack.push_back({child, 0});
+				} else {
+					combine(glyph, child);
+				}
+				continue;
+			}
+			state[glyph] = 2;
+			stack.pop_back();
+			if (!stack.empty()) {
+				combine(stack.back().glyph, glyph);
+			}
+		}
+	}
+}
+
+// Validates guest TrueType data for every structure the stb_truetype functions used here read
+// (table directory, cmap, head, hhea/hmtx, maxp, loca/glyf outlines, kern) and reports per glyph
+// whether stb may process it. CFF outlines are not accepted, and GPOS kerning is disabled by the
+// caller instead of being validated.
+static bool ttf_validate_guest_font(const uint8_t* data, uint32_t size,
+                                    std::vector<uint8_t>* glyph_safe, bool* kern_ok) {
+	if (!ttf_data_has_supported_magic(data, size) || !ttf_data_has_valid_directory(data, size)) {
+		return false;
+	}
+
+	const auto cmap = ttf_find_table(data, "cmap");
+	const auto head = ttf_find_table(data, "head");
+	const auto hhea = ttf_find_table(data, "hhea");
+	const auto hmtx = ttf_find_table(data, "hmtx");
+	const auto maxp = ttf_find_table(data, "maxp");
+	const auto loca = ttf_find_table(data, "loca");
+	const auto glyf = ttf_find_table(data, "glyf");
+	const auto kern = ttf_find_table(data, "kern");
+	if (!cmap.Present() || !head.Present() || !hhea.Present() || !hmtx.Present() ||
+	    !maxp.Present() || !loca.Present() || !glyf.Present()) {
+		return false;
+	}
+
+	const uint32_t units_per_em = ttf_be16(data, head.offset + 18);
+	const uint32_t loca_format  = ttf_be16(data, head.offset + 50);
+	const uint64_t num_glyphs   = ttf_be16(data, maxp.offset + 4);
+	const uint64_t num_metrics  = ttf_be16(data, hhea.offset + 34);
+	if (units_per_em < 16 || units_per_em > 16384 || loca_format > 1 || num_glyphs == 0 ||
+	    num_metrics == 0) {
+		return false;
+	}
+	if (hmtx.length <
+	    4 * num_metrics + 2 * (num_glyphs > num_metrics ? num_glyphs - num_metrics : 0)) {
+		return false;
+	}
+	const uint64_t loca_entry = (loca_format == 0 ? 2 : 4);
+	if (loca.length < (num_glyphs + 1) * loca_entry || !ttf_cmap_is_safe(data, cmap)) {
+		return false;
+	}
+
+	std::vector<TtfGlyphInfo> glyphs(num_glyphs);
+	std::vector<uint8_t>      safe(num_glyphs, 0);
+	std::vector<uint8_t>      flags;
+	uint64_t                  budget = TTF_MAX_VALIDATED_POINTS;
+	for (uint64_t glyph = 0; glyph < num_glyphs; glyph++) {
+		uint64_t g1 = 0;
+		uint64_t g2 = 0;
+		if (loca_format == 0) {
+			g1 = 2 * static_cast<uint64_t>(ttf_be16(data, loca.offset + glyph * 2));
+			g2 = 2 * static_cast<uint64_t>(ttf_be16(data, loca.offset + glyph * 2 + 2));
+		} else {
+			g1 = ttf_be32(data, loca.offset + glyph * 4);
+			g2 = ttf_be32(data, loca.offset + glyph * 4 + 4);
+		}
+		auto& info = glyphs[glyph];
+		if (g1 == g2) {
+			safe[glyph] = 1; // stb treats a zero-length glyph as empty and reads nothing
+			continue;
+		}
+		if (g1 > g2 || g2 > glyf.length || g2 - g1 < 10) {
+			info.kind = TtfGlyphKind::Bad;
+			continue;
+		}
+		const uint64_t start    = glyf.offset + g1;
+		const uint64_t end      = glyf.offset + g2;
+		const auto     contours = static_cast<int16_t>(ttf_be16(data, start));
+		bool           ok       = true;
+		if (contours > 0) {
+			info.kind = TtfGlyphKind::Simple;
+			ok = ttf_parse_simple_glyph(data, start, end, static_cast<uint64_t>(contours), &budget,
+			                            &flags, &info.vertices);
+			if (!ok && budget == 0) {
+				return false; // too large to validate
+			}
+		} else if (contours < 0) {
+			info.kind = TtfGlyphKind::Composite;
+			ok        = ttf_parse_composite_glyph(data, start, end, &info.components);
+		}
+		if (!ok) {
+			info.kind = TtfGlyphKind::Bad;
+		}
+		safe[glyph] = (ok ? 1 : 0);
+	}
+	ttf_resolve_composites(&glyphs, &safe);
+	if (safe[0] == 0) {
+		return false; // .notdef is the replacement for every unusable glyph
+	}
+
+	// stbtt__GetGlyphKernInfoAdvance reads the first subtable's pair array blindly.
+	*kern_ok = true;
+	if (kern.Present()) {
+		if (kern.length < 4) {
+			*kern_ok = false;
+		} else if (ttf_be16(data, kern.offset + 2) >= 1) {
+			if (kern.length < 10) {
+				*kern_ok = false;
+			} else if (ttf_be16(data, kern.offset + 8) == 1) {
+				*kern_ok =
+				    kern.length >= 12 &&
+				    kern.length >= 18 + 6 * static_cast<uint64_t>(ttf_be16(data, kern.offset + 10));
+			}
+		}
+	}
+
+	*glyph_safe = std::move(safe);
+	return true;
+}
+
+static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size, bool guest) {
 	if (font == nullptr || !ttf_data_has_supported_magic(data, size)) {
 		return false;
+	}
+
+	std::vector<uint8_t> copy;
+	std::vector<uint8_t> glyph_safe;
+	bool                 kern_ok = true;
+	if (guest) {
+		// Validate a private copy so the game cannot change or free the data stb reads later.
+		copy.assign(data, data + size);
+		if (!ttf_validate_guest_font(copy.data(), size, &glyph_safe, &kern_ok)) {
+			return false;
+		}
+		data = copy.data();
 	}
 
 	stbtt_fontinfo info {};
 	if (stbtt_InitFont(&info, data, 0) == 0) {
 		return false;
 	}
+	if (guest) {
+		info.gpos = 0; // GPOS lookups are not validated; the kern table is used instead.
+		if (!kern_ok) {
+			info.kern = 0;
+		}
+	}
 
-	font->font_info = info;
-	font->ttf_data  = data;
-	font->ttf_size  = size;
-	font->has_ttf   = true;
+	font->font_info  = info;
+	font->ttf_data   = data;
+	font->ttf_size   = size;
+	font->ttf_copy   = std::move(copy); // moving keeps the buffer stb points into
+	font->glyph_safe = std::move(glyph_safe);
+	font->has_ttf    = true;
 
 	return true;
 }
@@ -793,14 +1258,16 @@ static void init_font_face(FontState* font) {
 	font->ttf_data = nullptr;
 	font->ttf_size = 0;
 	font->has_ttf  = false;
+	font->ttf_copy.clear();
+	font->glyph_safe.clear();
 
-	if (init_stb_font(font, static_cast<const uint8_t*>(font->data), font->size)) {
+	if (init_stb_font(font, static_cast<const uint8_t*>(font->data), font->size, true)) {
 		return;
 	}
 
 	const auto& data = fallback_font_data(font_is_bold(font), font_is_italic(font));
 	if (!data.empty()) {
-		(void)init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()));
+		(void)init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()), false);
 	}
 }
 
@@ -814,14 +1281,24 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
-static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
-	if (font == nullptr || !ensure_stb_font(font)) {
-		return static_cast<uint32_t>('?');
+// Glyph for code that stb may process, or 0 when the font has none or only an unsafe one.
+static int stb_safe_glyph(const FontState* font, uint32_t code) {
+	if (code > 0x10ffffu) {
+		return 0;
 	}
-	if (code > 0x10ffffu || stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) == 0) {
-		return static_cast<uint32_t>('?');
+	const int glyph = stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code));
+	if (glyph <= 0 || glyph >= font->font_info.numGlyphs ||
+	    (!font->glyph_safe.empty() && (static_cast<size_t>(glyph) >= font->glyph_safe.size() ||
+	                                   font->glyph_safe[static_cast<size_t>(glyph)] == 0))) {
+		return 0;
 	}
-	return code;
+	return glyph;
+}
+
+// Glyph used to draw code: the code's own glyph, else '?', else .notdef.
+static int stb_render_glyph(FontState* font, uint32_t code) {
+	const int glyph = stb_safe_glyph(font, code);
+	return glyph != 0 ? glyph : stb_safe_glyph(font, static_cast<uint32_t>('?'));
 }
 
 static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
@@ -829,7 +1306,7 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
+	const int   glyph   = stb_render_glyph(font, code);
 	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
 	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 
@@ -838,8 +1315,8 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, nullptr);
-	stbtt_GetCodepointBox(&font->font_info, static_cast<int>(code), &x0, &y0, &x1, &y1);
+	stbtt_GetGlyphHMetrics(&font->font_info, glyph, &advance, nullptr);
+	stbtt_GetGlyphBox(&font->font_info, glyph, &x0, &y0, &x1, &y1);
 
 	metrics->width                = static_cast<float>(x1 - x0) * scale_x;
 	metrics->height               = static_cast<float>(y1 - y0) * scale_y;
@@ -859,7 +1336,7 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
+	const int   glyph   = stb_render_glyph(font, code);
 	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
 	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 
@@ -867,8 +1344,7 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetGlyphBitmapBox(&font->font_info, glyph, scale_x, scale_y, &x0, &y0, &x1, &y1);
 
 	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
 	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
@@ -883,9 +1359,9 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return true;
 	}
 
-	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
-	                          static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
-	                          static_cast<int>(code));
+	stbtt_MakeGlyphBitmap(&font->font_info, image->data(), static_cast<int>(width),
+	                      static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
+	                      glyph);
 
 	return true;
 }
@@ -1218,6 +1694,17 @@ int KYTY_SYSV_ABI FontOpenFontMemory(FontLibrary library, const void* font_addre
                                      uint32_t    font_size, const FontOpenDetail* /*detail*/,
                                      FontHandle* handle) {
 	PRINT_NAME();
+
+	// Data that claims to be TrueType/OpenType but is malformed, or uses CFF outlines, is
+	// rejected; other formats keep using the fallback font as before.
+	const auto* bytes = static_cast<const uint8_t*>(font_address);
+	if (ttf_data_has_supported_magic(bytes, font_size)) {
+		std::vector<uint8_t> glyph_safe;
+		bool                 kern_ok = true;
+		if (!ttf_validate_guest_font(bytes, font_size, &glyph_safe, &kern_ok)) {
+			return FONT_ERROR_INVALID_PARAMETER;
+		}
+	}
 
 	return open_font(library, font_address, font_size, 0, 0, handle);
 }
@@ -1614,7 +2101,11 @@ int KYTY_SYSV_ABI FontDestroyString(FontString* font_string) {
 	LOGF("\t string_ptr = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(font_string));
 
 	if (font_string != nullptr) {
-		delete static_cast<FontStringState*>(*font_string);
+		auto* string = static_cast<FontStringState*>(*font_string);
+		// FontWriting has no term call; its state only refers into this string, so it is released
+		// together with the string (or when the same FontWriting is initialized again).
+		release_writing_states_of(string);
+		delete string;
 		*font_string = nullptr;
 	}
 
@@ -1823,8 +2314,10 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 	}
 
 	if (auto* old_state = get_writing_state(font_writing); old_state != nullptr) {
-		unregister_writing_state(old_state);
-		delete old_state;
+		// FontDestroyString may have released it concurrently; only the remover frees it.
+		if (unregister_writing_state(old_state)) {
+			delete old_state;
+		}
 	}
 	std::memset(font_writing, 0, sizeof(FontWriting));
 

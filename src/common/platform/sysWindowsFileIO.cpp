@@ -516,7 +516,10 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto src_wide = src.wstring();
 	auto dst_wide = dst.wstring();
-	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
+	// Replace an existing destination file in one step (POSIX rename semantics); like MoveFileW,
+	// still allow a copy when the destination is on another volume.
+	return MoveFileExW(src_wide.c_str(), dst_wide.c_str(),
+	                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0;
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {

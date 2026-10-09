@@ -349,6 +349,7 @@ struct PthreadMutexPrivate {
 	std::condition_variable cv;
 	Pthread                 owner     = nullptr;
 	uint32_t                count     = 0;
+	uint32_t                waiters   = 0; // threads blocked in NativeMutexLock, guarded by m
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
 };
@@ -386,7 +387,10 @@ static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
 	PthreadGuestData      guest;
+	std::mutex              name_mutex; // guards name: PthreadRename can race the thread's reads
 	std::string           name;
+	std::mutex              lifecycle_mutex;
+	bool                    host_exited = false; // guarded by lifecycle_mutex
 	pthread_t             p;
 	PthreadAttr           attr;
 	pthread_entry_func_t  entry;
@@ -420,6 +424,16 @@ static PthreadAttrPrivate* GetPthreadAttrValue(const PthreadAttr* attr, const ch
 	}
 
 	return attr_value;
+}
+
+static std::string GetThreadName(Pthread thread) {
+	std::lock_guard lock(thread->name_mutex);
+	return thread->name;
+}
+
+static void SetThreadName(Pthread thread, const char* name) {
+	std::lock_guard lock(thread->name_mutex);
+	thread->name = (name != nullptr ? name : "");
 }
 
 struct PthreadRwlockPrivate {
@@ -457,6 +471,10 @@ struct PthreadCondPrivate {
 	std::mutex              m;
 	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
 	std::vector<Pthread>    waiters;
+	// Threads inside a wait call, including ones already woken (and removed from waiters) that
+	// still have to relock m. PthreadCondDestroy waits for them before freeing the object.
+	uint32_t                active_waiters = 0;
+	std::condition_variable drained_cv;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -464,13 +482,19 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(thread == nullptr);
 
 	cond->waiters.push_back(thread);
+	cond->active_waiters++;
 }
 
+// Called with cond->m held, once per CondAddWaiter, when the waiter leaves the wait call.
 static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
+	EXIT_IF(cond->active_waiters == 0);
 
 	std::erase(cond->waiters, thread);
+	if (--cond->active_waiters == 0) {
+		cond->drained_cv.notify_all();
+	}
 }
 
 static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -645,6 +669,10 @@ struct CachedGuestStack {
 };
 static std::vector<CachedGuestStack> g_guest_stack_cache;
 
+// No guest stack or guard can be larger than the whole guest stack region; bounding sizes here
+// keeps RoundStackSize and stack_size + guard_size (+ PTHREAD_STACK_EXTRA) from wrapping.
+constexpr size_t PTHREAD_STACK_MAX = PTHREAD_STACK_TOP - PTHREAD_STACK_BOTTOM;
+
 static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
 }
@@ -662,6 +690,9 @@ static int CreateGuestStack(PthreadAttr attr) {
 		return OK;
 	}
 
+	if (attr->stack_size > PTHREAD_STACK_MAX || attr->guard_size > PTHREAD_STACK_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 	const auto stack_size = RoundStackSize(attr->stack_size);
 	const auto guard_size = RoundStackSize(attr->guard_size);
 	const auto map_size   = stack_size + guard_size;
@@ -1267,7 +1298,17 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
+	// Counted so PthreadMutexDestroy can refuse to free a mutex that still has blocked waiters.
+	struct WaiterScope {
+		PthreadMutexPrivate* mutex;
+		explicit WaiterScope(PthreadMutexPrivate* m): mutex(m) { mutex->waiters++; }
+		~WaiterScope() { mutex->waiters--; }
+		WaiterScope(const WaiterScope&)            = delete;
+		WaiterScope& operator=(const WaiterScope&) = delete;
+	};
+
 	if (timeout_us == nullptr) {
+		WaiterScope waiter(mutex);
 		while (mutex->owner != nullptr) {
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 			if (mutex->owner != nullptr) {
@@ -1281,7 +1322,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			return ETIMEDOUT;
 		}
 	} else {
-		const auto deadline =
+		WaiterScope waiter(mutex);
+		const auto  deadline =
 		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
 		while (mutex->owner != nullptr) {
 			const auto now = std::chrono::steady_clock::now();
@@ -1360,7 +1402,7 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 
 	mutex->owner = nullptr;
 	mutex->count = 0;
-	lock.unlock();
+	// Notify while holding m: PthreadMutexDestroy takes m before freeing, so cv stays alive.
 	mutex->cv.notify_one();
 
 	return OK;
@@ -1389,8 +1431,11 @@ static bool NativeCondDeadlineFromAbs(KernelClockid clock_id, const KernelTimesp
 		return false;
 	}
 
-	auto delta = std::chrono::seconds(abstime->tv_sec - now.tv_sec) +
-	             std::chrono::nanoseconds(abstime->tv_nsec - now.tv_nsec);
+	// Clamp far-future deadlines so the nanosecond conversion below cannot overflow.
+	constexpr int64_t MAX_WAIT_SECONDS = 100ll * 365 * 24 * 60 * 60;
+	const int64_t     sec_delta        = (std::min)(abstime->tv_sec - now.tv_sec, MAX_WAIT_SECONDS);
+	auto              delta =
+	    std::chrono::seconds(sec_delta) + std::chrono::nanoseconds(abstime->tv_nsec - now.tv_nsec);
 	*out       = std::chrono::steady_clock::now() +
 	             std::chrono::duration_cast<std::chrono::steady_clock::duration>(delta);
 	return true;
@@ -1563,7 +1608,9 @@ static void DestructPthreadSpecific() {
 int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(attr == nullptr);
+	if (attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	*attr = new PthreadMutexattrPrivate {};
 
@@ -1582,7 +1629,9 @@ int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr) {
 int KYTY_SYSV_ABI PthreadMutexattrDestroy(PthreadMutexattr* attr) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(attr == nullptr || *attr == nullptr);
+	if (attr == nullptr || *attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	int result = pthread_mutexattr_destroy(&(*attr)->p);
 
@@ -1599,7 +1648,9 @@ int KYTY_SYSV_ABI PthreadMutexattrDestroy(PthreadMutexattr* attr) {
 int KYTY_SYSV_ABI PthreadMutexattrSettype(PthreadMutexattr* attr, int type) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(attr == nullptr || *attr == nullptr);
+	if (attr == nullptr || *attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	int ptype = PTHREAD_MUTEX_DEFAULT;
 	switch (type) {
@@ -1624,14 +1675,16 @@ int KYTY_SYSV_ABI PthreadMutexattrSetprotocol([[maybe_unused]] PthreadMutexattr*
                                               int                                protocol) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(attr == nullptr || *attr == nullptr);
+	if (attr == nullptr || *attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	[[maybe_unused]] int pprotocol = PTHREAD_PRIO_NONE;
 	switch (protocol) {
 		case 0: pprotocol = PTHREAD_PRIO_NONE; break;
 		case 1: pprotocol = PTHREAD_PRIO_INHERIT; break;
 		case 2: pprotocol = PTHREAD_PRIO_PROTECT; break;
-		default: EXIT("invalid protocol: %d\n", protocol);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
 	// protocol doesn't work in winpthreads
@@ -1709,7 +1762,13 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = ((*mutex)->owner == nullptr ? 0 : EBUSY);
+	int result = 0;
+	{
+		// Taking m waits out an unlocker that is still notifying cv; blocked waiters would
+		// touch the freed object, so a mutex that has any is busy.
+		std::lock_guard lock((*mutex)->m);
+		result = ((*mutex)->owner == nullptr && (*mutex)->waiters == 0 ? 0 : EBUSY);
+	}
 
 	if (result != 0) {
 		LOGF("\tmutex destroy: %s, %d\n", (*mutex)->name.c_str(), result);
@@ -2086,7 +2145,7 @@ int KYTY_SYSV_ABI PthreadAttrSetdetachstate(PthreadAttr* attr, int state) {
 	switch (state) {
 		case 0: pstate = PTHREAD_CREATE_JOINABLE; break;
 		case 1: pstate = PTHREAD_CREATE_DETACHED; break;
-		default: EXIT("unknown state: %d\n", state);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
 	// int result = pthread_attr_setdetachstate(&(*attr)->p, pstate);
@@ -2107,6 +2166,9 @@ int KYTY_SYSV_ABI PthreadAttrSetguardsize(PthreadAttr* attr, size_t guard_size) 
 	if (attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	if (guard_size > PTHREAD_STACK_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	attr_value->guard_size = guard_size;
 
@@ -2125,7 +2187,7 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	switch (inherit_sched) {
 		case 0: pinherit_sched = PTHREAD_EXPLICIT_SCHED; break;
 		case 4: pinherit_sched = PTHREAD_INHERIT_SCHED; break;
-		default: EXIT("unknown inherit_sched: %d\n", inherit_sched);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
 	// Keep this in Kyty state. winpthreads' inheritsched support is not needed for guest-visible
@@ -2202,7 +2264,8 @@ int KYTY_SYSV_ABI PthreadAttrSetstack(PthreadAttr* attr, void* addr, size_t size
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstack");
-	if (addr == nullptr || size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (addr == nullptr || size < GUEST_PTHREAD_STACK_MIN ||
+	    size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(addr) || attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -2235,7 +2298,8 @@ int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size) 
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstacksize");
-	if (stack_size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (stack_size < GUEST_PTHREAD_STACK_MIN || stack_size > PTHREAD_STACK_MAX ||
+	    attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -2491,6 +2555,11 @@ int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
 	PRINT_NAME();
 
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2737,8 +2806,24 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
 	int result = 0;
+	{
+		auto*            cond_value = *cond;
+		std::unique_lock lock(cond_value->m);
+		if (!cond_value->waiters.empty()) {
+			// Threads still blocked on the condition: destroying it now is undefined.
+			result = EBUSY;
+		} else {
+			// Woken waiters still relock m and unregister; free the object only after they left.
+			cond_value->drained_cv.wait(lock,
+			                            [cond_value] { return cond_value->active_waiters == 0; });
+		}
+	}
 
 	LOGF("\tcond destroy: %s, %d\n", (*cond)->name.c_str(), result);
+
+	if (result != 0) {
+		return KERNEL_ERROR_EBUSY;
+	}
 
 	delete *cond;
 	*cond = nullptr;
@@ -3082,7 +3167,14 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {
-	if (thread == nullptr || thread->free) {
+	if (thread == nullptr) {
+		return false;
+	}
+
+	// Holding lifecycle_mutex keeps the target from finishing CleanupThread, so it cannot be
+	// reaped by PthreadJoin (or detach) while pthread_kill still uses its handle.
+	std::lock_guard lifecycle_lock(thread->lifecycle_mutex);
+	if (thread->free || thread->host_exited) {
 		return false;
 	}
 
@@ -3175,6 +3267,12 @@ static void CleanupThread(void* arg) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
 
+	{
+		// After this no PthreadKillHost will touch the host handle (see PthreadKillHost).
+		std::lock_guard lifecycle_lock(thread->lifecycle_mutex);
+		thread->host_exited = true;
+	}
+
 	thread->almost_done = true;
 }
 
@@ -3200,19 +3298,20 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	const auto thread_name = GetThreadName(thread);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	if (!thread->name.empty()) {
+	if (!thread_name.empty()) {
 #if defined(__APPLE__)
-		pthread_setname_np(thread->name.substr(0, 63).c_str());
+		pthread_setname_np(thread_name.substr(0, 63).c_str());
 #else
-		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+		pthread_setname_np(pthread_self(), thread_name.substr(0, 15).c_str());
 #endif
 	}
 #endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
-	     thread->name.c_str(), thread->unique_id, os_thread_id,
+	     thread_name.c_str(), thread->unique_id, os_thread_id,
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
@@ -3265,14 +3364,26 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		EXIT_IF(created_thread->free);
 
 		if (created_thread->attr->stack_addr == nullptr) {
-			created_thread->attr->stack_size += PTHREAD_STACK_EXTRA;
+			// The setters bound stack_size, but the default attr can be edited directly.
+			if (created_thread->attr->stack_size > PTHREAD_STACK_MAX - PTHREAD_STACK_EXTRA) {
+				result = KERNEL_ERROR_EINVAL;
+			} else {
+				created_thread->attr->stack_size += PTHREAD_STACK_EXTRA;
+			}
 		}
 
-		result = CreateGuestStack(created_thread->attr);
+		if (result == 0) {
+			result = CreateGuestStack(created_thread->attr);
+		}
 	}
 
 	if (result == 0) {
-		created_thread->name            = (name != nullptr ? name : "");
+		SetThreadName(created_thread, name);
+		{
+			// The pool reuses PthreadPrivate objects; this host thread has not exited yet.
+			std::lock_guard lifecycle_lock(created_thread->lifecycle_mutex);
+			created_thread->host_exited = false;
+		}
 		created_thread->entry           = entry;
 		created_thread->arg             = arg;
 		created_thread->guest.thread_id = ++g_pthread_thread_id;
@@ -3292,7 +3403,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->free = true;
 	}
 
-	LOGF("\tthread create: %s, id = %d, %d\n", created_thread->name.c_str(),
+	LOGF("\tthread create: %s, id = %d, %d\n", GetThreadName(created_thread).c_str(),
 	     created_thread->unique_id, result);
 
 	PthreadAttrDbgPrint(&created_thread->attr);
@@ -3320,7 +3431,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	LOGF("\tthread detach: %s, %d\n", thread->name.c_str(), 0);
+	LOGF("\tthread detach: %s, %d\n", GetThreadName(thread).c_str(), 0);
 
 	thread->detached = true;
 
@@ -3337,7 +3448,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	int result = pthread_join(thread->p, value);
 
 	if (PRINT_NAME_ENABLED) {
-		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
+		LOGF("\tthread join: %s, %d\n", GetThreadName(thread).c_str(), result);
 	}
 
 	if (result == 0) {
@@ -3365,7 +3476,7 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 
 	int result = pthread_cancel(thread->p);
 
-	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
+	LOGF("\tthread cancel: %s, %d\n", GetThreadName(thread).c_str(), result);
 
 	switch (result) {
 		case 0: return OK;
@@ -3407,14 +3518,15 @@ int KYTY_SYSV_ABI PthreadSetcancelstate(int state, int* old_state) {
 	switch (state) {
 		case 0: pstate = PTHREAD_CANCEL_ENABLE; break;
 		case 1: pstate = PTHREAD_CANCEL_DISABLE; break;
-		default: EXIT("unknown state: %d", state);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
 	int result = pthread_setcancelstate(pstate, old_state);
 
 	LOGF("\tthread setcancelstate: %d\n", result);
 
-	if (old_state != nullptr) {
+	// On failure the host leaves *old_state untouched (still the guest's value).
+	if (result == 0 && old_state != nullptr) {
 		switch (*old_state) {
 			case PTHREAD_CANCEL_ENABLE: *old_state = 0; break;
 			case PTHREAD_CANCEL_DISABLE: *old_state = 1; break;
@@ -3436,14 +3548,15 @@ int KYTY_SYSV_ABI PthreadSetcanceltype(int type, int* old_type) {
 	switch (type) {
 		case 0: ptype = PTHREAD_CANCEL_DEFERRED; break;
 		case 2: ptype = PTHREAD_CANCEL_ASYNCHRONOUS; break;
-		default: EXIT("unknown type: %d", type);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
 	int result = pthread_setcanceltype(ptype, old_type);
 
 	LOGF("\tthread setcanceltype: %d\n", result);
 
-	if (old_type != nullptr) {
+	// On failure the host leaves *old_type untouched (still the guest's value).
+	if (result == 0 && old_type != nullptr) {
 		switch (*old_type) {
 			case PTHREAD_CANCEL_DEFERRED: *old_type = 0; break;
 			case PTHREAD_CANCEL_ASYNCHRONOUS: *old_type = 2; break;
@@ -3586,7 +3699,8 @@ int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	strncpy(name, thread->name.c_str(), 32);
+	const auto thread_name = GetThreadName(thread);
+	strncpy(name, thread_name.c_str(), 32);
 	name[31] = '\0';
 
 	return OK;
@@ -3603,7 +3717,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 		return OK;
 	}
 
-	thread->name = std::string(name);
+	SetThreadName(thread, name);
 
 	return OK;
 }
@@ -3833,7 +3947,10 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	EXIT_NOT_IMPLEMENTED(g_pthread_context->GetThreadDtors() != nullptr);
+	if (g_pthread_context->GetThreadDtors() != nullptr) {
+		// The kernel just stores the pointer; a later registration replaces the earlier one.
+		LOGF("\tthread dtors replaced\n");
+	}
 
 	g_pthread_context->SetThreadDtors(dtors);
 	// g_thread_dtors = dtors;

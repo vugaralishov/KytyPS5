@@ -31,17 +31,37 @@ constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// Owns the per-thread waitable timer so it is closed when the thread exits.
+class ThreadSleepTimer {
+public:
+	ThreadSleepTimer() {
+		m_handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+		                                  TIMER_ALL_ACCESS);
+		if (m_handle == nullptr) {
+			m_handle = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+		}
+	}
+	~ThreadSleepTimer() {
+		if (m_handle != nullptr) {
+			CloseHandle(m_handle);
+		}
+	}
+	ThreadSleepTimer(const ThreadSleepTimer&)            = delete;
+	ThreadSleepTimer& operator=(const ThreadSleepTimer&) = delete;
+
+	[[nodiscard]] HANDLE Get() const { return m_handle; }
+
+private:
+	HANDLE m_handle = nullptr;
+};
+
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
 	}
 
-	thread_local HANDLE timer = CreateWaitableTimerExW(
-	    nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-	if (timer == nullptr) {
-		thread_local HANDLE fallback_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
-		timer                              = fallback_timer;
-	}
+	thread_local ThreadSleepTimer sleep_timer;
+	HANDLE                        timer = sleep_timer.Get();
 
 	if (timer != nullptr) {
 		LARGE_INTEGER due_time {};

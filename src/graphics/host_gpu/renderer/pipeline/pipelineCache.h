@@ -140,6 +140,10 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Utility pass that clamps DispatchIndirect arguments to maxComputeWorkGroupCount. Binding 0
+	// is the source arguments, binding 1 the clamped copy (push descriptors); the push constants
+	// are the per-axis limits followed by the source dword offset.
+	Pipeline& GetDispatchIndirectClampPipeline();
 
 private:
 	struct ProgramCache;
@@ -176,6 +180,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	Pipeline                                                m_indirect_clamp_pipeline;
 
 	void InitializeDriverCache();
 };

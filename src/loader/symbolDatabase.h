@@ -10,18 +10,24 @@
 
 namespace Loader {
 
+struct Program;
+
 enum class SymbolType {
 	Unknown,
 	Func,
 	Object,
 	TlsModule,
 	NoType,
+	Tls,
 };
 
 struct SymbolRecord {
 	std::string name;
 	std::string dbg_name;
-	uint64_t    vaddr;
+	// For SymbolType::Tls: the offset inside the defining module's TLS block.
+	uint64_t vaddr;
+	// For SymbolType::Tls: the defining module; nullptr for every other record.
+	const Program* tls_program = nullptr;
 };
 
 struct SymbolResolve {
@@ -41,6 +47,7 @@ public:
 
 	void Add(const SymbolResolve& s, uint64_t vaddr);
 	void Add(const SymbolResolve& s, uint64_t vaddr, const std::string& dbg_name);
+	void AddTls(const SymbolResolve& s, uint64_t tls_offset, const Program* program);
 
 	[[nodiscard]] const SymbolRecord* Find(const SymbolResolve& s) const;
 	[[nodiscard]] const SymbolRecord* FindByNid(const std::string& nid, SymbolType type,

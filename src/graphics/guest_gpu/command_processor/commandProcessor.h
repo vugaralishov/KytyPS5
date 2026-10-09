@@ -6,7 +6,10 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -105,6 +108,7 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
+	void EmitHostReadBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
@@ -123,7 +127,8 @@ public:
 	void IncrementDe();
 	void IncrementCe();
 
-	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
+	[[nodiscard]] bool IsConstRamRangeValid(uint32_t offset, uint32_t dw_num) const;
+	void               WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
 	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
 
 	template <typename T>
@@ -153,7 +158,14 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
-	void ProcessPm4(Pm4Execution& execution);
+	// Records the write-back of GPU writes into pages the host cannot protect (guest stacks on
+	// Windows); a guest that sees the following label or interrupt must also see that data.
+	bool FlushUnprotectedGpuWrites();
+	// Writes an end-of-pipe label now, or (after a flush, or behind an earlier deferred label)
+	// as a priority operation that runs after the write-backs queued before it.
+	void                   PublishLabel(void* dst, const void* data, size_t size, bool defer);
+	[[nodiscard]] uint32_t ClampIndexCount(uint32_t first_index, uint32_t index_count) const;
+	void                   ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
@@ -184,6 +196,10 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// Labels queued by PublishLabel that have not been written yet. Later labels queue behind
+	// them so that no label is overwritten by an older value.
+	std::shared_ptr<std::atomic<uint32_t>> m_deferred_labels =
+	    std::make_shared<std::atomic<uint32_t>>(0);
 };
 
 } // namespace Libs::Graphics

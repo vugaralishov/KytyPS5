@@ -179,7 +179,10 @@ Hmd2ReprojectionInitialize(const SceHmd2ReprojectionInitializeParam* param, void
 	if (param == nullptr || param->pReprojectionBuff == nullptr || param->pDisplayBuff == nullptr) {
 		return ERROR_PARAMETER_NULL;
 	}
-	EXIT_NOT_IMPLEMENTED(param->pSeeThroughBuff != nullptr);
+	// See-through output is not emulated; there is no HMD2 invalid-argument code here.
+	if (param->pSeeThroughBuff != nullptr) {
+		return VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
 	const auto display_size = ReprojectionDisplaySize();
 	auto* state = new (param->pReprojectionBuff) ReprojectionState;
 	if (param->reprojectionTiming != 0) {
@@ -217,7 +220,9 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 	if (state == nullptr) {
 		return ERROR_REPROJECTION_NOT_INITIALIZED;
 	}
-	EXIT_NOT_IMPLEMENTED(timing < 2000 || timing > 7000);
+	if (timing < 2000 || timing > 7000) {
+		return VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
 	const auto rounded = static_cast<uint32_t>((timing + 99) / 100 * 100);
 	state->timing_us.store(rounded, std::memory_order_release);
 	LOGF("Hmd2: reprojection timing=%u us\n", rounded);

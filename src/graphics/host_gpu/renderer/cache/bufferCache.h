@@ -79,6 +79,12 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// GPU thread: records the write-back of GPU writes into pages the host cannot protect
+	// (guest stacks on Windows) into the current command buffer. Their guest-memory publication
+	// is queued as priority operations, so anything deferred afterwards for the same tick (an
+	// end-of-pipe label or interrupt) becomes visible only after the data. Returns whether a
+	// write-back was recorded.
+	bool               FlushUnprotectedGpuWrites();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -120,6 +126,10 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               TrackUnprotectedGpuWrite(uint64_t vaddr, uint64_t size);
+	// Waits until queued unprotected-page write-backs overlapping the range reach guest memory,
+	// so a CPU-side read or upload of the range does not see the stale contents.
+	void WaitForUnprotectedWriteBacks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -131,6 +141,16 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// GPU-written tracker pages the host cannot read-protect (guest stacks on Windows). CPU reads
+	// of them never fault, so they are written back at the end of each completed submission.
+	RangeSet m_unprotected_gpu_writes;
+	struct UnprotectedWriteBack {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	// Recorded unprotected-page write-backs whose publication may still be pending.
+	std::vector<UnprotectedWriteBack>                 m_unprotected_write_backs;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

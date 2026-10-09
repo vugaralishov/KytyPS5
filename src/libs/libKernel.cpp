@@ -490,7 +490,8 @@ static bool IsAllowedExceptionSignal(int signum) {
 	       signum == POSIX_SIGBUS || signum == POSIX_SIGSEGV || signum == POSIX_SIGUSR1;
 }
 
-static void* g_exception_handlers[130] = {};
+// Atomic so concurrent install/remove/dispatch never race on a slot.
+static std::atomic<void*> g_exception_handlers[130] = {};
 
 using exception_handler_func_t = KYTY_SYSV_ABI void (*)(int, void*);
 
@@ -978,7 +979,8 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 			continue;
 		}
 
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+		auto* handler =
+		    reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum].load());
 		if (handler != nullptr) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
@@ -1039,7 +1041,7 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 		return;
 	}
 
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum].load());
 	if (handler != nullptr) {
 		SignalDispatchScope scope;
 		auto                ctx           = CreateSignalUcontext(context);
@@ -1074,7 +1076,8 @@ void KernelDispatchPendingSignalForCurrentThread() {
 			continue;
 		}
 
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+		auto* handler =
+		    reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum].load());
 		if (handler != nullptr) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateSignalUcontext();
@@ -1095,11 +1098,10 @@ static int KYTY_SYSV_ABI KernelInstallExceptionHandler(int signum, void* handler
 	if (!IsAllowedExceptionSignal(signum)) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	if (g_exception_handlers[signum] != nullptr) {
+	void* expected = nullptr;
+	if (!g_exception_handlers[signum].compare_exchange_strong(expected, handler)) {
 		return KERNEL_ERROR_EAGAIN;
 	}
-
-	g_exception_handlers[signum] = handler;
 	return OK;
 }
 
@@ -1112,7 +1114,7 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	g_exception_handlers[signum] = nullptr;
+	g_exception_handlers[signum].store(nullptr);
 	return OK;
 }
 
@@ -1123,7 +1125,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum].load());
 	if (handler != nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto target_thread_id       = PthreadGetHostThreadId(thread);
@@ -1201,6 +1203,10 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	return OK;
 }
 
+// Serializes module load/unload so find-or-load, load_count and unloading are atomic with
+// respect to each other. Recursive, so module_start/module_stop may load or unload other modules.
+static Common::Mutex g_module_mutex;
+
 static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_name, size_t args,
                                                         const void* argp, uint32_t flags,
                                                         const KernelLoadModuleOpt* opt, int* res) {
@@ -1208,10 +1214,17 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
+	if (module_file_name == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
 	LOGF("\tmodule_file_name = %s\n", module_file_name);
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		LOGF("\tunsupported flags = 0x%08" PRIx32 ", opt = %p\n", flags,
+		     static_cast<const void*>(opt));
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1224,32 +1237,49 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	auto* program = rt->FindProgramByFileName(module_path);
-	if (program != nullptr) {
-		++program->load_count;
-		if (res != nullptr) {
-			*res = OK;
+	Loader::Program* program = nullptr;
+	{
+		Common::LockGuard lock(g_module_mutex);
+
+		program = rt->FindProgramByFileName(module_path);
+		if (program != nullptr) {
+			++program->load_count;
+			if (res != nullptr) {
+				*res = OK;
+			}
+			return static_cast<KernelModule>(program->unique_id);
 		}
-		return static_cast<KernelModule>(program->unique_id);
+
+		program = rt->LoadProgram(module_path);
+		if (program == nullptr) {
+			return KERNEL_ERROR_ENOEXEC;
+		}
+
+		program->dbg_print_reloc = true;
+
+		rt->RelocateProgram(program);
+
+		program->load_count = 1;
 	}
 
-	program = rt->LoadProgram(module_path);
-
+	// module_start runs without g_module_mutex so it can wait on threads that load modules.
 	auto handle = program->unique_id;
-
-	program->dbg_print_reloc = true;
-
-	rt->RelocateProgram(program);
-
-	program->load_count = 1;
-	int result = rt->StartModule(program, args, argp, nullptr);
+	int  result = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
-
 	if (res != nullptr) {
 		*res = result;
+	}
+
+	if (result < 0) {
+		// Drop the reference taken above; unload unless another caller acquired the module
+		// meanwhile.
+		Common::LockGuard lock(g_module_mutex);
+		if (--program->load_count == 0) {
+			rt->UnloadProgram(program);
+		}
+		return result;
 	}
 
 	return static_cast<KernelModule>(handle);
@@ -1264,12 +1294,18 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		LOGF("\tunsupported flags = 0x%08" PRIx32 ", opt = %p\n", flags,
+		     static_cast<const void*>(opt));
+		return KERNEL_ERROR_EINVAL;
+	}
 
-	auto* program = rt->FindProgramById(handle);
+	Common::LockGuard lock(g_module_mutex);
 
-	if (program == nullptr) {
+	// Handle 0 aliases the main executable in FindProgramById; it is never unloadable.
+	auto* program = (handle == 0 ? nullptr : rt->FindProgramById(handle));
+
+	if (program == nullptr || program->elf == nullptr || !program->elf->IsShared()) {
 		LOGF("\tinvalid module handle = %" PRId32 "\n", handle);
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -1293,10 +1329,13 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	LOGF("\tmodule_stop() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
-
 	if (res != nullptr) {
 		*res = result;
+	}
+
+	if (result < 0) {
+		// The module refused to stop, so it stays loaded.
+		return result;
 	}
 
 	rt->UnloadProgram(program);
@@ -2855,11 +2894,21 @@ struct KernelAioRwRequest {
 };
 
 static std::array<std::atomic_int32_t, KERNEL_AIO_MAX_QUEUE> g_kernel_aio_state = {};
-static std::atomic_int32_t                                   g_kernel_aio_next_id {1};
+static std::atomic_uint32_t                                  g_kernel_aio_next_id {0};
 
-static int32_t kernel_aio_next_id() {
-	const auto sequence = g_kernel_aio_next_id.fetch_add(1, std::memory_order_relaxed);
-	return ((sequence - 1) % (KERNEL_AIO_MAX_QUEUE - 1)) + 1;
+// Claims a free slot (state 0) so a live request id is never handed out twice. Returns 0 when
+// every slot is still in use.
+static int32_t kernel_aio_acquire_id() {
+	for (int32_t attempt = 0; attempt < KERNEL_AIO_MAX_QUEUE - 1; attempt++) {
+		const auto sequence = g_kernel_aio_next_id.fetch_add(1, std::memory_order_relaxed);
+		const auto id       = static_cast<int32_t>(sequence % (KERNEL_AIO_MAX_QUEUE - 1)) + 1;
+		int32_t    expected = 0;
+		if (g_kernel_aio_state[id].compare_exchange_strong(expected, KERNEL_AIO_STATE_PROCESSING,
+		                                                   std::memory_order_acq_rel)) {
+			return id;
+		}
+	}
+	return 0;
 }
 
 static bool kernel_aio_is_valid_id(int32_t id) {
@@ -2878,8 +2927,10 @@ int KYTY_SYSV_ABI KernelAioSubmitReadCommands(KernelAioRwRequest* req, int32_t s
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	const auto submit_id = kernel_aio_next_id();
-	g_kernel_aio_state[submit_id].store(KERNEL_AIO_STATE_PROCESSING, std::memory_order_release);
+	const auto submit_id = kernel_aio_acquire_id();
+	if (submit_id == 0) {
+		return LibKernel::KERNEL_ERROR_EAGAIN;
+	}
 
 	for (int32_t i = 0; i < size; i++) {
 		if (req[i].result == nullptr) {
@@ -2916,8 +2967,10 @@ int KYTY_SYSV_ABI KernelAioSubmitWriteCommands(KernelAioRwRequest* req, int32_t 
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	const auto submit_id = kernel_aio_next_id();
-	g_kernel_aio_state[submit_id].store(KERNEL_AIO_STATE_PROCESSING, std::memory_order_release);
+	const auto submit_id = kernel_aio_acquire_id();
+	if (submit_id == 0) {
+		return LibKernel::KERNEL_ERROR_EAGAIN;
+	}
 
 	for (int32_t i = 0; i < size; i++) {
 		if (req[i].result == nullptr) {

@@ -21,6 +21,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -245,7 +246,9 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 
 	uint32_t count = 1;
 
-	if (dw >= 20 && buffer[16] == 0xc0026900 && buffer[17] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
+	// dw counts from the SET_CONTEXT_REG header; buffer starts two dwords later, so reading
+	// buffer[19] needs 22 remaining dwords.
+	if (dw >= 22 && buffer[16] == 0xc0026900 && buffer[17] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
 		count = 20;
 
 		HW::AaSampleControl r;
@@ -263,27 +266,55 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 	return count;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-	auto r          = cp.GetCtx().GetAaSampleControl();
+// A multi-register SET_CONTEXT_REG is dispatched by its first register only. Registers that
+// another handler owns go through their per-register setter instead of being dropped.
+static void HwCtxSetForeignRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	if (cmd_offset < Pm4::CX_NUM && g_hw_ctx_indirect_func[cmd_offset] != nullptr) {
+		g_hw_ctx_indirect_func[cmd_offset](cp, cmd_offset, value);
+		return;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("\t warning: unhandled context register 0x%03" PRIx32 " = 0x%08" PRIx32
+		     " in multi-register write, ignored\n",
+		     cmd_offset, value);
+	}
+}
+
+// Applies `apply` to the registers owned by `self` and dispatches the rest individually, so
+// each register in the packet is applied exactly once.
+template <typename Apply>
+static uint32_t HwCtxForEachRegister(CommandProcessor& cp, hw_ctx_parser_func_t self,
+                                     uint32_t cmd_id, uint32_t cmd_offset, const uint32_t* buffer,
+                                     Apply&& apply) {
+	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		auto offset = cmd_offset + i;
-		switch (offset) {
-			case Pm4::PA_SC_CENTROID_PRIORITY_0:
-				r.centroid_priority = (r.centroid_priority & 0xffffffff00000000ull) | buffer[i];
-				break;
-			case Pm4::PA_SC_CENTROID_PRIORITY_1:
-				r.centroid_priority = (r.centroid_priority & 0x00000000ffffffffull) |
-				                      (static_cast<uint64_t>(buffer[i]) << 32u);
-				break;
-			default: break;
+		const auto reg = cmd_offset + i;
+		if (reg < Pm4::CX_NUM && g_hw_ctx_func[reg] == self) {
+			apply(reg, buffer[i]);
+		} else {
+			HwCtxSetForeignRegister(cp, reg, buffer[i]);
 		}
 	}
 
-	cp.GetCtx().SetAaSampleControl(r);
-
 	return num_values;
+}
+
+KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
+	return HwCtxForEachRegister(cp, HwCtxSetCentroidPriority, cmd_id, cmd_offset, buffer,
+	                            [&](uint32_t reg, uint32_t value) {
+		                            auto r = cp.GetCtx().GetAaSampleControl();
+		                            if (reg == Pm4::PA_SC_CENTROID_PRIORITY_0) {
+			                            r.centroid_priority =
+			                                (r.centroid_priority & 0xffffffff00000000ull) | value;
+		                            } else {
+			                            r.centroid_priority =
+			                                (r.centroid_priority & 0x00000000ffffffffull) |
+			                                (static_cast<uint64_t>(value) << 32u);
+		                            }
+		                            cp.GetCtx().SetAaSampleControl(r);
+	                            });
 }
 
 static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
@@ -384,143 +415,83 @@ static bool HwCtxTrySetFakeRegister(uint32_t cmd_offset, uint32_t value) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDepthBounds) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxSetDepthBoundsRegister(cp, cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetDepthBounds, cmd_id, cmd_offset, buffer,
+	    [&](uint32_t reg, uint32_t value) { HwCtxSetDepthBoundsRegister(cp, reg, value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDepthMetadataRegisters) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetDepthMetadataRegisters, cmd_id, cmd_offset, buffer,
+	    [&](uint32_t reg, uint32_t value) { HwCtxSetDepthMetadataRegister(cp, reg, value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetBorderColorTableAddr) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreBorderColorTableAddr(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(cp, HwCtxSetBorderColorTableAddr, cmd_id, cmd_offset, buffer,
+	                            HwCtxIgnoreBorderColorTableAddr);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPaScExtendedControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePaScExtendedControl(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(cp, HwCtxSetPaScExtendedControl, cmd_id, cmd_offset, buffer,
+	                            HwCtxIgnorePaScExtendedControl);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetCbDccControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreCbDccControl(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetCbDccControl, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreCbDccControl(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPointState) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePointState(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(cp, HwCtxSetPointState, cmd_id, cmd_offset, buffer,
+	                            HwCtxIgnorePointState);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAlphaToMaskRegister(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetAlphaToMask, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreAlphaToMaskRegister(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreDrawPayloadControl(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetDrawPayloadControl, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreDrawPayloadControl(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetObjprimIdControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreObjprimIdControl(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetObjprimIdControl, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreObjprimIdControl(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPrimitiveIdReset) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePrimitiveIdReset(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetPrimitiveIdReset, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnorePrimitiveIdReset(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetVtxControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreVtxControl(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetVtxControl, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreVtxControl(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetFovWindow) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreFovWindow(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetFovWindow, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreFovWindow(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetScanModeControl1) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreScanModeControl1(buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(
+	    cp, HwCtxSetScanModeControl1, cmd_id, cmd_offset, buffer,
+	    [](uint32_t /*reg*/, uint32_t value) { HwCtxIgnoreScanModeControl1(value); });
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+	return HwCtxForEachRegister(cp, HwCtxSetAaMask, cmd_id, cmd_offset, buffer,
+	                            HwCtxIgnoreAaMaskRegister);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetBlendControl) {
@@ -2153,6 +2124,22 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 	uint32_t id     = buffer[0] & 0xfffu;
 	uint32_t len_dw = ((cmd_id >> 16u) & 0x3fffu);
 
+	// The body is buffer[0..len_dw]; flip markers read up to buffer[5].
+	uint32_t required_len_dw = 0;
+	switch (id) {
+		case 0x778: required_len_dw = 3; break;
+		case 0x781: required_len_dw = 5; break;
+		default: break;
+	}
+	if (len_dw < required_len_dw) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("\t warning: truncated marker 0x%03" PRIx32 ", len_dw=%" PRIu32 ", skipped\n", id,
+			     len_dw);
+		}
+		return len_dw + 1;
+	}
+
 	switch (id) {
 		case 0x0: break;
 		case 0x4: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
@@ -2235,10 +2222,12 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
 	const char* str = reinterpret_cast<const char*>(buffer);
+	// The string is guest data and need not be terminated inside the packet.
+	const auto str_len = strnlen(str, (static_cast<size_t>(dw_num) + 1u) * sizeof(uint32_t));
 
 	static std::atomic<uint32_t> push_marker_log_count {0};
 	if (push_marker_log_count.fetch_add(1) < 128) {
-		LOGF("Push marker: %s\n", str);
+		LOGF("Push marker: %s\n", std::string_view(str, str_len));
 	}
 
 	return dw_num + 1;
@@ -2629,6 +2618,16 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	EXIT_NOT_IMPLEMENTED(op != Pm4::IT_WRITE_DATA);
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+
+	// The body is control + 64-bit address + (dw_num - 2) data dwords.
+	if (dw_num < 2u) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("\t warning: malformed writeData packet, cmd_id=0x%08" PRIx32 ", packet skipped\n",
+			     cmd_id);
+		}
+		return 1 + dw_num;
+	}
 
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));

@@ -25,6 +25,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -50,9 +51,17 @@ struct CxaDestructor {
 };
 
 struct CContext {
+	std::mutex               mutex;
 	std::list<CxaDestructor> cxa;
 	std::list<atexit_func_t> atexit;
 };
+
+// Guest threads register destructors concurrently; a function-local static gives thread-safe
+// creation, and the context is intentionally leaked so it outlives host static destructors.
+static CContext* GetCContext() {
+	static auto* context = new CContext;
+	return context;
+}
 
 struct InitEnvParams {
 	int         argc;
@@ -293,7 +302,9 @@ static KYTY_SYSV_ABI int atexit(atexit_func_t func) {
 	PRINT_NAME();
 
 	if (func != nullptr) {
-		Common::Singleton<CContext>::Instance()->atexit.push_front(func);
+		auto*           cc = GetCContext();
+		std::lock_guard lock(cc->mutex);
+		cc->atexit.push_front(func);
 	}
 
 	return 0;
@@ -310,7 +321,7 @@ static KYTY_SYSV_ABI int libc_printf(VA_ARGS) {
 static KYTY_SYSV_ABI int puts(const char* s) {
 	PRINT_NAME();
 
-	return GetGuestPrintfStdFunc()("%s\n", s);
+	return GetGuestPrintfStdFunc()("%s\n", s != nullptr ? s : "(null)");
 }
 
 static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwrite) {
@@ -439,6 +450,127 @@ static KYTY_SYSV_ABI int64_t libc_mktime(GuestTm* timeptr) {
 	return result;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void __cdecl IgnoreInvalidParameter(const wchar_t* /*expression*/,
+                                           const wchar_t* /*function*/, const wchar_t* /*file*/,
+                                           unsigned int /*line*/, uintptr_t /*reserved*/) {}
+#endif
+
+// Formats a single strftime conversion. The Windows CRT terminates the process (via the
+// invalid-parameter handler) on unknown conversions and on tm fields outside their range, so
+// each conversion is checked first and unsupported ones make the whole call fail with 0.
+static bool StrftimeConversion(std::string* out, char conv, const std::tm& tm) {
+	auto in = [](int v, int lo, int hi) { return v >= lo && v <= hi; };
+
+	const bool wday = in(tm.tm_wday, 0, 6);
+	const bool mon  = in(tm.tm_mon, 0, 11);
+	const bool mday = in(tm.tm_mday, 1, 31);
+	const bool hour = in(tm.tm_hour, 0, 23);
+	const bool min  = in(tm.tm_min, 0, 59);
+	// The CRT validates seconds as 0..59, so a leap second (60) is rejected as well.
+	const bool sec  = in(tm.tm_sec, 0, 59);
+	const bool yday = in(tm.tm_yday, 0, 365);
+	const bool year = in(tm.tm_year, -1900, 8099);
+
+	bool valid = false;
+	switch (conv) {
+		// Conversions the host CRT lacks.
+		case 'k':
+		case 'l': {
+			if (!hour) {
+				return false;
+			}
+			const int h =
+			    (conv == 'k' ? tm.tm_hour : (tm.tm_hour % 12 == 0 ? 12 : tm.tm_hour % 12));
+			*out = fmt::format("{:2d}", h);
+			return true;
+		}
+		case 'P':
+			if (!hour) {
+				return false;
+			}
+			*out = (tm.tm_hour < 12 ? "am" : "pm");
+			return true;
+		case 's': {
+			auto copy = tm;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			*out = fmt::format("{}", static_cast<int64_t>(_mktime64(&copy)));
+#else
+			*out = fmt::format("{}", static_cast<int64_t>(std::mktime(&copy)));
+#endif
+			return true;
+		}
+
+		case 'a':
+		case 'A':
+		case 'u':
+		case 'w': valid = wday; break;
+		case 'b':
+		case 'B':
+		case 'h':
+		case 'm': valid = mon; break;
+		case 'd':
+		case 'e': valid = mday; break;
+		case 'H':
+		case 'I':
+		case 'p': valid = hour; break;
+		case 'M': valid = min; break;
+		case 'S': valid = sec; break;
+		case 'j': valid = yday; break;
+		case 'C':
+		case 'y':
+		case 'Y': valid = year; break;
+		case 'D':
+		case 'x':
+		case 'F': valid = year && mon && mday; break;
+		case 'R': valid = hour && min; break;
+		case 'r':
+		case 'T':
+		case 'X': valid = hour && min && sec; break;
+		case 'g':
+		case 'G':
+		case 'U':
+		case 'V':
+		case 'W': valid = year && yday && wday; break;
+		case 'c': valid = wday && mon && mday && hour && min && sec && year; break;
+		case 'n':
+		case 't':
+		case 'z':
+		case 'Z':
+		case '%': valid = true; break;
+		default: return false;
+	}
+	if (!valid) {
+		return false;
+	}
+
+	const char fmt_str[3] = {'%', conv, '\0'};
+	char       buf[128] {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Defense in depth: if the CRT still rejects something, fail the call instead of the process.
+	auto* prev_handler = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+#endif
+	const size_t len = std::strftime(buf, sizeof(buf), fmt_str, &tm);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	_set_thread_local_invalid_parameter_handler(prev_handler);
+#endif
+	out->assign(buf, len);
+	return true;
+}
+
+// Applies the BSD/glibc padding flags ('-' none, '_' spaces, '0' zeros) to a numeric field.
+static void StrftimeApplyPad(std::string* piece, char pad) {
+	size_t i = 0;
+	while (i + 1 < piece->size() && ((*piece)[i] == '0' || (*piece)[i] == ' ')) {
+		i++;
+	}
+	if (pad == '-') {
+		piece->erase(0, i);
+	} else {
+		std::fill_n(piece->begin(), i, pad == '_' ? ' ' : '0');
+	}
+}
+
 static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* format,
                                           const GuestTm* timeptr) {
 	if (str == nullptr || format == nullptr || timeptr == nullptr) {
@@ -446,7 +578,49 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 	}
 
 	const auto host_time = ToHostTm(*timeptr);
-	return std::strftime(str, count, format, &host_time);
+
+	std::string result;
+	for (const char* p = format; *p != '\0'; p++) {
+		if (*p != '%') {
+			result.push_back(*p);
+			continue;
+		}
+		p++;
+		char pad   = '\0';
+		bool upper = false;
+		for (;; p++) {
+			if (*p == '-' || *p == '_' || *p == '0') {
+				pad = *p;
+			} else if (*p == '^') {
+				upper = true;
+			} else if (*p != '#') {
+				break;
+			}
+		}
+		if (*p == 'E' || *p == 'O') {
+			p++;
+		}
+		std::string piece;
+		if (*p == '\0' || !StrftimeConversion(&piece, *p, host_time)) {
+			return 0;
+		}
+		if (pad != '\0' && std::strchr("CdegGHIjklmMsSuUVwWyY", *p) != nullptr) {
+			StrftimeApplyPad(&piece, pad);
+		}
+		if (upper) {
+			for (auto& c: piece) {
+				c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+			}
+		}
+		result += piece;
+	}
+
+	if (result.size() >= count) {
+		return 0;
+	}
+	std::memcpy(str, result.data(), result.size());
+	str[result.size()] = '\0';
+	return result.size();
 }
 
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
@@ -523,13 +697,14 @@ static KYTY_SYSV_ABI int std_execute_once(int* flag, execute_once_func_t func, v
 static KYTY_SYSV_ABI int cxa_atexit(cxa_destructor_func_t func, void* arg, void* d) {
 	PRINT_NAME();
 
-	auto* cc = Common::Singleton<CContext>::Instance();
+	auto* cc = GetCContext();
 
 	CxaDestructor c {};
 	c.destructor_func   = func;
 	c.destructor_object = arg;
 	c.module_id         = d;
 
+	std::lock_guard lock(cc->mutex);
 	cc->cxa.push_back(c);
 
 	return 0;
@@ -538,15 +713,20 @@ static KYTY_SYSV_ABI int cxa_atexit(cxa_destructor_func_t func, void* arg, void*
 void KYTY_SYSV_ABI cxa_finalize(void* d) {
 	PRINT_NAME();
 
-	auto* cc = Common::Singleton<CContext>::Instance();
+	auto* cc = GetCContext();
 
+	std::unique_lock lock(cc->mutex);
+	// Entries are never erased, so iterators stay valid while the lock is dropped; it must be
+	// dropped around the call because a destructor may register or finalize further entries.
 	for (auto i = cc->cxa.rbegin(); i != cc->cxa.rend(); ++i) {
 		auto& c = *i;
 		if ((d == nullptr || c.module_id == d) && c.destructor_func != nullptr) {
 			auto* func        = c.destructor_func;
 			auto* object      = c.destructor_object;
 			c.destructor_func = nullptr;
+			lock.unlock();
 			func(object);
+			lock.lock();
 		}
 	}
 }
@@ -580,7 +760,11 @@ struct Info {
 void KYTY_SYSV_ABI LibcHeapGetTraceInfo(Info* info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(info->size != 32);
+	if (info == nullptr || info->size < sizeof(Info)) {
+		LOGF("\t invalid trace info (size = %" PRIu64 ")\n",
+		     info != nullptr ? info->size : static_cast<uint64_t>(0));
+		return;
+	}
 
 	info->mspace_atomic_id_mask = &g_mspace_atomic_id_mask;
 	info->mstate_table          = g_mstate_table;
@@ -636,9 +820,14 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
+	// Only the exported stdout object is a host FILE; fflush(NULL) flushes everything we own.
+	// Other guest streams (stderr, ...) are not host FILEs and are unbuffered here, so they
+	// must not reach the host CRT.
+	if (stream == stdout || stream == nullptr) {
+		return ::fflush(stdout);
+	}
 
-	return ::fflush(stream);
+	return 0;
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -700,20 +889,21 @@ char* KYTY_SYSV_ABI strstr(const char* haystack, const char* needle) {
 	return const_cast<char*>(::strstr(haystack, needle));
 }
 
-long KYTY_SYSV_ABI strtol(const char* str, char** endptr, int base) {
+// The guest is LP64: long is 64-bit even though the Windows host long is 32-bit.
+int64_t KYTY_SYSV_ABI strtol(const char* str, char** endptr, int base) {
 	static int log_count = 0;
 	if (log_count++ < 16) {
 		LOGF("LibcInternal::strtol(\"%s\", base=%d)\n", (str != nullptr ? str : "<null>"), base);
 	}
-	return ::strtol(str, endptr, base);
+	return static_cast<int64_t>(std::strtoll(str, endptr, base));
 }
 
-unsigned long KYTY_SYSV_ABI strtoul(const char* str, char** endptr, int base) {
+uint64_t KYTY_SYSV_ABI strtoul(const char* str, char** endptr, int base) {
 	static int log_count = 0;
 	if (log_count++ < 16) {
 		LOGF("LibcInternal::strtoul(\"%s\", base=%d)\n", (str != nullptr ? str : "<null>"), base);
 	}
-	return ::strtoul(str, endptr, base);
+	return static_cast<uint64_t>(std::strtoull(str, endptr, base));
 }
 
 int KYTY_SYSV_ABI atoi(const char* str) {

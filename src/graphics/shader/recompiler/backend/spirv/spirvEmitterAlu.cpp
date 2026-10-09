@@ -236,7 +236,8 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 }
 
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	// DX10_CLAMP saturates NaN to 0; FClamp leaves NaN undefined, NClamp returns minVal for it.
+	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 }
 
@@ -378,8 +379,18 @@ uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	// GLSL Ldexp is undefined above +128 and may flush below -126, while V_LDEXP_F32 saturates.
+	// Exponents beyond +-300 already overflow or underflow every finite input, so clamp and apply
+	// the scale in three steps that each stay within [-102, 102].
 	const auto exponent = Unary(state, spv::OpBitcast, TypeI32(state), arg1);
-	return EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {arg0, exponent});
+	const auto clamped  = EmitExt(state, TypeI32(state), GLSLstd450SClamp,
+	                              {exponent, ConstantI32(state, -300), ConstantI32(state, 300)});
+	const auto third = Binary(state, spv::OpSDiv, TypeI32(state), clamped, ConstantI32(state, 3));
+	const auto rest  = Binary(state, spv::OpISub, TypeI32(state), clamped,
+	                          Binary(state, spv::OpIAdd, TypeI32(state), third, third));
+	auto       value = EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {arg0, third});
+	value            = EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {value, third});
+	return EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {value, rest});
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {

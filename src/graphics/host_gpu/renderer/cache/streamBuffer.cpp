@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -128,8 +129,9 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	}
 }
 
-void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+void Buffer::Invalidate(uint64_t offset, uint64_t size) const {
+	// Any host-mapped buffer the GPU writes (download areas, the GDS stream buffer) may be read.
+	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
@@ -165,7 +167,18 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	}
 	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
 	    destination_offset < source_offset + size) {
-		EXIT("Buffer: overlapping self-copy\n");
+		// vkCmdCopyBuffer forbids overlapping regions. Stage through a scratch buffer, which
+		// stays alive until the GPU has finished with it.
+		auto scratch = std::make_unique<Buffer>(
+		    Graphics(), Scheduler(), MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, size);
+		scratch->CopyFrom(command, source, source_offset, 0, size, source_before, {},
+		                  source_after | vk::AccessFlagBits::eTransferRead,
+		                  vk::AccessFlagBits::eTransferRead);
+		CopyFrom(command, *scratch, 0, destination_offset, size, vk::AccessFlagBits::eTransferWrite,
+		         destination_before | vk::AccessFlagBits::eTransferRead, {}, destination_after);
+		Scheduler().DeferOperation([owner = std::move(scratch)]() mutable { owner.reset(); });
+		return;
 	}
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {

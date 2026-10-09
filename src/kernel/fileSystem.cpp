@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <random>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -30,6 +32,9 @@ namespace Libs::LibKernel::FileSystem {
 LIB_NAME("libkernel", "libkernel");
 
 constexpr int      DESCRIPTOR_MIN = 3;
+// Guest descriptors from SOCKET_FD_MIN (128, network.cpp) upwards belong to sockets, and
+// read/write/close check IsSocket first, so file descriptors must stay below it.
+constexpr int      DESCRIPTOR_MAX = 128;
 constexpr uint64_t DIR_BLOCK_SIZE = 512;
 
 enum class SpecialFile {
@@ -86,12 +91,12 @@ public:
 
 	int   CreateDescriptor();
 	void  DeleteDescriptor(int d);
-	File* GetFile(int d);
-	File* GetFile(const std::filesystem::path& real_name);
+	std::shared_ptr<File> GetFile(int d);
+	std::shared_ptr<File> GetFile(const std::filesystem::path& real_name);
 	void  CloseAll();
 
 private:
-	std::vector<File*> m_files;
+	std::vector<std::shared_ptr<File>> m_files;
 	Common::Mutex      m_mutex;
 };
 
@@ -130,7 +135,12 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 	uint64_t             last_reclen_offset = 0;
 	for (const auto& entry: entries) {
 		const auto& name = entry.name;
-		EXIT_NOT_IMPLEMENTED(name.size() > 255);
+		if (name.size() > 255) {
+			// d_namlen is one byte; such a host name cannot be represented to the guest.
+			LOGF("\tskipping directory entry with a name longer than 255 bytes: %s\n",
+			     name.c_str());
+			continue;
+		}
 		const auto reclen = AlignUp(8 + name.size() + 1, 4);
 		if (offset + reclen > dirents.size()) {
 			if (!dirents.empty()) {
@@ -176,7 +186,7 @@ static int PosixToKernel(int posix_errno) {
 int FileDescriptors::CreateDescriptor() {
 	Common::LockGuard lock(m_mutex);
 
-	auto* file        = new File {};
+	auto file         = std::make_shared<File>();
 	file->opened      = false;
 	file->directory   = false;
 	file->readable    = false;
@@ -191,6 +201,10 @@ int FileDescriptors::CreateDescriptor() {
 			m_files[index] = file;
 			return index + DESCRIPTOR_MIN;
 		}
+	}
+
+	if (files_num >= DESCRIPTOR_MAX - DESCRIPTOR_MIN) {
+		return -1;
 	}
 
 	m_files.push_back(file);
@@ -211,11 +225,10 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	m_files[index]->f.Close();
 #endif
 
-	delete m_files[index];
-	m_files[index] = nullptr;
+	m_files[index].reset();
 }
 
-File* FileDescriptors::GetFile(int d) {
+std::shared_ptr<File> FileDescriptors::GetFile(int d) {
 	Common::LockGuard lock(m_mutex);
 
 	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
@@ -227,10 +240,10 @@ File* FileDescriptors::GetFile(int d) {
 	return m_files[index];
 }
 
-File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
+std::shared_ptr<File> FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* f: m_files) {
+	for (const auto& f: m_files) {
 		if (f != nullptr && f->real_name == real_name) {
 			return f;
 		}
@@ -247,8 +260,7 @@ void FileDescriptors::CloseAll() {
 			if (f->opened) {
 				f->f.Close();
 			}
-			delete f;
-			f = nullptr;
+			f.reset();
 		}
 	}
 }
@@ -334,22 +346,63 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
+// Collapse "." and ".." lexically before mount matching so a guest path cannot climb out of its
+// mount. As on the console, ".." at the guest root stays at the root.
+static std::string NormalizeGuestPath(const std::string& path) {
+	if (!path.starts_with('/')) {
+		return path;
+	}
+
+	std::vector<std::string_view> components;
+	const std::string_view        view(path);
+	size_t                        pos = 0;
+	while (pos < view.size()) {
+		const auto end       = std::min(view.find('/', pos), view.size());
+		const auto component = view.substr(pos, end - pos);
+		if (component == "..") {
+			if (!components.empty()) {
+				components.pop_back();
+			}
+		} else if (!component.empty() && component != ".") {
+			components.push_back(component);
+		}
+		pos = end + 1;
+	}
+
+	std::string normalized;
+	for (const auto& component: components) {
+		normalized += '/';
+		normalized += component;
+	}
+	if (normalized.empty() || path.ends_with('/')) {
+		normalized += '/';
+	}
+	return normalized;
+}
+
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
+	const auto guest_path = NormalizeGuestPath(Common::FixFilenameSlash(mounted_name));
+
 	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
+	const auto mounted_path = Common::FixDirectorySlash(guest_path);
 	const auto it           = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
 	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		auto        rel_path = Common::RemoveFirst(guest_path, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		// A drive-relative component such as "C:" would make the join below discard the mount
+		// directory on Windows.
+		if (native_rel_path.has_root_path()) {
+			return {};
+		}
 		if (Common::IsArchivePath(p.dir)) {
 			return p.dir / native_rel_path;
 		}
@@ -439,14 +492,17 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		case 0: rw_mode = Common::File::Mode::Read; break;
 		case 1: rw_mode = Common::File::Mode::Write; break;
 		case 2: rw_mode = Common::File::Mode::ReadWrite; break;
-		default: EXIT("invalid flag_u: %u\n", flags_u);
+		default: return KERNEL_ERROR_EINVAL; // O_ACCMODE == 3
 	}
 
-	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
-	EXIT_NOT_IMPLEMENTED(directory && (trunc || creat));
+	// O_DIRECTORY with write access or O_CREAT/O_TRUNC is rejected below: ENOTDIR when the path
+	// is not a directory, EISDIR when it is.
 
-	int   descriptor = g_files->CreateDescriptor();
-	auto* file       = g_files->GetFile(descriptor);
+	int descriptor = g_files->CreateDescriptor();
+	if (descriptor < 0) {
+		return KERNEL_ERROR_EMFILE;
+	}
+	auto file = g_files->GetFile(descriptor);
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
@@ -500,8 +556,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			return KERNEL_ERROR_ENOTDIR;
 		}
 
-		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
-		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
+		if (rw_mode != Common::File::Mode::Read || trunc || creat) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EISDIR;
+		}
 
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
@@ -566,19 +624,17 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		return (result == OK ? OK : PosixToKernel(::Libs::Network::NetToPosix(result)));
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	// Only the caller that clears the opened flag tears the descriptor down, so a racing close of
+	// the same descriptor, or one still being opened, reports EBADF.
+	if (file == nullptr || !file->opened.exchange(false)) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (!file->directory && file->special == SpecialFile::None) {
 		file->f.Close();
 	}
-
-	file->opened = false;
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -594,7 +650,7 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -624,20 +680,18 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (file->directory) {
 		Common::LockGuard lock(file->mutex);
-		const auto        bytes = ReadDirectory(file, buf, nbytes);
+		const auto        bytes = ReadDirectory(file.get(), buf, nbytes);
 		LOGF("\tRead %" PRIu64 " directory bytes from: %s\n", bytes,
 		     Common::PathToString(file->real_name).c_str());
 		return static_cast<int64_t>(bytes);
@@ -703,18 +757,23 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special == SpecialFile::Random) {
+		// Like FreeBSD's /dev/random: writes are accepted (as entropy) and discarded.
+		return static_cast<int64_t>(nbytes);
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	file->mutex.Lock();
 
@@ -755,17 +814,19 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
@@ -845,7 +906,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	if (::Libs::Network::Net::IsSocket(d)) {
 		return KERNEL_ERROR_ESPIPE;
 	}
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened || !file->readable) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -918,18 +979,22 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special == SpecialFile::Random) {
+		return static_cast<int64_t>(nbytes);
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	file->mutex.Lock();
 
@@ -972,7 +1037,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	if (::Libs::Network::Net::IsSocket(d)) {
 		return KERNEL_ERROR_ESPIPE;
 	}
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -1029,13 +1094,11 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (file->special != SpecialFile::None) {
 		return KERNEL_ERROR_ESPIPE;
@@ -1144,13 +1207,11 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -1212,7 +1273,7 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
@@ -1261,10 +1322,10 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	auto* open_file = g_files->GetFile(real_file_name);
-	bool  ok        = (open_file != nullptr && open_file->opened && !open_file->directory
-	                       ? open_file->f.Unlink()
-	                       : Common::File::DeleteFile(real_file_name));
+	auto open_file = g_files->GetFile(real_file_name);
+	bool ok        = (open_file != nullptr && open_file->opened && !open_file->directory
+	                      ? open_file->f.Unlink()
+	                      : Common::File::DeleteFile(real_file_name));
 
 	if (!ok) {
 		return KERNEL_ERROR_EIO;
@@ -1296,10 +1357,7 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 
 	Common::File::CreateDirectories(real_to.parent_path());
 
-	if (Common::File::IsFileExisting(real_to)) {
-		Common::File::DeleteFile(real_to);
-	}
-
+	// RenameFile replaces an existing destination atomically, so a failed rename never loses it.
 	if (!Common::File::RenameFile(real_from, real_to)) {
 		return KERNEL_ERROR_EIO;
 	}
@@ -1320,9 +1378,9 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	auto* file = g_files->GetFile(fd);
+	auto file = g_files->GetFile(fd);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1330,7 +1388,6 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_IF(!file->opened);
 	Common::LockGuard lock(file->mutex);
 	if (file->dents_offset > file->dirents.size() || file->dents_offset % DIR_BLOCK_SIZE != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -1345,7 +1402,7 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		*basep = static_cast<int64_t>(file->dents_offset);
 	}
 	return static_cast<int>(
-	    ReadDirectory(file, buf, AlignDown(static_cast<uint64_t>(nbytes), DIR_BLOCK_SIZE)));
+	    ReadDirectory(file.get(), buf, AlignDown(static_cast<uint64_t>(nbytes), DIR_BLOCK_SIZE)));
 }
 
 int KYTY_SYSV_ABI KernelGetdents(int fd, char* buf, int nbytes) {

@@ -754,8 +754,17 @@ void EmitProgram(EmitterState& state) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
-		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
-		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		// WorkgroupId stays global across vkCmdDispatchBase chunks, but gl_NumWorkGroups would
+		// only report the chunk, so the host passes the total guest counts.
+		const auto counts = state.program.bindings.workgroup_count_dword;
+		const auto count_x =
+		    counts != IR::PushData::NoStart
+		        ? EmitShaderDataDwordLoad(state, counts)
+		        : EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y =
+		    counts != IR::PushData::NoStart
+		        ? EmitShaderDataDwordLoad(state, counts + 1u)
+		        : EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
 		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
 		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
 		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,

@@ -79,6 +79,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	if ((flags & ImageSampleFlagDerivative) != 0) {
 		components += ImageGradientComponents(dimension) * 2u;
 	}
+	// The *_cl variants append the LOD clamp after the coordinates.
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
+		components++;
+	}
 	return components;
 }
 
@@ -391,6 +395,17 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
+	}
+	// TFE/LWE return an extra status VGPR, and UNORM forces unnormalized sampler coordinates.
+	// Integer-addressed loads, stores and atomics ignore UNORM.
+	const bool unorm = ((word0 >> 12u) & 1u) != 0u;
+	const bool tfe   = ((word0 >> 16u) & 1u) != 0u;
+	const bool lwe   = ((word0 >> 17u) & 1u) != 0u;
+	if (tfe || lwe) {
+		SetUnsupported(inst, Family::MIMG, opcode, "MIMG TFE/LWE status return is not implemented");
+	} else if (unorm && (sample != nullptr || gather != nullptr || opcode == 0x60u)) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG UNORM sampler coordinates are not implemented");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

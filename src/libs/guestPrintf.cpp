@@ -14,8 +14,10 @@
 #include "common/stringUtils.h"
 #include "libs/vaContext.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace Libs {
@@ -37,6 +39,9 @@ constexpr size_t   PRINTF_NTOA_BUFFER_SIZE        = 32U;
 constexpr size_t   PRINTF_FTOA_BUFFER_SIZE        = 32U;
 constexpr double   PRINTF_MAX_FLOAT               = 1e9;
 constexpr uint32_t PRINTF_DEFAULT_FLOAT_PRECISION = 6U;
+// Guest-controlled widths are materialized as padding, so cap them to keep a bogus width
+// (e.g. INT_MAX via '*') from allocating gigabytes.
+constexpr uint32_t PRINTF_MAX_WIDTH = 1U << 20U;
 
 using out_fct_type = void (*)(char character, std::vector<char>* buffer, size_t idx,
                               size_t /*maxlen*/);
@@ -54,7 +59,9 @@ static inline bool _is_digit(char ch) {
 static unsigned int _atoi(const char** str) {
 	unsigned int i = 0U;
 	while (_is_digit(**str)) {
-		i = i * 10U + static_cast<unsigned int>(*((*str)++) - '0');
+		const auto digit = static_cast<unsigned int>(*((*str)++) - '0');
+		// Saturate instead of wrapping on absurdly long digit runs.
+		i = (i > (0x7fffffffU - digit) / 10U) ? 0x7fffffffU : i * 10U + digit;
 	}
 	return i;
 }
@@ -241,6 +248,9 @@ static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 		buf[len++] = '0';
 		prec--;
 	}
+	// The buffer is full at this point, so extra digits would be dropped anyway; clamp to stay
+	// inside pow10[].
+	prec = (std::min)(prec, 9U);
 
 	int    whole = static_cast<int>(value);
 	double tmp   = (value - whole) * pow10[prec];
@@ -510,12 +520,14 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			const int w = VaArg_int(va_list);
 			if (w < 0) {
 				flags |= FLAGS_LEFT; // reverse padding
-				width = static_cast<unsigned int>(-w);
+				// Negate in unsigned arithmetic so INT_MIN is well defined.
+				width = 0U - static_cast<unsigned int>(w);
 			} else {
 				width = static_cast<unsigned int>(w);
 			}
 			format++;
 		}
+		width = (std::min)(width, PRINTF_MAX_WIDTH);
 
 		// evaluate precision field
 		precision = 0U;
@@ -704,7 +716,10 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
 				const char* p = VaArg_ptr<const char>(va_list);
 				std::string converted;
-				if ((flags & FLAGS_LONG) != 0u) {
+				if (p == nullptr) {
+					// Match the common libc behaviour instead of dereferencing NULL.
+					p = "(null)";
+				} else if ((flags & FLAGS_LONG) != 0u) {
 					// The guest ABI uses a 16-bit code unit for wchar_t.
 					const auto* wide = reinterpret_cast<const char16_t*>(p);
 					std::u16string_view text(wide, _strnlen_s(wide, limit));
@@ -773,8 +788,13 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		// C99: write at most n-1 chars plus NUL (nothing when n == 0, so the buffer may be NULL)
+		// and return the untruncated length.
+		if (sn_n != 0 && sn_s != nullptr) {
+			const size_t copy = (std::min)(idx, sn_n - 1);
+			std::memcpy(sn_s, buffer.data(), copy);
+			sn_s[copy] = '\0';
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}

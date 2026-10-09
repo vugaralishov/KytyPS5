@@ -252,16 +252,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
-	if (!m_gpu_modified_ranges.Empty()) {
-		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
-	}
-	for (const auto& [vaddr, id]: m_buffers) {
-		(void)vaddr;
-		const auto& buffer = m_slot_buffers[id];
-		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
-			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
-		}
-	}
+	// GPU-modified data that was never read back is normal at shutdown and is discarded with
+	// the buffers. The memory tracker returns its page watchers when it is destroyed.
+	m_gpu_modified_ranges.Clear();
 	m_buffers.clear();
 }
 
@@ -283,9 +276,28 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		// GPU-dirty pages always belong to a cached buffer. Download from the buffers that
+		// intersect the range: creating one over an arbitrary range would merge every buffer in
+		// it into a single allocation.
+		bool       downloaded = false;
+		const auto end        = vaddr + size;
+		auto       it         = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), vaddr);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				downloaded |= DownloadBufferMemory<true>(buffer, start, finish - start);
+			}
+		}
+		if (downloaded) {
+			// One wait publishes every queued download before the CPU takes the pages.
+			const auto tick = m_scheduler.CurrentTick();
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
@@ -399,6 +411,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	WaitForUnprotectedWriteBacks(vaddr, size);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -482,6 +495,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		WaitForUnprotectedWriteBacks(vaddr, size);
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -500,6 +514,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		TrackUnprotectedGpuWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -521,6 +536,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
+	WaitForUnprotectedWriteBacks(vaddr, size);
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
 	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
@@ -545,6 +561,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
+		WaitForUnprotectedWriteBacks(vaddr, size);
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -571,8 +588,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
-		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
-		            size);
+		WaitForUnprotectedWriteBacks(dst_vaddr, size);
+		WaitForUnprotectedWriteBacks(src_vaddr, size);
+		// Guest DMA ranges may overlap.
+		std::memmove(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
+		             size);
 		return;
 	}
 
@@ -615,7 +635,79 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::TrackUnprotectedGpuWrite(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	LibKernel::Memory::GetUnprotectableGuestRanges(vaddr, size, &ranges);
+	for (const auto& [start, end]: ranges) {
+		const auto first = Common::AlignDown(start, TRACKER_PAGE_SIZE);
+		m_unprotected_gpu_writes.Add(first, Common::AlignUp(end, TRACKER_PAGE_SIZE) - first);
+	}
+}
+
+bool BufferCache::FlushUnprotectedGpuWrites() {
+	if (!m_unprotected_write_backs.empty() && !m_scheduler.HasPendingPriorityOperations()) {
+		std::erase_if(m_unprotected_write_backs, [this](const UnprotectedWriteBack& pending) {
+			return m_scheduler.IsFree(pending.tick);
+		});
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	m_unprotected_gpu_writes.ForEach(
+	    [&ranges](uint64_t begin, uint64_t end) { ranges.emplace_back(begin, end); });
+	if (ranges.empty()) {
+		return false;
+	}
+	m_unprotected_gpu_writes.Clear();
+
+	bool downloaded = false;
+	for (const auto& [begin, end]: ranges) {
+		auto it = m_buffers.upper_bound(begin);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), begin);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				downloaded |= DownloadBufferMemory<true>(buffer, start, finish - start);
+			}
+		}
+	}
+	// The pages return to CPU ownership now; CPU writes to them never fault, so the next GPU use
+	// uploads them again. Uploads and CPU-side accesses wait for this tick's publication first.
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto& [begin, end]: ranges) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+		m_memory_tracker.MarkRegionAsCpuModified(begin, end - begin);
+		if (downloaded) {
+			m_unprotected_write_backs.push_back({begin, end, tick});
+		}
+	}
+	return downloaded;
+}
+
+void BufferCache::WaitForUnprotectedWriteBacks(uint64_t vaddr, uint64_t size) {
+	if (m_unprotected_write_backs.empty()) {
+		return;
+	}
+	const auto end  = vaddr + size;
+	uint64_t   tick = 0;
+	std::erase_if(m_unprotected_write_backs, [&](const UnprotectedWriteBack& pending) {
+		if (pending.begin < end && vaddr < pending.end) {
+			tick = std::max(tick, pending.tick);
+			return true;
+		}
+		return false;
+	});
+	if (tick == 0 || !m_scheduler.Active() || CommandScheduler::InDeferredOperation()) {
+		return;
+	}
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+}
+
 void BufferCache::RunGarbageCollector() {
+	(void)FlushUnprotectedGpuWrites();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

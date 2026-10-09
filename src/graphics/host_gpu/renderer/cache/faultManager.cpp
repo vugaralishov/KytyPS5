@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -93,11 +94,19 @@ void FaultManager::ProcessFaultBuffer() {
 	pre_barrier.buffer        = m_fault_buffer.Handle();
 	pre_barrier.offset        = 0;
 	pre_barrier.size           = m_fault_buffer.Size();
-	auto post_barrier         = pre_barrier;
-	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
-	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	vk::BufferMemoryBarrier2 post_barriers[2] {pre_barrier, pre_barrier};
+	post_barriers[0].srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	post_barriers[0].srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barriers[0].dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	post_barriers[0].dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	// The deferred callback reads the fault list on the host after the tick completes.
+	post_barriers[1].srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	post_barriers[1].srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barriers[1].dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	post_barriers[1].dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	post_barriers[1].buffer        = m_download_buffer.Handle();
+	post_barriers[1].offset        = offset;
+	post_barriers[1].size          = PageFaultAreaSize;
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
@@ -124,15 +133,25 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
-	dependency.pBufferMemoryBarriers = &post_barrier;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(std::size(post_barriers));
+	dependency.pBufferMemoryBarriers    = post_barriers;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
+		// Shutdown pops pending operations after its final submit. No command buffer is
+		// recording then, so buffers cannot be created and the faults are moot.
+		if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+			m_fault_areas[area] = 0;
+			return;
+		}
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The shader's counter keeps counting past the area; only MaxPageFaults - 1 entries
+		// were stored. Pages it could not store stay set in the fault buffer for the next pass.
+		const auto count = static_cast<uint32_t>(
+		    std::min<uint64_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1));
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);

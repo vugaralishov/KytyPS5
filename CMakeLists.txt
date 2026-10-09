@@ -145,8 +145,6 @@ endif()
 project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
-	${KYTY_THIRD_PARTY_DIR}/gtest/include
-	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
 	${PROJECT_BINARY_DIR}
@@ -302,6 +300,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/gpu_dispatch_indirect_clamp.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -680,6 +679,45 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+
+	# These binaries initialize LibKernel::Memory, which reserves the whole guest address space
+	# (about 13.5 GB) per process; running several at once can exhaust it, so serialize them.
+	set(kyty_guest_memory_tests
+		virtual_memory_allocation
+		guest_red_zone_patcher
+		shader_recompiler_compute
+		shader_recompiler_alignbyte
+		graphics_pipeline_rasterization
+		graphics_draw_offsets
+		command_scheduler_timeline
+		stream_buffer_ring
+		gpu_command_lane
+		pm4_context_state
+		gpu_tiler
+		texture_cache_layered_image
+		host_image_allocation
+		texture_cache_image_views
+		texture_cache_storage_sampled
+		texture_cache_depth_readback
+		compute_meta_clear_classification
+		buffer_cache_dirty_gc
+		color_render_target_1d
+		texture_cache_image_overlap
+		texture_cache_htile_clear
+		buffer_cache_ranges
+	)
+	set_tests_properties(${kyty_guest_memory_tests} PROPERTIES RESOURCE_LOCK kyty_guest_memory)
+
+	# Tests that create a Vulkan device (or a Vulkan window) need a GPU; CI runs `ctest -LE gpu`.
+	# graphics_draw_offsets and texture_cache_depth_readback only exercise CPU-side code.
+	set(kyty_gpu_tests ${kyty_guest_memory_tests})
+	list(REMOVE_ITEM kyty_gpu_tests
+		virtual_memory_allocation
+		guest_red_zone_patcher
+		graphics_draw_offsets
+		texture_cache_depth_readback)
+	list(APPEND kyty_gpu_tests kernel_file_system)
+	set_tests_properties(${kyty_gpu_tests} PROPERTIES LABELS gpu)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests

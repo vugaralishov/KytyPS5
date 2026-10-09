@@ -1,6 +1,34 @@
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <array>
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+namespace {
+
+// S_SETREG_B32 has no direct translation. FP fields of MODE were already applied to the entry
+// mode (or rejected) by ResolveEntryFloatMode; warn once per other register whose write could
+// matter.
+void ReportIgnoredSetreg(const Decoder::Instruction& inst) {
+	constexpr uint32_t HwRegMode    = 1u;
+	constexpr uint32_t HwRegTrapsts = 3u;
+	const uint32_t     simm         = inst.src1.value;
+	const uint32_t     id           = simm & 0x3fu;
+	// MODE bits above IEEE are exception enables and debug controls, and TRAPSTS only feeds the
+	// trap handler; neither changes results here.
+	if (id == HwRegMode || id == HwRegTrapsts) {
+		return;
+	}
+	static std::array<std::atomic<bool>, 64> reported {};
+	if (reported[id].exchange(true)) {
+		return;
+	}
+	LOGF("shader recompiler: ignoring S_SETREG_B32 hwreg(%u, %u, %u) at pc 0x%08x\n", id,
+	     (simm >> 6u) & 0x1fu, ((simm >> 11u) & 0x1fu) + 1u, inst.pc);
+}
+
+} // namespace
 
 void Translator::EmitScalar(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
@@ -17,7 +45,10 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+			ReportIgnoredSetreg(inst);
+			EmitControlNop();
+			return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: return;
 

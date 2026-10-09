@@ -478,31 +478,30 @@ static void queue_save_data_event(uint32_t type, int32_t user_id,
 	}
 }
 
+// '%' matches any run of characters (including none) and '_' exactly one. Iterative matching
+// with a single backtrack point keeps guest patterns with many '%' at O(len(str) * len(pattern))
+// instead of exponential.
 static bool dir_name_match(const char* str, const char* pattern) {
-	while (*str != '\0' && *pattern != '\0') {
+	const char* star_pattern = nullptr;
+	const char* star_str     = nullptr;
+	while (*str != '\0') {
 		if (*pattern == '%') {
-			for (const char* s = str;; s++) {
-				if (dir_name_match(s, pattern + 1)) {
-					return true;
-				}
-				if (*s == '\0') {
-					break;
-				}
-			}
-			return false;
-		}
-		if (*pattern == '_') {
+			star_pattern = ++pattern;
+			star_str     = str;
+		} else if (*pattern != '\0' && (*pattern == '_' || *pattern == *str)) {
 			str++;
 			pattern++;
-			continue;
-		}
-		if (*pattern != *str) {
+		} else if (star_pattern != nullptr) {
+			pattern = star_pattern;
+			str     = ++star_str;
+		} else {
 			return false;
 		}
-		str++;
+	}
+	while (*pattern == '%') {
 		pattern++;
 	}
-	return *str == '\0' && *pattern == '\0';
+	return *pattern == '\0';
 }
 
 static int mount_save_data(int slot, const std::filesystem::path& directory,
@@ -687,7 +686,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	if (!create && !create2 && !open) {
-		EXIT("unknown mount mode: %u", mount->mount_mode);
+		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
 	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
@@ -932,7 +931,8 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
 	PRINT_NAME();
 
-	if (mount_point == nullptr) {
+	if (mount_point == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
@@ -960,7 +960,8 @@ int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
                                   const SaveDataPrepareParam* param) {
 	PRINT_NAME();
 
-	if (mount_point == nullptr || param == nullptr) {
+	if (mount_point == nullptr || param == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
@@ -1080,7 +1081,8 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDataIcon* icon) {
 	PRINT_NAME();
 
-	if (mount_point == nullptr || icon == nullptr) {
+	if (mount_point == nullptr || icon == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
@@ -1097,7 +1099,8 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, const char* path) {
 	PRINT_NAME();
 
-	if (mount_point == nullptr || path == nullptr) {
+	if (mount_point == nullptr || path == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
@@ -1273,8 +1276,9 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
 
 int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
                                    const SaveDataIcon*       icon) {
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
-	EXIT_NOT_IMPLEMENTED(icon == nullptr);
+	if (mount_point == nullptr || icon == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
 
 	LOGF("\t buf       = %016" PRIx64 "\n"
 	     "\t buf_size  = %" PRIu64 "\n"

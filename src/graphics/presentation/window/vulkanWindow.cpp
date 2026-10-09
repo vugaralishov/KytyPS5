@@ -566,7 +566,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.independentBlend                     = VK_TRUE;
+	// image_sample_*_cl shaders use the MinLod image operand. Every desktop driver supports it;
+	// enable it when present instead of refusing to start on a device without it.
+	device_features.shaderResourceMinLod = supported_features2.features.shaderResourceMinLod;
+	if (device_features.shaderResourceMinLod != VK_TRUE) {
+		LOGF("shaderResourceMinLod is not supported; *_cl image samples will be invalid\n");
+	}
+	device_features.independentBlend                      = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;

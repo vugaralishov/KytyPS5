@@ -969,7 +969,7 @@ public:
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
 	[[nodiscard]] const GdsOaState&   GetGdsOaState() const { return m_gds_oa; }
 	[[nodiscard]] const GdsOaCounter& GetGdsOaCounter(uint32_t index) const {
-		return m_gds_oa.counters[index & 0x0fu];
+		return m_gds_oa.counters[index & (GdsOaState::COUNTERS_NUM - 1u)];
 	}
 	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
 	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }

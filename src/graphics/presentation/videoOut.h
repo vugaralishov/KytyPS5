@@ -37,8 +37,11 @@ public:
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void WaitForSubmitSlot(int handle);
-	void WaitFlipDone(int handle, int index);
+	// GPU thread only. Returns false when no slot can free up without this thread's progress.
+	[[nodiscard]] bool WaitForSubmitSlot(int handle);
+	void               WaitFlipDone(int handle, int index);
+	// Non-blocking: true when WaitFlipDone would return immediately (invalid handle/index too).
+	[[nodiscard]] bool IsFlipDone(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 

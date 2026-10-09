@@ -27,6 +27,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 #include <thread>
 
 namespace Emulator {
@@ -76,9 +77,23 @@ static void MountOrCreateDir(const std::filesystem::path& dir, const std::string
 	LOGF("Mounted %s -> %s\n", point.c_str(), dir_text.c_str());
 }
 
+// TITLE_ID comes from the game's param.json and is joined into host paths that are mounted
+// read-write, so it must be a single plain path component (same rule as libSaveData).
+static bool IsValidTitleIdComponent(std::string_view name) {
+	return !name.empty() && name != "." && name != ".." &&
+	       name.find_first_not_of(
+	           "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.") ==
+	           std::string_view::npos;
+}
+
 static void MountSandboxDirs() {
 	std::string title_id;
-	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
+	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
+	    !IsValidTitleIdComponent(title_id)) {
+		if (!title_id.empty()) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "Invalid TITLE_ID for sandbox dirs, using UNKNOWN\n");
+		}
 		title_id = "UNKNOWN";
 	}
 
@@ -157,6 +172,12 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 
 	auto* program = rt->LoadProgram(
 	    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(elf)));
+
+	if (program == nullptr) {
+		EXIT("Failed to load %s: not a supported, decrypted PS5 ELF/SELF (the log names the "
+		     "reason)\n",
+		     Common::PathToString(elf).c_str());
+	}
 
 	if (dbg_print_reloc) {
 		program->dbg_print_reloc = true;

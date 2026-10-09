@@ -73,6 +73,8 @@ struct DynamicInfo {
 
 	char*    str_table      = nullptr;
 	uint64_t str_table_size = 0;
+	// Offsets below this value start a NUL-terminated string inside the table.
+	uint64_t str_table_terminated_size = 0;
 
 	Elf64_Sym* symbol_table            = nullptr;
 	uint64_t   symbol_table_total_size = 0;
@@ -142,6 +144,7 @@ public:
 
 	void DbgDump(const std::string& folder);
 
+	// Returns nullptr when the file is missing or not a loadable ELF/SELF.
 	Program* LoadProgram(const std::filesystem::path& elf_name);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
@@ -178,8 +181,8 @@ public:
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
-	static void LoadProgramToMemory(Program* program);
-	static void ParseProgramDynamicInfo(Program* program);
+	static bool LoadProgramToMemory(Program* program);
+	static bool ParseProgramDynamicInfo(Program* program);
 	static void CreateSymbolDatabase(Program* program);
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
@@ -200,6 +203,7 @@ private:
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
+bool TestTlsRelocations(std::string* failure);
 #endif
 
 } // namespace Loader

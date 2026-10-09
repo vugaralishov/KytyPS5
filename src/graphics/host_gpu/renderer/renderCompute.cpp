@@ -223,6 +223,13 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		}
 	}
 	bindings.shared_memory = {storage.Handle(), 0, size};
+	// The shader indexes each group's LDS slice with the total counts rather than
+	// gl_NumWorkGroups, which only covers one chunk of a split dispatch.
+	const auto counts_dword = input.stage.program->bindings.workgroup_count_dword;
+	if (counts_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		EXIT_IF(counts_dword + 3u > bindings.shader_data.size());
+		std::ranges::copy(input.workgroup_counts, bindings.shader_data.begin() + counts_dword);
+	}
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -430,11 +437,96 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	// Guest group counts may exceed maxComputeWorkGroupCount, which is undefined behaviour in
+	// Vulkan. Split such dispatches with vkCmdDispatchBase: WorkgroupId (and thus
+	// GlobalInvocationId) stays global, and storage LDS indexing uses the total counts passed in
+	// shader data instead of the per-chunk gl_NumWorkGroups.
+	const auto& max_groups =
+	    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxComputeWorkGroupCount;
+	if (thread_group_x <= max_groups[0] && thread_group_y <= max_groups[1] &&
+	    thread_group_z <= max_groups[2]) {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	} else {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("GraphicsRenderDispatchDirect: groups %ux%ux%u exceed host limit %ux%ux%u, "
+			     "splitting shader=0x%016" PRIx64 "\n",
+			     thread_group_x, thread_group_y, thread_group_z, max_groups[0], max_groups[1],
+			     max_groups[2], sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		const std::array<uint64_t, 3> totals {thread_group_x, thread_group_y, thread_group_z};
+		std::array<uint64_t, 3>       steps {};
+		for (uint32_t axis = 0; axis < 3u; axis++) {
+			steps[axis] = (std::max)(max_groups[axis], 1u);
+		}
+		const auto chunk = [&](uint32_t axis, uint64_t base) {
+			return static_cast<uint32_t>((std::min)(steps[axis], totals[axis] - base));
+		};
+		for (uint64_t z = 0; z < totals[2]; z += steps[2]) {
+			for (uint64_t y = 0; y < totals[1]; y += steps[1]) {
+				for (uint64_t x = 0; x < totals[0]; x += steps[0]) {
+					vk_buffer.dispatchBase(static_cast<uint32_t>(x), static_cast<uint32_t>(y),
+					                       static_cast<uint32_t>(z), chunk(0, x), chunk(1, y),
+					                       chunk(2, z));
+				}
+			}
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+}
+
+// Copies the DispatchIndirect arguments into the stream buffer with each count clamped to
+// maxComputeWorkGroupCount and returns the clamped copy for vkCmdDispatchIndirect.
+static std::pair<vk::Buffer, vk::DeviceSize> ClampDispatchIndirectArgs(RenderContext&    context,
+                                                                       vk::CommandBuffer vk_buffer,
+                                                                       const Buffer&     args,
+                                                                       uint64_t args_offset) {
+	const auto& graphics   = context.GetGraphics();
+	const auto& max_groups = graphics.GetPhysicalDeviceProperties().limits.maxComputeWorkGroupCount;
+	auto&       clamp      = context.GetPipelineCache().GetDispatchIndirectClampPipeline();
+	auto&       stream     = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	// minStorageBufferOffsetAlignment is a power of two.
+	const auto                        alignment = graphics.StorageMinAlignment();
+	constexpr std::array<uint32_t, 4> zero {};
+	const auto target_offset = stream.Copy(zero.data(), sizeof(zero), alignment);
+	const auto source_base   = args_offset & ~(alignment - 1u);
+	const vk::DescriptorBufferInfo infos[] {
+	    {args.Handle(), source_base,
+	     args_offset - source_base + sizeof(vk::DispatchIndirectCommand)},
+	    {stream.Handle(), target_offset, sizeof(vk::DispatchIndirectCommand)},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); ++index) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+	const std::array<uint32_t, 4> push {max_groups[0], max_groups[1], max_groups[2],
+	                                    static_cast<uint32_t>((args_offset - source_base) / 4u)};
+
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+	vk_buffer.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+	        vk::PipelineStageFlagBits::eTransfer,
+	    vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, clamp.pipeline);
+	vk_buffer.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, clamp.pipeline_layout, 0,
+	                               writes);
+	vk_buffer.pushConstants(clamp.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                        sizeof(push), push.data());
+	vk_buffer.dispatch(1, 1, 1);
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
+	                          0, nullptr);
+	return {stream.Handle(), target_offset};
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -470,9 +562,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	const auto vk_buffer = buffer.Handle();
+	// GPU-authored counts above maxComputeWorkGroupCount are undefined behaviour in Vulkan and
+	// cannot be split without reading them back, so a utility pass copies them clamped to the
+	// limits. It runs before CommitBindings because it rebinds the compute pipeline state.
+	const auto [clamped_buffer, clamped_offset] =
+	    ClampDispatchIndirectArgs(m_context, vk_buffer, *args_buffer, args_offset);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -482,16 +579,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (has_storage_writes) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(clamped_buffer, clamped_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

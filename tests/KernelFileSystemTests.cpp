@@ -128,6 +128,76 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void CheckGuestArgumentErrors(const std::filesystem::path &root) {
+  namespace Kernel = Libs::LibKernel;
+  Check(FileSystem::KernelOpen("/savedata0/accmode.dat", 0x3, 0777) ==
+            Kernel::KERNEL_ERROR_EINVAL,
+        "O_ACCMODE 3 reports EINVAL");
+
+  std::filesystem::create_directories(root / "guest-dir");
+  constexpr int ODirectory = 0x00020000;
+  Check(FileSystem::KernelOpen("/savedata0/guest-dir", ODirectory | 0x2, 0) ==
+            Kernel::KERNEL_ERROR_EISDIR &&
+            FileSystem::KernelOpen("/savedata0/guest-dir", 0x1, 0) ==
+                Kernel::KERNEL_ERROR_EISDIR &&
+            FileSystem::KernelOpen("/savedata0/guest-dir", 0x200, 0777) ==
+                Kernel::KERNEL_ERROR_EISDIR,
+        "writing or creating a directory reports EISDIR");
+  const int dir_fd = FileSystem::KernelOpen("/savedata0/guest-dir", ODirectory, 0);
+  std::array<char, 16> buffer {};
+  Check(dir_fd >= 3 &&
+            FileSystem::KernelPread(dir_fd, buffer.data(), buffer.size(), 0) ==
+                Kernel::KERNEL_ERROR_EISDIR,
+        "pread on a directory reports EISDIR");
+  Check(FileSystem::KernelClose(dir_fd) == OK, "close directory");
+
+  const int random_fd = FileSystem::KernelOpen("/dev/urandom", 0x1, 0);
+  Check(random_fd >= 3 &&
+            FileSystem::KernelWrite(random_fd, buffer.data(), buffer.size()) ==
+                static_cast<int64_t>(buffer.size()),
+        "writes to the entropy device are accepted");
+  Check(FileSystem::KernelClose(random_fd) == OK, "close write-only entropy device");
+
+  // File descriptors must stay below the socket descriptor range (128 and up).
+  std::vector<int> descriptors;
+  int last = OK;
+  for (int i = 0; i < 256; i++) {
+    last = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+    if (last < 0) {
+      break;
+    }
+    descriptors.push_back(last);
+  }
+  Check(last == Kernel::KERNEL_ERROR_EMFILE && !descriptors.empty() &&
+            std::all_of(descriptors.begin(), descriptors.end(),
+                        [](int fd) { return fd >= 3 && fd < 128; }),
+        "file descriptors are capped below the socket range with EMFILE");
+  for (const int fd : descriptors) {
+    Check(FileSystem::KernelClose(fd) == OK, "close capped descriptor");
+  }
+
+  {
+    Common::File old_target;
+    Check(old_target.Create(root / "rename-target.dat"), "create rename target");
+    old_target.Write("old", 3);
+  }
+  {
+    Common::File new_source;
+    Check(new_source.Create(root / "rename-source.dat"), "create rename source");
+    new_source.Write("new!", 4);
+  }
+  Check(FileSystem::KernelRename("/savedata0/rename-source.dat",
+                                 "/savedata0/rename-target.dat") == OK &&
+            !std::filesystem::exists(root / "rename-source.dat") &&
+            std::filesystem::file_size(root / "rename-target.dat") == 4,
+        "rename replaces an existing destination");
+  Check(FileSystem::KernelRename("/savedata0/rename-missing.dat",
+                                 "/savedata0/rename-target.dat") ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::file_size(root / "rename-target.dat") == 4,
+        "failed rename keeps the destination");
+}
+
 void TestRandomDevices() {
   for (const auto* path : {"/dev/urandom", "/dev/random"}) {
     const int fd = FileSystem::KernelOpen(path, 0, 0);
@@ -520,6 +590,18 @@ void CheckMountRoot(const std::filesystem::path &root) {
         "resolve mount descendant");
   Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
+  Check(FileSystem::GetRealFilename("/app0/./missing/../rpf.cache") == root / "rpf.cache" &&
+            FileSystem::GetRealFilename("/app0/../app0/rpf.cache") == root / "rpf.cache",
+        "dot components resolve lexically inside the guest namespace");
+  Check(FileSystem::GetRealFilename("/app0/../rpf.cache").empty() &&
+            FileSystem::GetRealFilename("/app0/../../rpf.cache").empty() &&
+            FileSystem::GetRealFilename("/app0/a/../../../rpf.cache").empty(),
+        "parent components cannot escape the mount directory");
+#if defined(_WIN32)
+  Check(FileSystem::GetRealFilename("/app0/C:/Windows/win.ini").empty() &&
+            FileSystem::GetRealFilename("/app0/C:rpf.cache").empty(),
+        "drive-qualified components cannot replace the mount directory");
+#endif
 
   for (const char *path : {"/app0", "/app0/"}) {
     for (const int flags : {0, 0x00020000}) {
@@ -1221,8 +1303,8 @@ std::array<int, 2> CreateTcpPair() {
 void CheckSocketReceiveConcurrency() {
   namespace Net = Libs::Network::Net;
   const auto [reader, writer] = CreateTcpPair();
-  const int timeout_ms = 3000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+  const int timeout_us = 3000000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0,
         "bound the blocked receive concurrency fixture");
   std::promise<void> entered;
   std::promise<int64_t> completed;
@@ -1256,13 +1338,12 @@ void CheckSocketReceiveConcurrency() {
   Check(Net::SocketClose(writer) == 0, "close blocked receive writer");
 
   const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
-  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0 &&
             Net::Send(shutdown_writer, "x", 1, 0) == 1 &&
             Net::Recv(shutdown_reader, &byte, 1, 0x42) == 1 && byte == 'x' &&
             Net::Shutdown(shutdown_reader, 0) == 0 &&
-            Net::Recv(shutdown_reader, &byte, 1, 0) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ESHUTDOWN,
-        "receive shutdown rejects bytes retained by an earlier peek");
+            Net::Recv(shutdown_reader, &byte, 1, 0) == 0,
+        "receive shutdown discards bytes retained by an earlier peek and reports EOF");
   Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
         "close receive shutdown fixture");
 }
@@ -1271,8 +1352,8 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
   namespace Net = Libs::Network::Net;
   constexpr int PeekWaitAll = 0x42;
   constexpr char Payload[] = "abcdef";
-  const int timeout_ms = 2000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+  const int timeout_us = 2000000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0,
         "bound blocking receive regressions with SO_RCVTIMEO");
   Check(Net::Send(writer, Payload, 2, 0) == 2, "send first TCP fragment");
   std::jthread sender([&] {
@@ -1385,7 +1466,7 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
   Check(datagram >= 0 && datagram_writer >= 0 &&
             Net::Bind(datagram, address.data(), address.size()) == 0 &&
             Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
-            Net::Setsockopt(datagram, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0 &&
             Net::Sendto(datagram_writer, Payload, 6, 0, address.data(), address_size) == 6,
         "create bounded UDP truncation fixture");
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
@@ -1729,6 +1810,7 @@ int main(int, char**) {
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
+  CheckGuestArgumentErrors(temporary.Path());
   FileSystem::Shutdown();
   CheckSocketWakeup();
   CheckEtherAddressFormatting();

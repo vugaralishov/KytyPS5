@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,6 +71,10 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// GPU thread: records write-backs of GPU-written images in pages the host cannot protect
+	// (guest stacks on Windows), queued ahead of anything deferred later for the same tick.
+	// Returns whether a write-back was recorded.
+	bool FlushUnprotectedGpuWrites();
 	void RunGarbageCollector();
 
 private:
@@ -116,6 +121,9 @@ private:
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
 	void                      FreeImage(ImageId id);
+	// For an image replaced by a different guest layout: GPU-only contents go to guest memory
+	// first, so the replacement can load them.
+	void                             DownloadAndFreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -125,6 +133,9 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	void                             RevalidateUnprotectableImage(ImageId id, Image& image);
+	[[nodiscard]] static bool        IsUnprotectableImage(const Image& image);
+	bool                             FlushUnprotectedGpuWritesLocked();
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -162,6 +173,17 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Newest tick of a queued download write-back overlapping the range's tracker pages, or 0.
+	[[nodiscard]] uint64_t PendingWriteBackTick(uint64_t address, uint64_t size);
+	// GPU thread only: returns once the write-backs queued up to tick have reached guest memory.
+	void WaitForWriteBack(uint64_t tick);
+
+	struct PendingWriteBack {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t tick    = 0;
+		uint64_t serial  = 0;
+	};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -175,7 +197,15 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Images in unprotectable pages that may hold GPU writes not yet written back.
+	std::unordered_set<ImageId> m_unprotected_gpu_images;
+	// Images whose GPU contents were written back; guest memory is authoritative for them.
+	std::unordered_set<ImageId>                       m_unprotected_written_back;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Guards the write-back list, which the priority thread updates without m_lock.
+	std::mutex                                        m_write_back_mutex;
+	std::vector<PendingWriteBack>                     m_pending_write_backs;
+	uint64_t                                          m_write_back_serial      = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

@@ -8,6 +8,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -338,7 +339,8 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 	}
 
 	if (out != nullptr && pool != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		// prepare is the pool size; zero is not "unlimited" (matches HttpUriEscape).
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
@@ -526,7 +528,8 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 	}
 
 	if (out != nullptr && pool != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		// prepare is the pool size; zero is not "unlimited" (matches HttpUriEscape).
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
@@ -690,7 +693,8 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 	}
 
 	if (out != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		// prepare is the buffer size; zero is not "unlimited" (matches HttpUriEscape).
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
@@ -815,7 +819,10 @@ static int g_http2_next_request_id  = 1;
 static std::map<int, Http2Context>  g_http2_contexts;
 static std::map<int, Http2Template> g_http2_templates;
 static std::map<int, Http2Request>  g_http2_requests;
+// Guards the maps and id counters above; guest threads call these concurrently.
+static std::mutex g_http2_mutex;
 
+// The caller holds g_http2_mutex.
 static Http2Options* GetHttp2Options(int id) {
 	auto request = g_http2_requests.find(id);
 	if (request != g_http2_requests.end()) {
@@ -840,6 +847,7 @@ static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t 
 	     "\t max_concurrent_request = %d\n",
 	     libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request);
 
+	std::lock_guard lock(g_http2_mutex);
 	const auto id        = g_http2_next_context_id++;
 	g_http2_contexts[id] = {libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request};
 
@@ -855,6 +863,7 @@ static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* u
 	LOGF("\t http_ver           = %d\n", http_ver);
 	LOGF("\t is_auto_proxy_conf = %d\n", is_auto_proxy_conf);
 
+	std::lock_guard lock(g_http2_mutex);
 	if (g_http2_contexts.find(lib_http2_ctx_id) == g_http2_contexts.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
@@ -871,6 +880,7 @@ static int KYTY_SYSV_ABI Http2DeleteTemplate(int tmpl_id) {
 
 	LOGF("\t tmpl_id = %d\n", tmpl_id);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto tmpl = g_http2_templates.find(tmpl_id);
 	if (tmpl == g_http2_templates.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -894,6 +904,7 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 
 	LOGF("\t lib_http2_ctx_id = %d\n", lib_http2_ctx_id);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto context = g_http2_contexts.find(lib_http2_ctx_id);
 	if (context == g_http2_contexts.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -933,6 +944,7 @@ static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* meth
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	if (g_http2_templates.find(tmpl_id) == g_http2_templates.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
@@ -956,6 +968,7 @@ static int KYTY_SYSV_ABI Http2AddRequestHeader(int id, const char* name, const c
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -972,6 +985,7 @@ static int KYTY_SYSV_ABI Http2SetRequestContentLength(int id, uint64_t content_l
 	LOGF("\t id             = %d\n", id);
 	LOGF("\t content_length = %" PRIu64 "\n", content_length);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -988,6 +1002,7 @@ static int KYTY_SYSV_ABI Http2SetAuthEnabled(int id, int is_enable) {
 	LOGF("\t id        = %d\n", id);
 	LOGF("\t is_enable = %d\n", is_enable);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1004,6 +1019,7 @@ static int KYTY_SYSV_ABI Http2SetAutoRedirect(int id, int enable) {
 	LOGF("\t id     = %d\n", id);
 	LOGF("\t enable = %d\n", enable);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1020,6 +1036,7 @@ static int KYTY_SYSV_ABI Http2SetInflateGZIPEnabled(int id, int enable) {
 	LOGF("\t id     = %d\n", id);
 	LOGF("\t enable = %d\n", enable);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1036,6 +1053,7 @@ static int KYTY_SYSV_ABI Http2SslEnableOption(int id, uint32_t ssl_flags) {
 	LOGF("\t id        = %d\n", id);
 	LOGF("\t ssl_flags = 0x%08" PRIx32 "\n", ssl_flags);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1052,6 +1070,7 @@ static int KYTY_SYSV_ABI Http2SslDisableOption(int id, uint32_t ssl_flags) {
 	LOGF("\t id        = %d\n", id);
 	LOGF("\t ssl_flags = 0x%08" PRIx32 "\n", ssl_flags);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1069,6 +1088,7 @@ static int KYTY_SYSV_ABI Http2SetSslCallback(int id, void* cb_func, void* user_a
 	LOGF("\t cb_func  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(cb_func));
 	LOGF("\t user_arg = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(user_arg));
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1087,6 +1107,7 @@ static int KYTY_SYSV_ABI Http2SetRedirectCallback(int id, void* cb_func, void* u
 	LOGF("\t cb_func  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(cb_func));
 	LOGF("\t user_arg = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(user_arg));
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1104,6 +1125,7 @@ static int KYTY_SYSV_ABI Http2SetConnectTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1120,6 +1142,7 @@ static int KYTY_SYSV_ABI Http2SetConnectionWaitTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1136,6 +1159,7 @@ static int KYTY_SYSV_ABI Http2SetResolveTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1152,6 +1176,7 @@ static int KYTY_SYSV_ABI Http2SetTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1168,6 +1193,7 @@ static int KYTY_SYSV_ABI Http2SetSendTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1184,6 +1210,7 @@ static int KYTY_SYSV_ABI Http2SetRecvTimeOut(int id, uint32_t usec) {
 	LOGF("\t id   = %d\n", id);
 	LOGF("\t usec = %" PRIu32 "\n", usec);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto* options = GetHttp2Options(id);
 	if (options == nullptr) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1205,6 +1232,7 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1227,6 +1255,7 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1250,6 +1279,7 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1275,6 +1305,7 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 
 	*status_code = 0;
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1304,6 +1335,7 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 	*result         = 0;
 	*content_length = 0;
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1334,6 +1366,7 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 	*header      = nullptr;
 	*header_size = 0;
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1360,6 +1393,7 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1395,6 +1429,7 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -1428,6 +1463,7 @@ static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 
 	LOGF("\t req_id = %d\n", req_id);
 
+	std::lock_guard lock(g_http2_mutex);
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
@@ -2185,6 +2221,9 @@ struct NpWebApi2Request {
 	size_t      read_offset = 0;
 };
 
+// Guards NpWebApi2Requests() and the request id counter. Callers of NpWebApi2Requests() hold it.
+static std::mutex g_np_webapi2_request_mutex;
+
 static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
 	static std::map<int64_t, NpWebApi2Request> requests;
 	return requests;
@@ -2230,7 +2269,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
 
-	static int handle = 0;
+	static std::atomic_int handle = 0;
 
 	return ++handle;
 }
@@ -2242,7 +2281,7 @@ static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id)
 	     "\t user_id    = %d\n",
 	     lib_ctx_id, user_id);
 
-	static int user_context = 1000;
+	static std::atomic_int user_context = 1000;
 
 	return ++user_context;
 }
@@ -2271,6 +2310,7 @@ static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char*
 
 	static int64_t next_request_id = 1000;
 
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	if (request_id != nullptr) {
 		*request_id = next_request_id++;
 		NpWebApi2Request request {};
@@ -2288,6 +2328,7 @@ static int KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
 
 	LOGF("\t request_id = %" PRIi64 "\n", request_id);
 
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	return (NpWebApi2Requests().find(request_id) == NpWebApi2Requests().end()
 	            ? NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND
 	            : 0);
@@ -2304,6 +2345,7 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 	LOGF("\t response_info_option = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(response_info_option));
 
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	auto request = NpWebApi2Requests().find(request_id);
 	if (request == NpWebApi2Requests().end()) {
 		return NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND;
@@ -2335,6 +2377,7 @@ static int KYTY_SYSV_ABI NpWebApi2ReadData(int64_t request_id, void* data, size_
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
 
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	auto request = NpWebApi2Requests().find(request_id);
 	if (request == NpWebApi2Requests().end()) {
 		return NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND;
@@ -2355,6 +2398,7 @@ static int KYTY_SYSV_ABI NpWebApi2DeleteRequest(int64_t request_id) {
 
 	LOGF("\t request_id = %" PRIi64 "\n", request_id);
 
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	NpWebApi2Requests().erase(request_id);
 
 	return 0;
@@ -2383,6 +2427,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValueLength(int64_t     r
 	if (field_name == nullptr || value_length == nullptr) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	if (NpWebApi2Requests().find(request_id) == NpWebApi2Requests().end()) {
 		return NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND;
 	}
@@ -2408,6 +2453,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValue(int64_t     request
 	if (field_name == nullptr || value == nullptr || value_size == 0) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
+	std::lock_guard lock(g_np_webapi2_request_mutex);
 	if (NpWebApi2Requests().find(request_id) == NpWebApi2Requests().end()) {
 		return NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND;
 	}
@@ -2459,7 +2505,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int hand
 	LOGF("\t filter_param     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(filter_param));
 	LOGF("\t filter_param_num = %" PRIu64 "\n", filter_param_num);
 
-	static int filter_id = 1;
+	static std::atomic_int filter_id = 1;
 
 	return filter_id++;
 }
@@ -2473,7 +2519,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	LOGF("\t callback        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(callback));
 	LOGF("\t user_arg        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(user_arg));
 
-	static int callback_id = 1;
+	static std::atomic_int callback_id = 1;
 
 	return callback_id++;
 }
@@ -2555,10 +2601,13 @@ struct GameUpdateAddcontVersionInfo {
 static bool                g_game_update_initialized  = false;
 static int                 g_game_update_next_request = 1;
 static std::map<int, bool> g_game_update_requests;
+// Guards the state above; guest threads call these concurrently.
+static std::mutex g_game_update_mutex;
 
 static int KYTY_SYSV_ABI GameUpdateInitialize() {
 	PRINT_NAME();
 
+	std::lock_guard lock(g_game_update_mutex);
 	g_game_update_initialized = true;
 
 	return 0;
@@ -2567,6 +2616,7 @@ static int KYTY_SYSV_ABI GameUpdateInitialize() {
 static int KYTY_SYSV_ABI GameUpdateTerminate() {
 	PRINT_NAME();
 
+	std::lock_guard lock(g_game_update_mutex);
 	g_game_update_initialized = false;
 	g_game_update_requests.clear();
 
@@ -2576,6 +2626,7 @@ static int KYTY_SYSV_ABI GameUpdateTerminate() {
 static int KYTY_SYSV_ABI GameUpdateCreateRequest() {
 	PRINT_NAME();
 
+	std::lock_guard lock(g_game_update_mutex);
 	if (!g_game_update_initialized) {
 		return GAME_UPDATE_ERROR_NOT_INITIALIZED;
 	}
@@ -2595,6 +2646,7 @@ static int KYTY_SYSV_ABI GameUpdateCheck(int request_id, const GameUpdateCheckPa
 	     "\t result     = 0x%016" PRIx64 "\n",
 	     request_id, reinterpret_cast<uint64_t>(param), reinterpret_cast<uint64_t>(result));
 
+	std::lock_guard lock(g_game_update_mutex);
 	if (!g_game_update_initialized) {
 		return GAME_UPDATE_ERROR_NOT_INITIALIZED;
 	}
@@ -2623,6 +2675,7 @@ static int KYTY_SYSV_ABI GameUpdateAbortRequest(int request_id) {
 
 	LOGF("\t request_id = %d\n", request_id);
 
+	std::lock_guard lock(g_game_update_mutex);
 	if (!g_game_update_initialized) {
 		return GAME_UPDATE_ERROR_NOT_INITIALIZED;
 	}
@@ -2638,6 +2691,7 @@ static int KYTY_SYSV_ABI GameUpdateDeleteRequest(int request_id) {
 
 	LOGF("\t request_id = %d\n", request_id);
 
+	std::lock_guard lock(g_game_update_mutex);
 	if (!g_game_update_initialized) {
 		return GAME_UPDATE_ERROR_NOT_INITIALIZED;
 	}
@@ -2659,6 +2713,7 @@ static int KYTY_SYSV_ABI GameUpdateGetAddcontLatestVersion(uint32_t    service_l
 	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
 	     reinterpret_cast<uint64_t>(info));
 
+	std::lock_guard lock(g_game_update_mutex);
 	if (!g_game_update_initialized) {
 		return GAME_UPDATE_ERROR_NOT_INITIALIZED;
 	}

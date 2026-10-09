@@ -121,11 +121,18 @@ constexpr Elf64_Sxword DT_RELACOUNT = 0x6ffffff9;
 
 constexpr Elf64_Sxword DT_NULL = 0;
 
+constexpr Elf64_Word R_X86_64_NONE      = 0;
 constexpr Elf64_Word R_X86_64_64        = 1;
 constexpr Elf64_Word R_X86_64_GLOB_DAT  = 6;
 constexpr Elf64_Word R_X86_64_JUMP_SLOT = 7;
 constexpr Elf64_Word R_X86_64_RELATIVE  = 8;
 constexpr Elf64_Word R_X86_64_DTPMOD64  = 16;
+constexpr Elf64_Word R_X86_64_DTPOFF64  = 17;
+constexpr Elf64_Word R_X86_64_TPOFF64   = 18;
+constexpr Elf64_Word R_X86_64_DTPOFF32  = 21;
+constexpr Elf64_Word R_X86_64_TPOFF32   = 23;
+
+constexpr Elf64_Half SHN_UNDEF = 0;
 
 constexpr uint8_t STB_LOCAL  = 0;
 constexpr uint8_t STB_GLOBAL = 1;
@@ -134,6 +141,12 @@ constexpr uint8_t STB_WEAK   = 2;
 constexpr uint8_t STT_NOTYPE = 0;
 constexpr uint8_t STT_OBJECT = 1;
 constexpr uint8_t STT_FUNC   = 2;
+constexpr uint8_t STT_TLS    = 6;
+
+// SelfSegment::type flags.
+constexpr uint64_t SELF_SEGMENT_ENCRYPTED = 0x2;
+constexpr uint64_t SELF_SEGMENT_DEFLATED  = 0x8;
+constexpr uint64_t SELF_SEGMENT_BLOCKED   = 0x800;
 
 #pragma pack(1)
 
@@ -264,7 +277,8 @@ public:
 	[[nodiscard]] bool IsShared() const;
 	[[nodiscard]] bool IsNextGen() const;
 
-	void LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
+	// Returns false when the requested range is not backed by the file.
+	bool LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
 
 	uint64_t GetEntry();
 
@@ -282,23 +296,36 @@ public:
 	[[nodiscard]] const Elf64_Shdr* GetShdr() const { return m_shdr.get(); }
 	[[nodiscard]] char*             GetStrTable() const { return m_str_table.get(); }
 
+	// Returns nullptr for offsets outside PT_OS_DYNLIBDATA; callers still validate table sizes
+	// with IsDynamicDataRange.
 	template <class T>
 	[[nodiscard]] T GetDynamicData(uint64_t offset) const {
-		return (m_dynamic_data == nullptr ? nullptr
-		                                  : reinterpret_cast<T>(m_dynamic_data.get() + offset));
+		return (m_dynamic_data == nullptr || offset > m_dynamic_data_size
+		            ? nullptr
+		            : reinterpret_cast<T>(m_dynamic_data.get() + offset));
 	}
+	[[nodiscard]] bool IsDynamicDataRange(const void* ptr, uint64_t size) const;
 
 private:
 	void Clear();
+	bool               LoadDynamic(uint64_t offset, uint64_t size, std::unique_ptr<uint8_t[]>* out,
+	                               uint64_t* out_size);
+	[[nodiscard]] bool IsFileRange(uint64_t offset, uint64_t size) const;
+	bool               ReadFile(uint64_t vaddr, uint64_t file_offset, uint64_t size);
+	const std::vector<uint8_t>* GetInflatedSelfSegment(uint16_t index);
 
 	std::unique_ptr<Common::File>  m_f;
 	std::unique_ptr<SelfHeader>    m_self;
 	std::unique_ptr<SelfSegment[]> m_self_segments;
+	// Lazily inflated contents of deflate-compressed SELF segments, indexed like m_self_segments.
+	std::vector<std::vector<uint8_t>> m_self_inflated;
 	std::unique_ptr<Elf64_Ehdr>    m_ehdr;
 	std::unique_ptr<Elf64_Phdr[]>  m_phdr;
 	std::unique_ptr<Elf64_Shdr[]>  m_shdr;
 	std::unique_ptr<uint8_t[]>     m_dynamic;
+	uint64_t                          m_dynamic_size = 0;
 	std::unique_ptr<uint8_t[]>     m_dynamic_data;
+	uint64_t                          m_dynamic_data_size = 0;
 	std::unique_ptr<char[]>        m_str_table;
 	uint32_t                       m_str_table_size = 0;
 	// uint64_t    m_base_vaddr   = 0;

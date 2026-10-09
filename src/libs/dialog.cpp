@@ -614,8 +614,9 @@ struct MsgDialogResult {
 	uint8_t reserved[32];
 };
 
-static int g_status = STATUS_NONE;
-static int g_mode   = 0;
+// Games poll the dialog status from other threads than the one that opens it.
+static std::atomic<int> g_status = STATUS_NONE;
+static std::atomic<int> g_mode   = 0;
 
 int KYTY_SYSV_ABI MsgDialogInitialize() {
 	PRINT_NAME();

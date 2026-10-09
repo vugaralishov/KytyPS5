@@ -9,12 +9,17 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -57,37 +62,84 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 
 	bytes->resize(text.size() / 2);
 	for (size_t index = 0; index < bytes->size(); index++) {
-		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
+		const char* begin    = text.data() + index * 2;
+		uint8_t     value    = 0;
+		const auto [ptr, ec] = std::from_chars(begin, begin + 2, value, 16);
+		if (ec != std::errc() || ptr != begin + 2) {
+			return false;
+		}
+		(*bytes)[index] = value;
 	}
 	return true;
 }
 
-bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
+// Accepts the "0x..." form used by GoldHEN files as well as bare hex digits.
+bool ParseAddress(const std::string& text, uint64_t* value) {
+	std::string_view digits = text;
+	if (digits.size() >= 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+		digits.remove_prefix(2);
+	}
+	if (digits.empty()) {
+		return false;
+	}
+	const auto [ptr, ec] =
+	    std::from_chars(digits.data(), digits.data() + digits.size(), *value, 16);
+	return ec == std::errc() && ptr == digits.data() + digits.size();
+}
+
+bool GetString(const Json& object, const char* key, std::string* value) {
+	if (!object.is_object()) {
+		return false;
+	}
+	const auto it = object.find(key);
+	if (it == object.end() || !it->is_string()) {
+		return false;
+	}
+	*value = it->get<std::string>();
+	return true;
+}
+
+bool LoadPlanUnchecked(const std::filesystem::path& path, Plan* plan, std::string* error) {
 	std::ifstream file(path, std::ios::binary);
 	if (!file) {
 		return Fail(error, "could not read cheat file");
 	}
 
 	const auto root = Json::parse(file, nullptr, false);
-	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
-	    !root.contains("process") || !root.contains("mods")) {
+	if (!GetString(root, "id", &plan->title_id) || !GetString(root, "version", &plan->version) ||
+	    !GetString(root, "process", &plan->process) || !root.contains("mods") ||
+	    !root["mods"].is_array()) {
 		return Fail(error, "expected a GoldHEN-style mods JSON file");
 	}
-	plan->title_id = root["id"].get<std::string>();
-	plan->version  = root["version"].get<std::string>();
-	plan->process  = root["process"].get<std::string>();
 
 	for (const auto& mod: root["mods"]) {
-		if (!mod.value("enabled", true)) {
-			continue;
+		if (!mod.is_object()) {
+			return Fail(error, "invalid mod entry");
 		}
-		const auto name = mod["name"].get<std::string>();
+		if (const auto enabled = mod.find("enabled"); enabled != mod.end()) {
+			if (!enabled->is_boolean()) {
+				return Fail(error, "invalid mod enabled flag");
+			}
+			if (!enabled->get<bool>()) {
+				continue;
+			}
+		}
+		std::string name;
+		const auto  memory = mod.find("memory");
+		if (!GetString(mod, "name", &name) || memory == mod.end() || !memory->is_array()) {
+			return Fail(error, "invalid mod entry");
+		}
 		plan->mod_names.push_back(name);
-		for (const auto& entry: mod["memory"]) {
-			Write write;
-			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
-			if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
-			    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
+		for (const auto& entry: *memory) {
+			Write       write;
+			std::string offset;
+			std::string off;
+			std::string on;
+			if (!GetString(entry, "offset", &offset) || !GetString(entry, "off", &off) ||
+			    !GetString(entry, "on", &on) || !ParseAddress(offset, &write.source_address)) {
+				return Fail(error, "invalid mod memory entry");
+			}
+			if (!ParseBytes(off, &write.off) || !ParseBytes(on, &write.on) ||
 			    write.off.size() != write.on.size()) {
 				return Fail(error, "invalid mod memory bytes");
 			}
@@ -95,6 +147,15 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 	}
 	return true;
+}
+
+// The plan is loaded on the guest thread; never let a malformed file escape as an exception.
+bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
+	try {
+		return LoadPlanUnchecked(path, plan, error);
+	} catch (const std::exception& e) {
+		return Fail(error, std::string("invalid cheat file: ") + e.what());
+	}
 }
 
 bool ValidateGame(const Plan& plan, const Program* main_program, std::string* error) {
@@ -112,18 +173,29 @@ bool ValidateGame(const Plan& plan, const Program* main_program, std::string* er
 	return true;
 }
 
-void Translate(const Program& program, uint64_t source_base, uint64_t source_address,
+// Returns false when the translated address would wrap around the 64-bit address space.
+bool Translate(const Program& program, uint64_t source_base, uint64_t source_address,
                uint64_t* target_address) {
 	if (source_address >= source_base) {
-		*target_address = program.base_vaddr + source_address - source_base;
-		return;
+		const uint64_t delta = source_address - source_base;
+		if (delta > UINT64_MAX - program.base_vaddr) {
+			return false;
+		}
+		*target_address = program.base_vaddr + delta;
+		return true;
 	}
-	*target_address = program.base_vaddr - (source_base - source_address);
+	const uint64_t delta = source_base - source_address;
+	if (delta > program.base_vaddr) {
+		return false;
+	}
+	*target_address = program.base_vaddr - delta;
+	return true;
 }
 
 bool IsInsideProgram(const Program& program, uint64_t address, size_t size) {
 	return size != 0 && address >= program.base_vaddr &&
-	       address + size <= program.base_vaddr + program.mapped_size;
+	       address - program.base_vaddr <= program.mapped_size &&
+	       size <= program.mapped_size - (address - program.base_vaddr);
 }
 
 bool IsZero(const std::vector<uint8_t>& bytes) {
@@ -132,7 +204,9 @@ bool IsZero(const std::vector<uint8_t>& bytes) {
 
 bool TranslateAndValidate(Plan* plan, const Program& program, uint64_t source_base) {
 	for (auto& write: plan->writes) {
-		Translate(program, source_base, write.source_address, &write.target_address);
+		if (!Translate(program, source_base, write.source_address, &write.target_address)) {
+			return false;
+		}
 		if (!IsZero(write.off) &&
 		    (!IsInsideProgram(program, write.target_address, write.off.size()) ||
 		     std::memcmp(reinterpret_cast<const void*>(write.target_address), write.off.data(),
@@ -196,11 +270,18 @@ bool AllocateCave(Plan* plan, const Program& program, std::string* error) {
 			return Fail(error, "non-zero write is outside the matched module");
 		}
 
-		const auto write_end = write.target_address + write.off.size();
-		for (auto page = write.target_address & ~(kPageSize - 1); page < write_end;
-		     page += kPageSize) {
+		// Iterate by last page instead of an end address so a write ending at the top of the
+		// address space cannot wrap and skip the cave allocation.
+		if (write.off.empty() || write.off.size() - 1 > UINT64_MAX - write.target_address) {
+			return Fail(error, "code-cave write wraps the address space");
+		}
+		const auto last_page = (write.target_address + (write.off.size() - 1)) & ~(kPageSize - 1);
+		for (auto page = write.target_address & ~(kPageSize - 1);; page += kPageSize) {
 			if (std::find(pages.begin(), pages.end(), page) == pages.end()) {
 				pages.push_back(page);
+			}
+			if (page == last_page) {
+				break;
 			}
 		}
 	}

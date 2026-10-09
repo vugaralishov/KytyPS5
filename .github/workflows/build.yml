@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Read-only by default; only the release job gets write access.
+permissions:
+  contents: read
+
 env:
   SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
@@ -36,12 +40,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
       - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Locate vcpkg
         id: vcpkg
@@ -56,7 +60,7 @@ jobs:
 
       - name: Cache glslang
         id: glslang_cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
           key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
@@ -72,7 +76,7 @@ jobs:
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
         with:
           version: "6.10.3"
           host: windows
@@ -81,7 +85,7 @@ jobs:
           cache: true
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Verify toolchain
         shell: cmd
@@ -112,16 +116,13 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
-            shader_recompiler_compute_tests ^
-            resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+          cmake --build _Build/windows --target launcher kyty_tests --parallel
 
+      # Runners have no GPU; tests that need a Vulkan device carry the "gpu" label.
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -LE gpu
 
       - name: Install
         shell: cmd
@@ -129,7 +130,7 @@ jobs:
           cmake --install _Build/windows --prefix _Build/windows/install
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: KytyPS5-Windows-x64
           path: _Build/windows/install/**
@@ -142,7 +143,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -159,7 +160,7 @@ jobs:
         run: brew install glslang
 
       - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
         with:
           version: "6.10.3"
           host: mac
@@ -168,7 +169,7 @@ jobs:
           cache: true
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -201,18 +202,13 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
+          cmake --build _Build/macos --target launcher kyty_tests --parallel
 
+      # Runners have no GPU; tests that need a Vulkan device carry the "gpu" label.
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          ctest --test-dir _Build/macos --output-on-failure -LE gpu
 
       - name: Install
         shell: bash
@@ -283,7 +279,7 @@ jobs:
           unzip -t "$archive"
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: KytyPS5-macOS-x86_64
           path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
@@ -296,7 +292,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -327,7 +323,7 @@ jobs:
             wayland-protocols
 
       - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
         with:
           version: "6.10.3"
           host: linux
@@ -336,7 +332,7 @@ jobs:
           cache: true
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -384,18 +380,13 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
+          cmake --build _Build/linux --target launcher kyty_tests --parallel
 
+      # Runners have no GPU; tests that need a Vulkan device carry the "gpu" label.
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          ctest --test-dir _Build/linux --output-on-failure -LE gpu
 
       - name: Install
         shell: bash
@@ -424,7 +415,7 @@ jobs:
           _Build/linux/install/kyty_emulator --help > /dev/null
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: KytyPS5-Linux-x86_64
           path: _Build/linux/install/**
@@ -449,21 +440,21 @@ jobs:
     steps:
       - name: Download Windows build
         if: needs.windows.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: KytyPS5-Windows-x64
           path: artifacts/KytyPS5-Windows-x64
 
       - name: Download macOS build
         if: needs.macos.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: KytyPS5-macOS-x86_64
           path: artifacts/KytyPS5-macOS-x86_64
 
       - name: Download Linux build
         if: needs.linux.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: KytyPS5-Linux-x86_64
           path: artifacts/KytyPS5-Linux-x86_64
@@ -503,6 +494,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # Only a release with every platform may become "latest"; the launcher's update
+          # check follows the latest release. Partial releases are published as prereleases.
+          ALL_PLATFORMS: ${{ needs.windows.result == 'success' && needs.macos.result == 'success' && needs.linux.result == 'success' }}
         run: |
           assets=()
           for artifact in \
@@ -514,12 +508,25 @@ jobs:
             fi
           done
           test "${#assets[@]}" -gt 0
+          sha256sum "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          assets+=(SHA256SUMS)
+          if [[ "$ALL_PLATFORMS" == "true" ]]; then
+            release_flags=(--latest=true --prerelease=false)
+          else
+            release_flags=(--latest=false --prerelease)
+          fi
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_NAME" "${assets[@]}" \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
+            if [[ "$ALL_PLATFORMS" == "true" ]]; then
+              gh release edit "$RELEASE_NAME" "${release_flags[@]}" \
+                --repo "$GITHUB_REPOSITORY"
+            fi
           else
             gh release create "$RELEASE_NAME" "${assets[@]}" \
+              "${release_flags[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \

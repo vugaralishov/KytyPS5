@@ -6,9 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <codecvt>
 #include <filesystem>
-#include <locale>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -163,12 +161,37 @@ inline int32_t ToInt32(std::string_view text, int base = 10) {
 	return value;
 }
 
+// Unpaired surrogates become U+FFFD instead of failing the whole conversion.
 inline std::string Utf16ToUtf8(std::u16string_view utf16) {
-	if (utf16.empty()) {
-		return {};
+	std::string utf8;
+	utf8.reserve(utf16.size());
+	for (size_t i = 0; i < utf16.size(); i++) {
+		uint32_t code = utf16[i];
+		if (code >= 0xD800 && code <= 0xDBFF && i + 1 < utf16.size() && utf16[i + 1] >= 0xDC00 &&
+		    utf16[i + 1] <= 0xDFFF) {
+			code = 0x10000 + ((code - 0xD800) << 10) + (utf16[i + 1] - 0xDC00);
+			i++;
+		} else if (code >= 0xD800 && code <= 0xDFFF) {
+			code = 0xFFFD;
+		}
+
+		if (code < 0x80) {
+			utf8 += static_cast<char>(code);
+		} else if (code < 0x800) {
+			utf8 += static_cast<char>(0xC0 | (code >> 6));
+			utf8 += static_cast<char>(0x80 | (code & 0x3F));
+		} else if (code < 0x10000) {
+			utf8 += static_cast<char>(0xE0 | (code >> 12));
+			utf8 += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+			utf8 += static_cast<char>(0x80 | (code & 0x3F));
+		} else {
+			utf8 += static_cast<char>(0xF0 | (code >> 18));
+			utf8 += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+			utf8 += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+			utf8 += static_cast<char>(0x80 | (code & 0x3F));
+		}
 	}
-	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-	return convert.to_bytes(utf16.data(), utf16.data() + utf16.size());
+	return utf8;
 }
 
 } // namespace Common

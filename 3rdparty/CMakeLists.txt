@@ -87,11 +87,16 @@ target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_source_SOURCE_DIR}
 target_include_directories(zarchive PRIVATE "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(zarchive PRIVATE libzstd_static)
 target_compile_features(zarchive PRIVATE cxx_std_20)
-if(MSVC)
-	target_compile_options(zarchive PRIVATE /W0)
-else()
-	target_compile_options(zarchive PRIVATE -w)
-endif()
+foreach(third_party_target zarchive libzstd_static)
+	if(NOT TARGET ${third_party_target})
+		continue()
+	endif()
+	if(MSVC)
+		target_compile_options(${third_party_target} PRIVATE /W0)
+	else()
+		target_compile_options(${third_party_target} PRIVATE -w)
+	endif()
+endforeach()
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 if(APPLE)
@@ -176,6 +181,96 @@ if (NOT TARGET FFmpeg::ffmpeg)
 	else()
 		set(ARCHITECTURE x86_64)
 	endif()
+
+	# ffmpeg-core downloads a prebuilt package without checking its hash. Fetch the same file
+	# into the path it expects first, verified against the release digests recorded below, so
+	# the submodule finds a trusted archive and skips its own download. The asset name and
+	# release tag are computed exactly as in ffmpeg-core/CMakeLists.txt.
+	if(NOT FFMPEG_PREBUILT_DIR)
+		if(WIN32 AND NOT MINGW)
+			set(kyty_ffmpeg_os windows)
+		elseif(APPLE)
+			set(kyty_ffmpeg_os macos)
+		elseif(UNIX)
+			set(kyty_ffmpeg_os linux)
+		elseif(MINGW)
+			set(kyty_ffmpeg_os mingw)
+		endif()
+		if(ARCHITECTURE STREQUAL "x86_64")
+			set(kyty_ffmpeg_arch x64)
+		elseif(ARCHITECTURE STREQUAL "arm64")
+			set(kyty_ffmpeg_arch arm64)
+		else()
+			set(kyty_ffmpeg_arch universal)
+		endif()
+		set(kyty_ffmpeg_asset "ffmpeg-${kyty_ffmpeg_os}-${kyty_ffmpeg_arch}.zip")
+		execute_process(
+			COMMAND git rev-parse --short=12 HEAD
+			WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-core"
+			OUTPUT_VARIABLE kyty_ffmpeg_sha
+			OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+		# SHA-256 of the release assets of KytyPS5/ext-ffmpeg-core, tag 9ac4cfd195f1. Update
+		# this table together with the submodule.
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-windows-x64.zip
+			32839a244a418063f6fb4bbe55585bc66ea17a859b920cae0e3aa1eab9398c09)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-windows-arm64.zip
+			bf6347986ab50135fa379d5596b57fc29cdb7735f59adc2188871c52daee1267)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-linux-x64.zip
+			f4659ad09e6f2b99ecf0227ca56fe4bbb34572cdd8d85ff85384f74ba38f23ef)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-linux-arm64.zip
+			01e39e8a20bbc6002cbe02024a357c39ec2104485bfee8e27a66b1d443e352a0)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-macos-x64.zip
+			b92c60ac99f9b2277f62d42e7424c24bc991d5723f4fa388a5d2e452be18f40b)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-macos-arm64.zip
+			458933af900b2bf0bf3d4422e3ae1c7aef46f671cd4af99c42ffe99d43ca9170)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-macos-universal.zip
+			4f7eccb838b0177cee9edbae671079888469e22044379516b95916c294b406e3)
+		set(kyty_ffmpeg_9ac4cfd195f1_ffmpeg-mingw-x64.zip
+			e4be9938b321da5f53e248d8ae947c984390e09d0f59fb6855644a972126e26b)
+
+		set(kyty_ffmpeg_hash "${kyty_ffmpeg_${kyty_ffmpeg_sha}_${kyty_ffmpeg_asset}}")
+		if(NOT kyty_ffmpeg_hash)
+			message(FATAL_ERROR
+				"No recorded SHA-256 for FFmpeg ${kyty_ffmpeg_sha}/${kyty_ffmpeg_asset}. Add it to "
+				"3rdparty/CMakeLists.txt, or set FFMPEG_PREBUILT_DIR to an unpacked package.")
+		endif()
+
+		set(kyty_ffmpeg_zip "${CMAKE_BINARY_DIR}/externals/${kyty_ffmpeg_sha}-${kyty_ffmpeg_asset}")
+		set(kyty_ffmpeg_dir "${CMAKE_BINARY_DIR}/externals/ffmpeg-${kyty_ffmpeg_sha}")
+		if(EXISTS "${kyty_ffmpeg_zip}")
+			file(SHA256 "${kyty_ffmpeg_zip}" kyty_ffmpeg_actual_hash)
+			if(NOT kyty_ffmpeg_actual_hash STREQUAL kyty_ffmpeg_hash)
+				# Discard the unverified archive and anything unpacked from it.
+				message(WARNING "FFmpeg archive ${kyty_ffmpeg_zip} has SHA-256 "
+					"${kyty_ffmpeg_actual_hash}, expected ${kyty_ffmpeg_hash}; downloading it again.")
+				file(REMOVE "${kyty_ffmpeg_zip}")
+				file(REMOVE_RECURSE "${kyty_ffmpeg_dir}")
+			endif()
+		endif()
+		if(NOT EXISTS "${kyty_ffmpeg_zip}")
+			message(STATUS "Downloading FFmpeg libraries...")
+			file(DOWNLOAD
+				"https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/${kyty_ffmpeg_sha}/${kyty_ffmpeg_asset}"
+				"${kyty_ffmpeg_zip}"
+				EXPECTED_HASH SHA256=${kyty_ffmpeg_hash}
+				SHOW_PROGRESS STATUS kyty_ffmpeg_status)
+			list(GET kyty_ffmpeg_status 0 kyty_ffmpeg_status_code)
+			if(NOT kyty_ffmpeg_status_code EQUAL 0)
+				file(REMOVE "${kyty_ffmpeg_zip}")
+				message(FATAL_ERROR "Could not download FFmpeg ${kyty_ffmpeg_sha}: ${kyty_ffmpeg_status}")
+			endif()
+			file(SHA256 "${kyty_ffmpeg_zip}" kyty_ffmpeg_actual_hash)
+			if(NOT kyty_ffmpeg_actual_hash STREQUAL kyty_ffmpeg_hash)
+				file(REMOVE "${kyty_ffmpeg_zip}")
+				message(FATAL_ERROR "FFmpeg archive ${kyty_ffmpeg_asset} has SHA-256 "
+					"${kyty_ffmpeg_actual_hash}, expected ${kyty_ffmpeg_hash}")
+			endif()
+			# Unpack again from the verified archive.
+			file(REMOVE_RECURSE "${kyty_ffmpeg_dir}")
+		endif()
+	endif()
+
 	add_subdirectory(ffmpeg-core)
 	add_library(FFmpeg::ffmpeg ALIAS ffmpeg)
 endif()
@@ -204,10 +299,29 @@ if (TARGET TracyClient)
 			-Wno-braced-scalar-init
 			-Wno-format
 			-Wno-unused-variable
+			-Wno-unused-function
+			-Wno-unused-private-field
+			-Wno-unused-value
 		)
 	endif()
 endif()
 
 if (CLANG AND MSVC)
+# The prebuilt winpthread binaries are committed to the repository and shipped with every Windows
+# build. Refuse to use them if they differ from the recorded files (see
+# docs/third-party/winpthread.md for their provenance).
+foreach(kyty_winpthread_file
+		"bin/libwinpthread-1.dll=78ebbc1480d62098aa66307db2ff139abc07c137bc188f5b73bf7b131492932c"
+		"lib/libwinpthread.dll.a=c0302c72dbd07e551c29e968d385cf315bf42ec8334a60b3acf39346e8f972ef")
+	string(REPLACE "=" ";" kyty_winpthread_entry "${kyty_winpthread_file}")
+	list(GET kyty_winpthread_entry 0 kyty_winpthread_path)
+	list(GET kyty_winpthread_entry 1 kyty_winpthread_expected)
+	file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/winpthread/${kyty_winpthread_path}" kyty_winpthread_actual)
+	if(NOT kyty_winpthread_actual STREQUAL kyty_winpthread_expected)
+		message(FATAL_ERROR "3rdparty/winpthread/${kyty_winpthread_path} has SHA-256 "
+			"${kyty_winpthread_actual}, expected ${kyty_winpthread_expected}. Update "
+			"docs/third-party/winpthread.md and this check only for a reviewed replacement.")
+	endif()
+endforeach()
 add_subdirectory(winpthread)
 endif()

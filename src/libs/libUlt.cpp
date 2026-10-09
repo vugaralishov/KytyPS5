@@ -66,6 +66,7 @@ struct UltQueueDataResourcePoolState {
 
 struct UltQueueState {
 	std::mutex                       mutex;
+	std::condition_variable          not_full;
 	std::deque<std::vector<uint8_t>> items;
 	uint64_t                         data_size    = 0;
 	uint32_t                         capacity     = 0;
@@ -437,16 +438,11 @@ static int KYTY_SYSV_ABI UltQueuePush(void* queue, const void* data) {
 		return ULT_ERROR_NULL;
 	}
 
-	std::scoped_lock lock(state->mutex);
-	if (state->capacity != 0 && state->items.size() >= state->capacity) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 32) {
-			LOGF("\t queue full, dropping pushed item: queue=0x%016" PRIx64 " capacity=%" PRIu32
-			     " data_size=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(queue), state->capacity, state->data_size);
-		}
-		return OK;
-	}
+	// Like the real API, a push to a full queue blocks until a consumer pops. Queues are never
+	// destroyed, so there is no teardown path to wake from.
+	std::unique_lock lock(state->mutex);
+	state->not_full.wait(
+	    lock, [&] { return state->capacity == 0 || state->items.size() < state->capacity; });
 
 	auto& item = state->items.emplace_back(static_cast<size_t>(state->data_size));
 	if (!item.empty()) {
@@ -478,6 +474,7 @@ static int KYTY_SYSV_ABI UltQueueTryPop(void* queue, void* data) {
 	if (!item.empty()) {
 		std::memcpy(data, item.data(), item.size());
 	}
+	state->not_full.notify_one();
 
 	return OK;
 }

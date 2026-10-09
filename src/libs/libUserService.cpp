@@ -5,6 +5,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -54,7 +55,9 @@ static KYTY_SYSV_ABI int UserServiceInitialize2() {
 static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(user_id == nullptr);
+	if (user_id == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
 	*user_id = Config::GetUserId();
 
@@ -64,12 +67,14 @@ static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(event == nullptr);
+	if (event == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
-	static bool logged_in = false;
+	// Several threads may poll events; exactly one of them must see the login.
+	static std::atomic_bool logged_in {false};
 
-	if (!logged_in) {
-		logged_in         = true;
+	if (!logged_in.exchange(true)) {
 		event->event_type = UserServiceEventTypeLogin;
 		event->user_id    = Config::GetUserId();
 		return OK;
@@ -81,7 +86,9 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdList* user_id_list) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
+	if (user_id_list == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
 	user_id_list->user_id[0] = Config::GetUserId();
 	user_id_list->user_id[1] = -1;
@@ -95,12 +102,20 @@ static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t 
 	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
-	EXIT_NOT_IMPLEMENTED(size < 5);
+	if (name == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
+	if (size < 5) {
+		return USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
+	}
 
 	const auto& user_name = Config::GetUserName();
 	int         s         = snprintf(name, size, "%s", user_name.c_str());
 
-	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
+	// The configured name may exceed the 16-character limit of real accounts.
+	if (s < 0 || static_cast<size_t>(s) >= size) {
+		return USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
+	}
 
 	return OK;
 }

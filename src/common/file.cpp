@@ -589,10 +589,8 @@ bool File::RenameFile(const std::filesystem::path& src,
 	if (IsArchivePath(src) || IsArchivePath(dst)) {
 		return false;
 	}
-	if (IsFileExisting(dst)) {
-		DeleteFile(dst); // @suppress("Invalid arguments")
-	}
 
+	// Replaces an existing dst atomically; deleting it first would lose it if the rename failed.
 	return SysFileRenameFile(src, dst);
 }
 

@@ -279,18 +279,26 @@ static void JsonValueCopy(JsonValue* dst, const JsonValue* src) {
 		return;
 	}
 
-	JsonValueClear(dst);
-	dst->type = src->type;
+	// src may be a descendant of dst (v = v["data"]), so build the copy before clearing dst.
+	JsonValue tmp {};
+	JsonValueInit(&tmp);
+	tmp.type = src->type;
 	switch (src->type) {
-		case JsonValueTypeBoolean: dst->boolean = src->boolean; break;
-		case JsonValueTypeInteger: dst->integer = src->integer; break;
-		case JsonValueTypeUInteger: dst->uinteger = src->uinteger; break;
-		case JsonValueTypeReal: dst->real = src->real; break;
-		case JsonValueTypeString: dst->string = JsonStringNew(*JsonStringImpl(src->string)); break;
-		case JsonValueTypeArray: dst->array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
-		case JsonValueTypeObject: dst->object = new JsonObject {JsonObjectCopy(src->object, dst)}; break;
-		default: dst->uinteger = 0; break;
+		case JsonValueTypeBoolean: tmp.boolean = src->boolean; break;
+		case JsonValueTypeInteger: tmp.integer = src->integer; break;
+		case JsonValueTypeUInteger: tmp.uinteger = src->uinteger; break;
+		case JsonValueTypeReal: tmp.real = src->real; break;
+		case JsonValueTypeString: tmp.string = JsonStringNew(*JsonStringImpl(src->string)); break;
+		case JsonValueTypeArray: tmp.array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
+		case JsonValueTypeObject:
+			tmp.object = new JsonObject {JsonObjectCopy(src->object, dst)};
+			break;
+		default: tmp.uinteger = 0; break;
 	}
+
+	// Clearing resets parent and rootparam, which tmp also leaves null.
+	JsonValueClear(dst);
+	*dst = tmp;
 }
 
 static JsonValue* JsonObjectLookup(JsonObject* object, const std::string& key, bool create) {
@@ -310,8 +318,12 @@ static JsonValue* JsonObjectLookup(JsonObject* object, const std::string& key, b
 	return value;
 }
 
-static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value) {
-	if (out == nullptr) {
+// Conversion and serialization recurse per nesting level; parsed documents deeper than this are
+// rejected (and serialized as null beyond it) so they cannot exhaust the host stack.
+constexpr int JSON_MAX_DEPTH = 512;
+
+static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value, int depth = 0) {
+	if (out == nullptr || depth > JSON_MAX_DEPTH) {
 		return false;
 	}
 
@@ -349,7 +361,7 @@ static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value) {
 		out->array = JsonArrayNew();
 		for (const auto& item: value) {
 			auto* child = JsonValueNew();
-			if (!JsonValueFromNlohmann(child, item)) {
+			if (!JsonValueFromNlohmann(child, item, depth + 1)) {
 				JsonValueDelete(child);
 				return false;
 			}
@@ -363,7 +375,7 @@ static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value) {
 		out->object = JsonObjectNew();
 		for (auto it = value.begin(); it != value.end(); ++it) {
 			auto* child = JsonValueNew();
-			if (!JsonValueFromNlohmann(child, *it)) {
+			if (!JsonValueFromNlohmann(child, *it, depth + 1)) {
 				JsonValueDelete(child);
 				return false;
 			}
@@ -375,8 +387,36 @@ static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value) {
 	return false;
 }
 
-static void JsonSerializeValue(const JsonValue* value, std::string* out) {
-	if (value == nullptr) {
+// Writes a JSON string literal, escaping per RFC 8259.
+static void JsonAppendQuoted(const std::string& str, std::string* out) {
+	static const char* const hex = "0123456789abcdef";
+	out->push_back('"');
+	for (const char ch: str) {
+		const auto c = static_cast<unsigned char>(ch);
+		switch (c) {
+			case '"': out->append("\\\""); break;
+			case '\\': out->append("\\\\"); break;
+			case '\b': out->append("\\b"); break;
+			case '\f': out->append("\\f"); break;
+			case '\n': out->append("\\n"); break;
+			case '\r': out->append("\\r"); break;
+			case '\t': out->append("\\t"); break;
+			default:
+				if (c < 0x20) {
+					out->append("\\u00");
+					out->push_back(hex[c >> 4u]);
+					out->push_back(hex[c & 0xfu]);
+				} else {
+					out->push_back(ch);
+				}
+				break;
+		}
+	}
+	out->push_back('"');
+}
+
+static void JsonSerializeValue(const JsonValue* value, std::string* out, int depth = 0) {
+	if (value == nullptr || depth > JSON_MAX_DEPTH) {
 		out->append("null");
 		return;
 	}
@@ -385,11 +425,7 @@ static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 		case JsonValueTypeInteger: out->append(std::to_string(value->integer)); break;
 		case JsonValueTypeUInteger: out->append(std::to_string(value->uinteger)); break;
 		case JsonValueTypeReal: out->append(std::to_string(value->real)); break;
-		case JsonValueTypeString:
-			out->push_back('"');
-			out->append(*JsonStringImpl(value->string));
-			out->push_back('"');
-			break;
+		case JsonValueTypeString: JsonAppendQuoted(*JsonStringImpl(value->string), out); break;
 		case JsonValueTypeArray: {
 			out->push_back('[');
 			bool first = true;
@@ -398,7 +434,7 @@ static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 					out->push_back(',');
 				}
 				first = false;
-				JsonSerializeValue(item, out);
+				JsonSerializeValue(item, out, depth + 1);
 			}
 			out->push_back(']');
 			break;
@@ -411,10 +447,9 @@ static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 					out->push_back(',');
 				}
 				first = false;
-				out->push_back('"');
-				out->append(item.first);
-				out->append("\":");
-				JsonSerializeValue(item.second, out);
+				JsonAppendQuoted(item.first, out);
+				out->push_back(':');
+				JsonSerializeValue(item.second, out, depth + 1);
 			}
 			out->push_back('}');
 			break;
@@ -693,10 +728,12 @@ static void KYTY_SYSV_ABI JsonValueSetDouble(JsonValue* self, double value) {
 static void KYTY_SYSV_ABI JsonValueSetString(JsonValue* self, const JsonString* value) {
 	PRINT_NAME();
 
-	JsonValueClear(self);
 	if (self != nullptr) {
+		// The source string may be owned by self, so copy it before clearing.
+		auto* string = JsonStringNew(*JsonStringImpl(value));
+		JsonValueClear(self);
 		self->type   = JsonValueTypeString;
-		self->string = JsonStringNew(*JsonStringImpl(value));
+		self->string = string;
 	}
 }
 

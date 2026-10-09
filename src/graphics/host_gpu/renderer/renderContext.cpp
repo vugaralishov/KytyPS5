@@ -7,8 +7,17 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace Libs::Graphics {
+
+namespace {
+
+constexpr uint64_t NoFaultPage = ~uint64_t {0};
+// Tracker page of this thread's last fault that no watcher explained.
+thread_local uint64_t t_unwatched_fault_page = NoFaultPage;
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -61,6 +70,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// Only faults on pages the caches protected are resolved here. Any other fault is a guest
+	// access violation, and retrying it would fault forever.
+	const auto page = fault_vaddr / TRACKER_PAGE_SIZE;
+	if (!m_page_manager.IsAccessWatched(fault_vaddr, access)) {
+		// A cache may have released the page between the fault and this check, so retry once.
+		// Two unexplained faults in a row on the same page are a guest access violation.
+		if (std::exchange(t_unwatched_fault_page, page) == page) {
+			t_unwatched_fault_page = NoFaultPage;
+			return false;
+		}
+		return true;
+	}
+	t_unwatched_fault_page = NoFaultPage;
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);

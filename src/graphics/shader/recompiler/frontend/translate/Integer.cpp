@@ -385,9 +385,11 @@ void Translator::S_QUADMASK_B64(const Decoder::Instruction& inst) {
 void Translator::BFM_B32(const Decoder::Instruction& inst) {
 	const auto count  = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(31u)));
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
-	const auto result = ir.Emit(IR::ValueOpcode::BitFieldInsert,
-	                            {IR::Value(0u), IR::Value(0xffffffffu), offset, count});
-	WriteOperand(DestinationOperand(inst), result);
+	// ((1 << count) - 1) << offset, truncated to 32 bits. A bit-field insert would be undefined
+	// once offset + count passes bit 31.
+	const auto one  = IR::U32(IR::Value(1u));
+	const auto mask = ir.ISub(ir.ShiftLeftLogical(one, count), one);
+	WriteOperand(DestinationOperand(inst), ir.ShiftLeftLogical(mask, offset));
 }
 
 IR::U32 Translator::RightMask32(IR::U32 count) {
@@ -547,6 +549,19 @@ void Translator::PackB16(const Decoder::Instruction& inst, bool high0, bool high
 	const auto hi        = high1 ? ir.ShiftRightLogical(ReadU32(inst.src1), IR::U32(IR::Value(16u)))
 	                             : ReadU32(inst.src1);
 	const auto result = PackU16Lanes(lo, hi);
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::V_CVT_PK_16_32(const Decoder::Instruction& inst, bool sign) {
+	// Each 32-bit source saturates to the 16-bit range before packing.
+	const auto saturate = [&](IR::U32 value) {
+		if (!sign) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, IR::Value(0xffffu)}));
+		}
+		const auto low = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0xffff8000u)}));
+		return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)}));
+	};
+	const auto result = PackU16Lanes(saturate(ReadU32(inst.src0)), saturate(ReadU32(inst.src1)));
 	WriteOperand(DestinationOperand(inst), result);
 }
 

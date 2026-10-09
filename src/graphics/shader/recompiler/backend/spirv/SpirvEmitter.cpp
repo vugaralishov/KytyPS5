@@ -90,11 +90,17 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 	const auto user_data_dwords = program.bindings.user_data_registers.size();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_workgroup_counts =
+	    program.bindings.workgroup_count_dword != IR::PushData::NoStart;
+	const auto workgroup_count_dword = user_data_dwords + (has_dispatch_threads ? 3u : 0u);
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    has_workgroup_counts != (shared.lds && lds_storage) ||
+	    (has_workgroup_counts && program.bindings.workgroup_count_dword != workgroup_count_dword) ||
+	    program.bindings.memory_offset_dword !=
+	        workgroup_count_dword + (has_workgroup_counts ? 3u : 0u) ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
@@ -341,8 +347,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const ShaderHostFeatures& host_features) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -359,6 +365,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
+	state.host_features   = host_features;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

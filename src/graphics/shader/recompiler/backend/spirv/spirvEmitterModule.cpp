@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -638,6 +639,103 @@ void DefineOutputs(EmitterState& state) {
 	}
 }
 
+bool UsesFloat16(const IR::Program& program) {
+	return std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+		return std::ranges::any_of(
+		    *block, [](const IR::Inst& inst) { return inst.GetType() == IR::Type::F16; });
+	});
+}
+
+// Maps a constant S_SETREG_B32 MODE write at shader entry (IR::Program::float_mode) onto SPIR-V
+// float-controls execution modes. MODE packs FP32 round [1:0], FP16/FP64 round [3:2], FP32 denorm
+// [5:4] and FP16/FP64 denorm [7:6]; round 0 is RTE and 3 RTZ, denorm 0 flushes and 3 preserves
+// both inputs and outputs. Fields equal to the pipeline default keep the current translation.
+void EmitEntryFloatMode(EmitterState& state) {
+	const auto mode    = state.program.float_mode & 0x3ffu;
+	const auto base    = state.program.base_float_mode & 0x3ffu;
+	const auto changed = mode ^ base;
+	if (changed == 0u) {
+		return;
+	}
+	const auto& features = state.host_features;
+	const auto  fail     = [&](const char* reason) {
+		EXIT("unsupported S_SETREG_B32 MODE 0x%03x (pipeline default 0x%03x) hash=0x%016" PRIx64
+		     ": %s\n",
+		     mode, base, state.program.shader_hash, reason);
+	};
+	if ((changed & 0x300u) != 0u) {
+		fail("DX10_CLAMP/IEEE mode changes are not implemented");
+	}
+	if ((changed & 0xccu) != 0u && UsesFloat16(state.program)) {
+		fail("FP16 round/denorm changes cannot be expressed; FP16 math is emulated in FP32");
+	}
+	const bool fp64 = state.requirements.float64;
+	struct Field {
+		uint32_t shift32;
+		uint32_t shift64;
+		bool     independent;
+	};
+	const auto declare = [&](const Field& field, bool rounding) {
+		const auto value32 = (mode >> field.shift32) & 3u;
+		const auto value64 = (mode >> field.shift64) & 3u;
+		bool       decl32  = ((changed >> field.shift32) & 3u) != 0u;
+		bool       decl64  = fp64 && ((changed >> field.shift64) & 3u) != 0u;
+		if (!decl32 && !decl64) {
+			return;
+		}
+		if (fp64 && !field.independent) {
+			// The device requires one mode for every bit width.
+			if (value32 != value64) {
+				fail(rounding ? "the device cannot use different FP32 and FP64 rounding modes"
+				              : "the device cannot use different FP32 and FP64 denorm modes");
+			}
+			decl32 = decl64 = true;
+		}
+		const auto emit = [&](uint32_t width, uint32_t value) {
+			const bool f64 = width == 64u;
+			if (rounding) {
+				if (value != 0u && value != 3u) {
+					fail("rounding toward +/-infinity cannot be expressed in SPIR-V");
+				}
+				const bool rte = value == 0u;
+				if (!(rte ? (f64 ? features.rounding_rte_f64 : features.rounding_rte_f32)
+				          : (f64 ? features.rounding_rtz_f64 : features.rounding_rtz_f32))) {
+					fail("the device does not support the requested rounding mode");
+				}
+				state.builder.RequireCapability(rte ? spv::CapabilityRoundingModeRTE
+				                                    : spv::CapabilityRoundingModeRTZ);
+				state.builder.AddExecutionMode(state.main_func,
+				                               rte ? spv::ExecutionModeRoundingModeRTE
+				                                   : spv::ExecutionModeRoundingModeRTZ,
+				                               width);
+				return;
+			}
+			if (value != 0u && value != 3u) {
+				fail("separate input/output denorm handling cannot be expressed in SPIR-V");
+			}
+			const bool preserve = value == 3u;
+			if (!(preserve ? (f64 ? features.denorm_preserve_f64 : features.denorm_preserve_f32)
+			               : (f64 ? features.denorm_flush_f64 : features.denorm_flush_f32))) {
+				fail("the device does not support the requested denorm mode");
+			}
+			state.builder.RequireCapability(preserve ? spv::CapabilityDenormPreserve
+			                                         : spv::CapabilityDenormFlushToZero);
+			state.builder.AddExecutionMode(state.main_func,
+			                               preserve ? spv::ExecutionModeDenormPreserve
+			                                        : spv::ExecutionModeDenormFlushToZero,
+			                               width);
+		};
+		if (decl32) {
+			emit(32u, value32);
+		}
+		if (decl64) {
+			emit(64u, value64);
+		}
+	};
+	declare({0u, 2u, features.independent_rounding}, true);
+	declare({4u, 6u, features.independent_denorm}, false);
+}
+
 } // namespace
 
 void DefineModule(EmitterState& state) {
@@ -762,6 +860,7 @@ void DefineModule(EmitterState& state) {
 		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
 	}
+	EmitEntryFloatMode(state);
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

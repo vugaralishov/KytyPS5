@@ -115,13 +115,24 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	if (control >= 0x150u && control <= 0x15fu) {
+		// row_share: every lane of a row reads lane N of the same row.
+		const auto row    = state.builder.AllocateId();
+		const auto target = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), row, subid,
+		                          ConstantU32(state, 0xfffffff0u));
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row,
+		                          ConstantU32(state, control & 0xfu));
+		return {target, ConstantBool(state, true)};
+	}
 	if (control >= 0x160u && control <= 0x16fu) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,
 		                          ConstantU32(state, control & 0xfu));
 		return {target, ConstantBool(state, true)};
 	}
-	return {subid, ConstantBool(state, true)};
+	// The decoder rejects reserved DPP16 controls, so nothing else reaches the emitter.
+	EXIT("unsupported DPP control 0x%03x\n", control);
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {

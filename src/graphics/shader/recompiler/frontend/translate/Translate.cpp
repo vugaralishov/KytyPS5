@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
+#include <optional>
+#include <set>
 #include <unordered_map>
 #include <utility>
 
@@ -488,6 +491,15 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::VccLo) {
 		return {ir.GetVccLo(), ir.GetVccHi()};
 	}
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// 64-bit operands receive the double-precision form of float inline constants.
+		const auto bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
 	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
@@ -620,7 +632,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return ThreadBit(ReadU32Pair(operand));
+		// Wave32 lane masks are 32-bit operands, so float constants keep their f32 bits.
+		return ThreadBit(program.wave_size == 64u
+		                     ? ReadU32Pair(operand)
+		                     : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))});
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
@@ -965,6 +980,106 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	}
 }
 
+bool IsScalarFamily(Decoder::Family family) {
+	switch (family) {
+		case Decoder::Family::SOP1:
+		case Decoder::Family::SOP2:
+		case Decoder::Family::SOPK:
+		case Decoder::Family::SOPC:
+		case Decoder::Family::SOPP:
+		case Decoder::Family::SMEM: return true;
+		default: return false;
+	}
+}
+
+// Applies S_SETREG_B32 writes to the FP bits of MODE (FP_ROUND, FP_DENORM, DX10_CLAMP, IEEE).
+// SPIR-V float controls are fixed per entry point, so only a compile-time constant written in the
+// straight-line scalar prologue (before any vector or FP instruction) can change the mode. Later or
+// dynamic writes are accepted only when they provably leave the FP bits unchanged.
+uint32_t ResolveEntryFloatMode(const Decoder::Program& decoded, uint32_t base_mode,
+                               uint64_t shader_hash) {
+	constexpr uint32_t HwRegMode     = 1u;
+	constexpr uint32_t FloatModeBits = 0x3ffu;
+	std::set<uint32_t> labels;
+	for (const auto& inst: decoded.instructions) {
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			labels.insert(inst.branch_target);
+		}
+	}
+	std::array<std::optional<uint32_t>, 106> sgprs {};
+	const auto invalidate = [&](const Decoder::Operand& operand, uint32_t count) {
+		if (operand.kind != Decoder::OperandKind::Sgpr) {
+			return;
+		}
+		for (uint32_t reg = operand.reg; reg < operand.reg + count && reg < sgprs.size(); reg++) {
+			sgprs[reg].reset();
+		}
+	};
+	auto mode     = base_mode;
+	bool prologue = true;
+	for (const auto& inst: decoded.instructions) {
+		if (labels.contains(inst.pc)) {
+			// Another path may reach this point with different register values.
+			sgprs.fill(std::nullopt);
+			prologue = false;
+		}
+		if (inst.opcode == Decoder::Opcode::S_SETREG_B32) {
+			const uint32_t simm   = inst.src1.value;
+			const uint32_t offset = (simm >> 6u) & 0x1fu;
+			const uint32_t size   = ((simm >> 11u) & 0x1fu) + 1u;
+			const auto     field  = static_cast<uint32_t>(((uint64_t {1} << size) - 1u) << offset);
+			if ((simm & 0x3fu) != HwRegMode || (field & FloatModeBits) == 0u) {
+				continue;
+			}
+			std::optional<uint32_t> value;
+			if (inst.src0.kind == Decoder::OperandKind::Sgpr && inst.src0.reg < sgprs.size()) {
+				value = sgprs[inst.src0.reg];
+			}
+			if (!value.has_value()) {
+				EXIT("unsupported S_SETREG_B32 to MODE at pc 0x%08x (hash=0x%016" PRIx64
+				     "): the FP round/denorm value is not a compile-time constant\n",
+				     inst.pc, shader_hash);
+			}
+			const auto next = (mode & ~field) | ((*value << offset) & field);
+			if (((next ^ mode) & FloatModeBits) != 0u && !prologue) {
+				EXIT("unsupported S_SETREG_B32 to MODE at pc 0x%08x (hash=0x%016" PRIx64
+				     "): FP round/denorm/clamp mode 0x%03x -> 0x%03x changes after the shader "
+				     "prologue\n",
+				     inst.pc, shader_hash, mode & FloatModeBits, next & FloatModeBits);
+			}
+			mode = next;
+			continue;
+		}
+		if (!IsScalarFamily(inst.family) || Decoder::IsDirectBranch(inst.opcode) ||
+		    inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+			prologue = false;
+		}
+		const bool constant_source =
+		    inst.src0.kind == Decoder::OperandKind::IntegerInlineConstant ||
+		    inst.src0.kind == Decoder::OperandKind::FloatInlineConstant ||
+		    inst.src0.kind == Decoder::OperandKind::LiteralConstant;
+		if ((inst.opcode == Decoder::Opcode::S_MOV_B32 ||
+		     inst.opcode == Decoder::Opcode::S_MOVK_I32) &&
+		    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg < sgprs.size()) {
+			std::optional<uint32_t> value;
+			if (constant_source) {
+				value = inst.src0.value;
+			} else if (inst.src0.kind == Decoder::OperandKind::Sgpr &&
+			           inst.src0.reg < sgprs.size()) {
+				value = sgprs[inst.src0.reg];
+			}
+			sgprs[inst.dst.reg] = value;
+			continue;
+		}
+		// Scalar loads write DATA_DWORDS registers; other writers at most a 64-bit pair.
+		const auto width =
+		    inst.family == Decoder::Family::SMEM ? (std::max)(inst.data_dwords, 1u) : 2u;
+		invalidate(inst.dst, width);
+		invalidate(inst.dst2, 2u);
+	}
+	return mode;
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
@@ -998,6 +1113,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			break;
 		default: break; // ValidateTranslateOptions rejects unsupported stages.
 	}
+	// Only compute pipelines report FLOAT_MODE; graphics stages require the 0xc0 default.
+	// DX10_CLAMP is assumed enabled and IEEE disabled, matching the emitted clamp/min/max.
+	result.base_float_mode =
+	    0x100u |
+	    (options.stage == ShaderType::Compute ? options.input_info.compute->float_mode : 0xc0u);
+	result.float_mode = ResolveEntryFloatMode(decoded, result.base_float_mode, options.shader_hash);
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	result.cfg_failure_kind    = cfg.failure_kind;
 	result.fallback_reason     = cfg.unsupported_reason;
@@ -1330,8 +1451,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
-	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
-	                             (options.input_info.compute->float_mode & 0x10u) == 0;
+	const bool flush_f32_inputs =
+	    options.stage == ShaderType::Compute && (result.float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);

@@ -85,8 +85,10 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			// A written range becomes GPU-dirty below, so only read-only uploads keep
+			// unprotectable pages CPU-dirty.
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			                                                      bytes, range_func, !is_written);
 			if (!is_written) {
 				manager->lock.unlock();
 			}

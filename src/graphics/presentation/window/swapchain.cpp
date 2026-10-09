@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -254,16 +255,19 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Timeout };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
-	void                 Create();
+	// Returns false without creating a swapchain while the surface has no extent (minimized).
+	[[nodiscard]] bool   Create();
 	void                 Recreate(bool surface_lost = false);
+	[[nodiscard]] bool   Valid() const noexcept { return m_handle != nullptr; }
+	[[nodiscard]] bool   Suboptimal() const noexcept { return m_suboptimal; }
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -289,6 +293,8 @@ private:
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
 	std::vector<vk::Semaphore>     m_render_complete;
+	// Present-scheduler tick of the submission that last waited on each acquire semaphore.
+	std::vector<uint64_t>          m_acquire_ticks;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
@@ -296,6 +302,8 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	bool                           m_suboptimal          = false;
+	bool                           m_extent_unavailable  = false;
 };
 
 struct Presenter::Impl {
@@ -303,8 +311,9 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
-		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		(void)swapchain.Create();
+		// The pool grows on demand, so a minimized start only needs a non-zero seed.
+		frames.Initialize((std::max)(swapchain.ImageCount(), 1u), swapchain.Format());
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -312,6 +321,14 @@ struct Presenter::Impl {
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+	}
+
+	bool RestoreSwapchain() {
+		if (!swapchain.Create()) {
+			return false;
+		}
+		frames.SetFormat(swapchain.Format());
+		return true;
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -346,10 +363,11 @@ struct Presenter::Impl {
 	std::atomic<uint64_t> presented_overlay_revision {0};
 };
 
-void Swapchain::Create() {
+bool Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
+	EXIT_IF(m_handle != nullptr);
 
 	// Capture the size before querying surface capabilities. If the window changes
 	// during creation, the next presentation will detect the newer size.
@@ -357,34 +375,11 @@ void Swapchain::Create() {
 		Common::LockGuard lock(m_window.mutex);
 		m_window_extent = {graphics.screen_width, graphics.screen_height};
 	}
-	EXIT_IF(m_window_extent.width == 0);
-	EXIT_IF(m_window_extent.height == 0);
 	m_window.RefreshSurfaceCapabilities();
 	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
-	m_extent = surface.capabilities.currentExtent;
-	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
-		m_extent.width =
-		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
-		               surface.capabilities.maxImageExtent.width);
-		m_extent.height =
-		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
-		               surface.capabilities.maxImageExtent.height);
-	}
-	uint32_t image_count = surface.capabilities.minImageCount + 1;
-	if (surface.capabilities.maxImageCount != 0) {
-		image_count = std::min(image_count, surface.capabilities.maxImageCount);
-	}
-	const auto transform =
-	    surface.capabilities.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity
-	        ? vk::SurfaceTransformFlagBitsKHR::eIdentity
-	        : surface.capabilities.currentTransform;
-	const auto composite =
-	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
-	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
-	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
-
+	// Pick the format first so the frame pool keeps a valid format while no swapchain exists.
 	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
 	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
@@ -403,6 +398,45 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
+
+	m_extent = surface.capabilities.currentExtent;
+	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
+		const auto& min_extent = surface.capabilities.minImageExtent;
+		const auto& max_extent = surface.capabilities.maxImageExtent;
+		m_extent               = {};
+		if (max_extent.width != 0 && max_extent.height != 0 &&
+		    min_extent.width <= max_extent.width && min_extent.height <= max_extent.height &&
+		    m_window_extent.width != 0 && m_window_extent.height != 0) {
+			m_extent.width = std::clamp(m_window_extent.width, min_extent.width, max_extent.width);
+			m_extent.height =
+			    std::clamp(m_window_extent.height, min_extent.height, max_extent.height);
+		}
+	}
+	// A minimized window reports a 0x0 surface, which vkCreateSwapchainKHR rejects.
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		if (!m_extent_unavailable) {
+			LOGF("Vulkan surface has no extent; holding presentation until it is restored\n");
+		}
+		m_extent_unavailable = true;
+		m_extent             = {};
+		return false;
+	}
+	if (m_extent_unavailable) {
+		LOGF("Vulkan surface extent restored: %ux%u\n", m_extent.width, m_extent.height);
+	}
+	m_extent_unavailable = false;
+	uint32_t image_count = surface.capabilities.minImageCount + 1;
+	if (surface.capabilities.maxImageCount != 0) {
+		image_count = std::min(image_count, surface.capabilities.maxImageCount);
+	}
+	const auto transform =
+	    surface.capabilities.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity
+	        ? vk::SurfaceTransformFlagBitsKHR::eIdentity
+	        : surface.capabilities.currentTransform;
+	const auto composite =
+	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
+	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
+	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -465,6 +499,7 @@ void Swapchain::Create() {
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
 	m_render_complete.resize(m_images.size());
+	m_acquire_ticks.assign(m_images.size(), 0);
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
@@ -475,6 +510,8 @@ void Swapchain::Create() {
 	}
 	m_image_index = static_cast<uint32_t>(-1);
 	m_frame_index = 0;
+	m_suboptimal  = false;
+	return true;
 }
 
 Swapchain::~Swapchain() {
@@ -533,6 +570,8 @@ void Swapchain::Destroy() {
 	m_image_views.clear();
 	m_image_acquired.clear();
 	m_render_complete.clear();
+	m_acquire_ticks.clear();
+	m_suboptimal = false;
 }
 
 void Swapchain::Recreate(bool surface_lost) {
@@ -548,7 +587,8 @@ void Swapchain::Recreate(bool surface_lost) {
 		m_window.RecreateSurface();
 #endif
 	}
-	Create();
+	// A zero-sized surface leaves the swapchain invalid; Present() retries creation.
+	(void)Create();
 }
 
 bool Swapchain::NeedsResize() const {
@@ -557,17 +597,34 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
-	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size() ||
+	        m_frame_index >= m_acquire_ticks.size());
+	// The semaphore may be re-signaled only after the submission that waited on it is done.
+	if (const auto tick = m_acquire_ticks[m_frame_index]; tick != 0) {
+		scheduler.Wait(tick);
+	}
+	// Bounded so a stalled compositor cannot pin the present thread (and shutdown) forever; the
+	// next vblank tries again.
+	constexpr uint64_t ACQUIRE_TIMEOUT_NS = 100'000'000;
+	m_image_index                         = static_cast<uint32_t>(-1);
+	const auto result                     = m_window.graphic_ctx.device.acquireNextImageKHR(
+	    m_handle, ACQUIRE_TIMEOUT_NS, m_image_acquired[m_frame_index], nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
+		case vk::Result::eTimeout:
+		case vk::Result::eNotReady:
+			// Nothing was acquired and the semaphore stays unsignaled.
+			m_image_index = static_cast<uint32_t>(-1);
+			return Status::Timeout;
 		case vk::Result::eSuboptimalKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			// The image is acquired and the semaphore will be signaled: present it, then
+			// recreate instead of destroying a semaphore with a pending signal.
+			if (!m_suboptimal) {
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
+			}
+			m_suboptimal = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -828,7 +885,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                = scheduler.Submit(submit);
+	m_acquire_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -850,8 +909,12 @@ Swapchain::Status Swapchain::Present() {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
-			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			// The image was queued for presentation; recreate after this frame.
+			if (!m_suboptimal) {
+				LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
+			}
+			m_suboptimal = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -940,8 +1003,18 @@ void Presenter::Present(Frame& frame) {
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
-		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+		EXIT_IF(layer.bus < 0);
 		m_impl->frames.ValidateForPresent(layer.frame);
+		// Only the main and overlay buses reach the window. A sub-bus port keeps flipping
+		// (status and events advance) but has no host display, so its frame is dropped.
+		if (layer.bus >= static_cast<int>(m_impl->layers.size())) {
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("video-out bus %d has no host display; its flips are not shown\n", layer.bus);
+			}
+			m_impl->frames.Release(layer.frame);
+			continue;
+		}
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
 			m_impl->frames.Release(previous.frame);
@@ -972,7 +1045,19 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		// Keep the layers but drop the frame until a minimized surface has an extent again.
+		if (!swapchain.Valid() && !RestoreSwapchain()) {
+			return;
+		}
+		auto status = swapchain.AcquireNextImage(present_scheduler);
+		if (status == Swapchain::Status::Timeout) {
+			// Keep the layers; the caller's next present (or vblank refresh) shows them.
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("vkAcquireNextImageKHR timed out; dropping frame\n");
+			}
+			return;
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -999,6 +1084,9 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		if (swapchain.Suboptimal()) {
+			RecoverSwapchain(Swapchain::Status::Recreate);
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

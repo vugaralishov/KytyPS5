@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -58,8 +59,10 @@ static uint32_t                                          g_next_file_id       = 
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
 static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
-static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
+// Keeps file ids stable per guest path; only successful lookups are stored, and each lookup
+// re-resolves the host path and size, so mount/umount and file creation are always observed.
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+static std::unordered_set<std::string>                   g_logged_missing_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -124,16 +127,6 @@ static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	return true;
 }
 
-static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
-	std::scoped_lock lock(g_mutex);
-	const auto       it = g_file_sizes.find(file_id);
-	if (it == g_file_sizes.end()) {
-		return false;
-	}
-	*out = it->second;
-	return true;
-}
-
 static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
 	if (st == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -183,51 +176,43 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
-	bool              found = false;
-	{
-		std::scoped_lock lock(g_mutex);
-		const auto       it = g_resolved_paths.find(path);
-		if (it != g_resolved_paths.end()) {
-			info  = it->second;
-			found = true;
-		}
+
+	const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
+	info.host_path       = real_path;
+
+	if (Common::File::IsDirectoryExisting(real_path)) {
+		info.is_dir    = true;
+		info.file_size = 0x10000;
+	} else if (Common::File::IsFileExisting(real_path)) {
+		info.file_size = Common::File::Size(real_path);
+	} else {
+		info.result = LibKernel::KERNEL_ERROR_ENOENT;
 	}
 
-	if (!found) {
-		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.host_path       = real_path;
-
-		if (Common::File::IsDirectoryExisting(real_path)) {
-			info.is_dir    = true;
-			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
+	bool log_missing = false;
+	{
+		std::scoped_lock lock(g_mutex);
+		if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
+			log_missing = g_logged_missing_paths.insert(path).second;
 		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
-		}
-
-		bool log_missing = false;
-		{
-			std::scoped_lock lock(g_mutex);
-			auto [it, inserted] = g_resolved_paths.emplace(path, info);
-			if (!inserted) {
-				info = it->second;
-			} else if (info.result == OK) {
-				// Allocate once under the cache lock; distinct paths can share a hash.
-				if (g_next_file_id == 0xffffffffu) {
-					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
-				} else {
-					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
-					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
-				}
-			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
-				log_missing = true;
+			auto it = g_resolved_paths.find(path);
+			if (it != g_resolved_paths.end() && it->second.host_path == info.host_path) {
+				info.file_id = it->second.file_id;
+				it->second   = info;
+			} else if (g_next_file_id == 0xffffffffu) {
+				info.result = LibKernel::KERNEL_ERROR_ENFILE;
+			} else {
+				// New path, or the mount table now maps it elsewhere: ids handed out earlier
+				// keep their old host file.
+				info.file_id = g_next_file_id++;
+				g_files.emplace(info.file_id, info.host_path);
+				g_resolved_paths.insert_or_assign(path, info);
 			}
 		}
-		if (log_missing) {
-			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(info.host_path).c_str());
-		}
+	}
+	if (log_missing) {
+		LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path,
+		     Common::PathToString(info.host_path).c_str());
 	}
 
 	if (info.result != OK) {
@@ -437,12 +422,7 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
 
-	uint64_t cached_size = 0;
-	if (AprShared::TryGetHostFileSize(file_id, &cached_size)) {
-		*size = cached_size;
-		return OK;
-	}
-
+	// The size is re-read each time: the file may have been written since it was resolved.
 	if (Common::File::IsDirectoryExisting(host_path)) {
 		*size = 0;
 		return OK;

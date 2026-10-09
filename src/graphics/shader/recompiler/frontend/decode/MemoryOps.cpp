@@ -295,6 +295,12 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
+	} else if (((word0 >> 16u) & 1u) != 0u) {
+		// LDS=1 redirects the loaded data into LDS at M0 instead of VDATA.
+		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF LDS-direct load is not implemented");
+	} else if (((word1 >> 23u) & 1u) != 0u) {
+		// TFE returns an extra status VGPR after the data.
+		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF TFE status return is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -336,6 +342,8 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MTBUF, opcode, "MTBUF opcode is not implemented");
+	} else if (((word1 >> 23u) & 1u) != 0u) {
+		SetUnsupported(inst, Family::MTBUF, opcode, "MTBUF TFE status return is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -426,9 +434,6 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
 			SetUnsupported(inst, Family::DS, opcode, "DS ordered count variant is not implemented");
 		}
-	}
-	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
-		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
 	}
 	if (inst.gds &&
 	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_PERMUTE_B32 ||

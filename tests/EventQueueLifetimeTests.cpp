@@ -68,6 +68,17 @@ void TestLevelUserEventDelivery() {
 	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete user event queue");
 }
 
+void TestWaitRequiresOutputCount() {
+	using Libs::LibKernel::KERNEL_ERROR_EFAULT;
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "null-out") == OK, "create null-out queue");
+	EventQueue::KernelEvent         event {};
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, nullptr, &timeout) == KERNEL_ERROR_EFAULT,
+	      "wait without an output count reports EFAULT");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete null-out queue");
+}
+
 void TestPeriodicTimerEvents() {
 	using namespace std::chrono_literals;
 	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
@@ -542,6 +553,7 @@ void TestConcurrentDelete() {
 
 int main() {
 	TestLevelUserEventDelivery();
+	TestWaitRequiresOutputCount();
 	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();

@@ -1,0 +1,25 @@
+#version 450
+
+// Copies guest DispatchIndirect arguments, clamping each group count to the host's
+// maxComputeWorkGroupCount; counts above the limit are undefined behaviour in Vulkan.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer source_buf {
+    uint source_args[];
+};
+
+layout(std430, binding = 1) writeonly buffer target_buf {
+    uint target_args[3];
+};
+
+layout(push_constant) uniform params_block {
+    uvec3 max_groups;
+    uint  source_offset;
+} params;
+
+void main() {
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        target_args[axis] = min(source_args[params.source_offset + axis], params.max_groups[axis]);
+    }
+}

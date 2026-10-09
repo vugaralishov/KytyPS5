@@ -308,7 +308,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				Replace(inst, Value(static_cast<uint32_t>(value.U16())));
 			} else if (auto* producer = value.TryInstruction();
 			           producer != nullptr && producer->GetOpcode() == ValueOpcode::ConvertU16U32) {
-				Replace(inst, producer->Arg(0));
+				// The narrowing dropped the high bits, so the round trip is a mask, not a no-op.
+				auto result = block.PrependNewInst(instruction, ValueOpcode::BitwiseAnd32,
+				                                   {Arg(*producer, 0), Value(0xffffu)});
+				Replace(inst, Value(&*result));
+				FoldInstruction(block, result, lowered_ancillary);
 			}
 			return;
 		}
@@ -325,7 +329,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				Replace(inst, Value(static_cast<uint32_t>(value.U8())));
 			} else if (auto* producer = value.TryInstruction();
 			           producer != nullptr && producer->GetOpcode() == ValueOpcode::ConvertU8U32) {
-				Replace(inst, producer->Arg(0));
+				auto result = block.PrependNewInst(instruction, ValueOpcode::BitwiseAnd32,
+				                                   {Arg(*producer, 0), Value(0xffu)});
+				Replace(inst, Value(&*result));
+				FoldInstruction(block, result, lowered_ancillary);
 			}
 			return;
 		}

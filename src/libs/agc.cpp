@@ -3360,8 +3360,11 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 		return nullptr;
 	}
 
+	// Same selector encoding as AgcDcbWriteData, which is what the WRITE_DATA decoder expects.
+	const auto dst_value = static_cast<uint32_t>(dst);
+
 	cmd[0] = KYTY_PM4(4u + num_dwords, Pm4::IT_WRITE_DATA, 0u);
-	cmd[1] = ((static_cast<uint32_t>(dst) & 0xfu) << 8u) |
+	cmd[1] = ((dst_value & 0x1u) << 30u) | ((dst_value & 0x1eu) << 7u) |
 	         ((static_cast<uint32_t>(increment) & 0x1u) << 16u) |
 	         ((dst == 0u ? 0u : static_cast<uint32_t>(write_confirm) & 0x1u) << 20u) |
 	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
@@ -3790,7 +3793,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 		LOGF_COLOR(Log::Color::Red, "\t invalid arguments\n");
 		return nullptr;
 	}
-	if ((4 + num_dwords - 2u) > 0x3fffu) {
+	// Checked before any arithmetic so a huge num_dwords cannot wrap past the 14-bit count.
+	if (num_dwords > 0x3fffu - 2u) {
 		LOGF_COLOR(Log::Color::Red, "\t packet is too large\n");
 		return nullptr;
 	}
@@ -4122,10 +4126,14 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, ui
 		str = "";
 	}
 
-	const auto len            = strlen(str) + 1;
-	const auto payload_dwords = static_cast<uint32_t>((len + 3) / 4);
-	const auto size           = 1u + (payload_dwords == 0 ? 1u : payload_dwords);
-	auto*      cmd            = buf->AllocateDW(size);
+	// The 14-bit PM4 count limits the payload to 0x4000 dwords; truncate longer strings so the
+	// header length stays exact and the payload stays NUL-terminated.
+	constexpr size_t max_payload_bytes = (0x3fffu + 1u) * sizeof(uint32_t);
+	const auto       str_len           = strnlen(str, max_payload_bytes - 1u);
+	const auto       len               = str_len + 1;
+	const auto       payload_dwords    = static_cast<uint32_t>((len + 3) / 4);
+	const auto       size              = 1u + (payload_dwords == 0 ? 1u : payload_dwords);
+	auto*            cmd               = buf->AllocateDW(size);
 
 	if (cmd == nullptr) {
 		return nullptr;
@@ -4133,7 +4141,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, ui
 
 	cmd[0] = KYTY_PM4(size, Pm4::IT_NOP, Pm4::R_PUSH_MARKER);
 	memset(cmd + 1, 0, static_cast<size_t>(size - 1) * sizeof(uint32_t));
-	memcpy(cmd + 1, str, len);
+	memcpy(cmd + 1, str, str_len);
 
 	return cmd;
 }

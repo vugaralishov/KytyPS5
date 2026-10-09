@@ -190,6 +190,10 @@ void TestPadPortOwnership() {
 	      "a closed port retained a usable handle");
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
+	constexpr auto invalid_arg = static_cast<int32_t>(0x80920001u);
+	Check(PadRead(handle, &data, 0) == invalid_arg && PadRead(handle, &data, 65) == invalid_arg &&
+	          PadRead(handle, &data, -1) == invalid_arg && PadRead(handle, &data, 1) == 1,
+	      "PadRead accepted a sample count outside 1..64");
 	Shutdown();
 }
 

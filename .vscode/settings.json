@@ -7,10 +7,11 @@
         "CC": "clang-cl",
         "CXX": "clang-cl"
     },
+    // Set QT_ROOT_DIR to your Qt kit, e.g. C:/Qt/6.10.3/msvc2022_64 (CI builds with Qt 6.10.3).
     "cmake.configureSettings": {
         "CMAKE_C_COMPILER": "clang-cl",
         "CMAKE_CXX_COMPILER": "clang-cl",
-        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64"
+        "CMAKE_PREFIX_PATH": "${env:QT_ROOT_DIR}"
     },
     "C_Cpp.default.intelliSenseMode": "windows-clang-x64",
     "C_Cpp.default.compileCommands": "${workspaceFolder}/_Build/vscode-clang/compile_commands.json",

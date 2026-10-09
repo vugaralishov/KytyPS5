@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -188,6 +191,14 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Guest thread stacks. Windows dispatches exceptions on the faulting thread's own stack, so
+// ProtectGuestHostMemory never protects guest stack pages there and GPU tracking must not rely
+// on faults for them. The "unprotectable" queries report nothing on other platforms.
+[[nodiscard]] bool IsGuestStackRange(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool IsUnprotectableGuestRange(uint64_t vaddr, uint64_t size);
+// Appends the [start, end) parts of [vaddr, vaddr + size) that cannot be protected.
+void GetUnprotectableGuestRanges(uint64_t vaddr, uint64_t size,
+                                 std::vector<std::pair<uint64_t, uint64_t>>* out);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

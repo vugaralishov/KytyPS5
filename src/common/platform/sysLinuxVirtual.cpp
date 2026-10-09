@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -33,18 +34,23 @@ static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs = nullptr;
 
 void Init() {
-	pthread_mutexattr_t attr {};
+	// Init is reached from both main() and Memory::Initialize(); a second run would re-init a
+	// mutex that may be in use and drop every tracked allocation.
+	static std::once_flag once;
+	std::call_once(once, [] {
+		pthread_mutexattr_t attr {};
 
-	pthread_mutexattr_init(&attr);
+		pthread_mutexattr_init(&attr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_FAST_NP); // glibc-only fast mutex
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_FAST_NP); // glibc-only fast mutex
 #else
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_NORMAL);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_NORMAL);
 #endif
-	pthread_mutex_init(&g_virtual_mutex, &attr);
-	pthread_mutexattr_destroy(&attr);
+		pthread_mutex_init(&g_virtual_mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
 
-	g_allocs = new std::map<uintptr_t, size_t>;
+		g_allocs = new std::map<uintptr_t, size_t>;
+	});
 }
 
 static int get_protection_flag(Mode mode) {

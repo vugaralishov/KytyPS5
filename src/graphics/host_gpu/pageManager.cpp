@@ -93,9 +93,12 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 } // namespace
 
 struct PageManager::Impl {
+	static constexpr uint32_t MaxWriteWatchers = 0x7fff;
+
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		// Every cached image on a page holds its own write watcher; 15 bits leave ample room.
+		uint16_t write_watchers  : 15 = 0;
+		uint16_t access_watchers : 1  = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -126,7 +129,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == MaxWriteWatchers) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -141,7 +144,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -292,6 +295,40 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+bool PageManager::IsAccessWatched(uint64_t vaddr, PageFaultAccess access) const {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	SpinGuard  lock(region->lock);
+	const auto page = region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE];
+	if (access == PageFaultAccess::Write || access == PageFaultAccess::Unknown) {
+		return page.write_watchers != 0 || page.access_watchers != 0;
+	}
+	return page.access_watchers != 0;
+}
+
+void PageManager::MarkUnprotectablePages(uint64_t base_addr, size_t first, size_t last,
+                                         RegionBits& pages) const {
+	if (first >= last || last > REGION_PAGES) {
+		Fatal("invalid unprotectable page query [%zu, %zu)", first, last);
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	Libs::LibKernel::Memory::GetUnprotectableGuestRanges(base_addr + first * PAGE_SIZE,
+	                                                     (last - first) * PAGE_SIZE, &ranges);
+	for (const auto& [start, end]: ranges) {
+		if (start >= end || start < base_addr) {
+			continue;
+		}
+		const auto page_first = static_cast<size_t>((start - base_addr) / PAGE_SIZE);
+		const auto page_last =
+		    std::min(static_cast<size_t>((end - base_addr + PAGE_SIZE - 1) / PAGE_SIZE), last);
+		if (page_first < page_last) {
+			pages.SetRange(page_first, page_last);
+		}
+	}
 }
 
 template <bool track>

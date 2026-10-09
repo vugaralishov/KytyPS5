@@ -7,6 +7,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -29,6 +30,14 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#define KYTY_TEST_GETPID _getpid
+#else
+#include <unistd.h>
+#define KYTY_TEST_GETPID getpid
+#endif
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
@@ -157,9 +166,11 @@ void InitSubsystems() {
 
 	subsystems.Initialize<Log::Lifecycle>();
 
-	const auto param_json = std::filesystem::temp_directory_path() /
-	                        ("kyty_virtual_memory_" +
-	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
+	// The address alone repeats across processes (no ASLR), so add the PID for parallel runs.
+	const auto param_json =
+	    std::filesystem::temp_directory_path() /
+	    ("kyty_virtual_memory_" + std::to_string(static_cast<long long>(KYTY_TEST_GETPID())) + "_" +
+	     std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
 	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
 	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
@@ -703,6 +714,43 @@ void TestBackingReadExcludesWritesAndUnmap() {
 			      "backing mutation failed after the reader released its lock");
 		}
 	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestBackingWritesSurvivePartialUnmap() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "BackingWritesSurvivePartialUnmap";
+	constexpr uint64_t value = 0x5355525649564f52ull; // "SURVIVOR"
+	const auto         base  = MapNamedFlexible(test, SceKernelPageSize * 4, SceKernelProtCpuRw,
+	                                            "partial_unmap_writes");
+	std::atomic<bool>     stop {false};
+	std::atomic<bool>     failed {false};
+	std::atomic<uint64_t> writes {0};
+	// Partial unmaps re-create the surviving views; a concurrent backing write to a survivor
+	// must neither fail nor be lost while that happens.
+	std::thread writer([&] {
+		while (!stop.load(std::memory_order_acquire)) {
+			if (!TryWriteBacking(base, &value, sizeof(value))) {
+				failed.store(true, std::memory_order_release);
+			}
+			writes.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	while (writes.load(std::memory_order_relaxed) == 0) {
+		std::this_thread::yield();
+	}
+	for (uint64_t page = 3; page >= 1; page--) {
+		CheckOk(test, KernelMunmap(base + SceKernelPageSize * page, SceKernelPageSize),
+		        "KernelMunmap(partial)");
+	}
+	stop.store(true, std::memory_order_release);
+	writer.join();
+	uint64_t after = 0;
+	Check(test, !failed.load(std::memory_order_acquire),
+	      "a backing write to a surviving page failed during a partial unmap");
+	Check(test, TryReadBacking(base, &after, sizeof(after)) && after == value,
+	      "the surviving page lost its backing contents");
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap(survivor)");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1715,6 +1763,103 @@ void TestDirectReleaseContracts() {
 	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(
 	          free_offset, SceKernelPageSize) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
 	      "checked release did not report an unallocated range");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestRangeArgumentErrors() {
+	using namespace Libs::LibKernel::Memory;
+	const char*    test = "GuestRangeArgumentErrors";
+	constexpr auto page = SceKernelPageSize;
+	const auto     top  = static_cast<uint64_t>(0) - page; // last guest-page-aligned address
+
+	// MAP_FIXED ranges that wrap past 2^64 are rejected instead of reaching the owner.
+	void* wrapped = reinterpret_cast<void*>(top);
+	Check(test,
+	      KernelMapFlexibleMemory(&wrapped, page * 2, SceKernelProtCpuRw, SceKernelMapFixed) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "wrapping fixed flexible map was not rejected");
+	wrapped = reinterpret_cast<void*>(top);
+	Check(test,
+	      KernelReserveVirtualRange(&wrapped, page * 2, SceKernelMapFixed, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "wrapping fixed reservation was not rejected");
+	int64_t physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 3, page,
+	                                         SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	wrapped = reinterpret_cast<void*>(top);
+	Check(test,
+	      KernelMapDirectMemory(&wrapped, page * 2, SceKernelProtCpuRw, SceKernelMapFixed, physical,
+	                            0) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "wrapping fixed direct map was not rejected");
+
+	// Guest-controlled arguments that used to abort.
+	void* flexible = nullptr;
+	Check(test,
+	      KernelMapFlexibleMemory(&flexible, page, 0x40, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          flexible == nullptr,
+	      "flexible map with only unknown protection bits was not rejected");
+	Check(test,
+	      KernelMapFlexibleMemory(nullptr, page, SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EFAULT,
+	      "flexible map without an address pointer was not rejected");
+	Check(test, KernelQueryMemoryProtection(nullptr, nullptr, nullptr, nullptr) == ErrorAccess,
+	      "protection query of a null address did not fail");
+	Check(test,
+	      KernelMprotect(reinterpret_cast<void*>(top), page * 2, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "wrapping mprotect range was not rejected");
+	void* reserved = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserved, page, 0, page), "KernelReserveVirtualRange");
+	Check(test,
+	      KernelMprotect(reserved, page, SceKernelProtCpuRw) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "mprotect of a reserved range was not rejected");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(reserved), page), "KernelMunmap(reserve)");
+
+	// Fixed reservations over pooled memory are refused without changing the pool range.
+	void* arena = nullptr;
+	CheckOk(test, KernelMemoryPoolReserve(nullptr, SceKernelMemoryPoolReserveLen, 0, 0, &arena),
+	        "KernelMemoryPoolReserve");
+	int64_t pool_offset = -1;
+	CheckOk(test,
+	        KernelMemoryPoolExpand(0, KernelGetDirectMemorySize(), SceKernelMemoryPoolExpandLen,
+	                               SceKernelMemoryPoolAlignment, &pool_offset),
+	        "KernelMemoryPoolExpand");
+	CheckOk(test,
+	        KernelMemoryPoolCommit(arena, SceKernelMemoryPoolCommitLen, SceKernelMtypeC,
+	                               SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit");
+	const auto pool_base = reinterpret_cast<uint64_t>(arena);
+	void*      over_pool = arena;
+	Check(test,
+	      KernelReserveVirtualRange(&over_pool, SceKernelMemoryPoolCommitLen, SceKernelMapFixed, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EBUSY,
+	      "fixed reservation over pooled memory was not refused");
+	Check(test, Query(test, pool_base).is_pooled == 1 && Query(test, pool_base).is_committed == 1,
+	      "refused fixed reservation changed the pooled range");
+	CheckOk(test, KernelMemoryPoolDecommit(arena, SceKernelMemoryPoolCommitLen, 0),
+	        "KernelMemoryPoolDecommit");
+	CheckOk(test, KernelMunmap(pool_base, SceKernelMemoryPoolReserveLen), "KernelMunmap(pool)");
+	CheckOk(test, KernelReleaseDirectMemory(pool_offset, SceKernelMemoryPoolExpandLen),
+	        "KernelReleaseDirectMemory(pool expansion)");
+
+	// Renaming part of a direct mapping splits its virtual range; releasing the memory must
+	// still recognise the mapping as one owner alias.
+	void* direct = nullptr;
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&direct, page * 3, SceKernelProtCpuRw, 0, physical, page,
+	                                   "split_by_rename"),
+	        "KernelMapNamedDirectMemory");
+	const auto direct_base = reinterpret_cast<uint64_t>(direct);
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(direct_base + page), page, "middle"),
+	        "KernelSetVirtualRangeName(middle)");
+	ExpectRange(test, Query(test, direct_base + page), direct_base + page, direct_base + page * 2,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "middle", physical + page);
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 3), "KernelReleaseDirectMemory");
+	ExpectUnmapped(test, direct_base);
+	ExpectUnmapped(test, direct_base + page * 2);
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -3209,6 +3354,76 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestLoaderTlsRelocations() {
+	const char* test    = "LoaderTlsRelocations";
+	std::string failure = "unknown failure";
+	Check(test, Loader::TestTlsRelocations(&failure), failure);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestLoaderRejectsMalformedElf() {
+	const char* test = "LoaderRejectsMalformedElf";
+	const auto  path = std::filesystem::temp_directory_path() /
+	                  ("kyty_malformed_elf_" + std::to_string(reinterpret_cast<uintptr_t>(&test)) +
+	                   ".elf");
+
+	const auto write_elf = [&](uint64_t phoff, const Loader::Elf64_Phdr* phdr) {
+		Loader::Elf64_Ehdr ehdr {};
+		ehdr.e_ident[Loader::EI_MAG0]       = 0x7f;
+		ehdr.e_ident[Loader::EI_MAG1]       = 'E';
+		ehdr.e_ident[Loader::EI_MAG2]       = 'L';
+		ehdr.e_ident[Loader::EI_MAG3]       = 'F';
+		ehdr.e_ident[Loader::EI_CLASS]      = Loader::ELFCLASS64;
+		ehdr.e_ident[Loader::EI_DATA]       = Loader::ELFDATA2LSB;
+		ehdr.e_ident[Loader::EI_VERSION]    = Loader::EV_CURRENT;
+		ehdr.e_ident[Loader::EI_OSABI]      = Loader::ELFOSABI_FREEBSD;
+		ehdr.e_ident[Loader::EI_ABIVERSION] = 2;
+		ehdr.e_type                         = Loader::ET_DYNAMIC;
+		ehdr.e_machine                      = Loader::EM_X86_64;
+		ehdr.e_version                      = Loader::EV_CURRENT;
+		ehdr.e_phoff                        = phoff;
+		ehdr.e_phentsize                    = sizeof(Loader::Elf64_Phdr);
+		ehdr.e_phnum                        = 1;
+
+		std::vector<uint8_t> bytes(sizeof(ehdr) + (phdr != nullptr ? sizeof(*phdr) : 0));
+		std::memcpy(bytes.data(), &ehdr, sizeof(ehdr));
+		if (phdr != nullptr) {
+			std::memcpy(bytes.data() + sizeof(ehdr), phdr, sizeof(*phdr));
+		}
+		Common::File file;
+		Check(test, file.Create(path), "failed to create temporary ELF");
+		uint32_t written = 0;
+		file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()), &written);
+		file.Close();
+		Check(test, written == bytes.size(), "failed to write temporary ELF");
+	};
+	const auto is_valid = [&]() {
+		Loader::Elf64 elf;
+		elf.Open(path);
+		return elf.IsValid();
+	};
+
+	write_elf(0x1000, nullptr);
+	Check(test, !is_valid(), "program header table past the end of the file was accepted");
+
+	Loader::Elf64_Phdr dynamic {};
+	dynamic.p_type   = Loader::PT_DYNAMIC;
+	dynamic.p_offset = 0x10000;
+	dynamic.p_filesz = 0x100;
+	write_elf(sizeof(Loader::Elf64_Ehdr), &dynamic);
+	Check(test, !is_valid(), "PT_DYNAMIC past the end of the file was accepted");
+
+	dynamic.p_offset = 0;
+	dynamic.p_filesz = sizeof(Loader::Elf64_Ehdr);
+	write_elf(sizeof(Loader::Elf64_Ehdr), &dynamic);
+	Check(test, is_valid(), "well-formed ELF headers were rejected");
+
+	Check(test, Common::File::DeleteFile(path), "failed to remove temporary ELF");
+	Check(test, !is_valid(), "missing file was reported as a valid ELF");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_instruction_traps = 0;
 
@@ -4476,6 +4691,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestBackingWritesSurvivePartialUnmap);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
@@ -4507,6 +4723,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
+	RunTest(TestGuestRangeArgumentErrors);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
@@ -4534,6 +4751,8 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestLoaderTlsRelocations);
+	RunTest(TestLoaderRejectsMalformedElf);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

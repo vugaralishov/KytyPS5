@@ -5,11 +5,15 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -36,6 +40,7 @@ bool                                 pad_connected = false, pad_bluetooth = fals
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+std::function<void()>                on_put;
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -86,6 +91,11 @@ int GetAudioStreamQueued(SDL_AudioStream* stream) {
 
 bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	now += processing;
+	if (on_put) {
+		const auto callback = std::move(on_put); // One-shot.
+		on_put              = nullptr;
+		callback();
+	}
 	if (fail_put) {
 		return false;
 	}
@@ -456,6 +466,49 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+void TestCloseWaitsForInFlightOutput() {
+	Fixture           f;
+	const auto        port = f.Open();
+	std::atomic<bool> closed {false};
+	std::thread       closer;
+	on_put = [&] {
+		closer = std::thread([&] {
+			Check(f.audio.AudioOutClose(port), "in-flight port did not close");
+			closed = true;
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		Check(!closed && streams.size() == 1, "close freed a port during its output");
+	};
+	f.Output(port, false);
+	closer.join();
+	Check(closed && streams.empty(), "close did not finish after the output");
+	Check(!f.audio.AudioOutValid(port), "closed port still valid");
+
+	Audio::OutputParam param {port, f.pcm.data()};
+	Check(f.audio.AudioOutOutputs(&param, 1, false) == 0, "output to a closed port was accepted");
+	Check(!f.audio.AudioOutClose(port), "port closed twice");
+}
+
+void TestPublicArgumentErrors() {
+	Fixture f;
+	Libs::Audio::Initialize();
+	using namespace Libs::Audio;
+	Check(AudioOut::AudioOutOpen(0, 0, 1, 256, 48000, 1) == AUDIO_OUT_ERROR_INVALID_PARAM,
+	      "nonzero port index was accepted");
+	Check(AudioOut::AudioOutOpen(0, 0, 0, 256, 48000, 0xff) == AUDIO_OUT_ERROR_INVALID_FORMAT,
+	      "unknown format was accepted");
+	const int handle = AudioOut::AudioOutOpen(0, 0, 0, 256, 48000, 1);
+	Check(handle > 0, "valid public open failed");
+	Check(AudioOut::AudioOutGetPortState(handle, nullptr) == AUDIO_OUT_ERROR_INVALID_POINTER,
+	      "null port state was accepted");
+	Check(AudioOut::AudioOutSetVolume(handle, 1, nullptr) == AUDIO_OUT_ERROR_INVALID_POINTER,
+	      "null volume was accepted");
+	Check(AudioOut::AudioOutOutputs(nullptr, 1) == AUDIO_OUT_ERROR_INVALID_POINTER,
+	      "null output batch was accepted");
+	Check(AudioOut::AudioOutClose(handle) == OK, "public close failed");
+	Shutdown();
+}
 } // namespace
 
 int main() {
@@ -470,6 +523,8 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestCloseWaitsForInFlightOutput();
+	TestPublicArgumentErrors();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

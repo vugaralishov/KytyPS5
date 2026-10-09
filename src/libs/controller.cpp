@@ -1138,7 +1138,9 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
+	if (num < 1 || num > 64) {
+		return PAD_ERROR_INVALID_ARG;
+	}
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
 	}

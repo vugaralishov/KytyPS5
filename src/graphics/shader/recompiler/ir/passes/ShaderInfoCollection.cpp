@@ -324,6 +324,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::GlobalInvocationId:
 					AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 					break;
+				case StageInputKind::NumWorkgroups:
+					AddInput(info, kind, 0, 3, "gl_NumWorkGroups");
+					break;
 				case StageInputKind::PackedAncillary:
 				case StageInputKind::Parameter: break;
 			}

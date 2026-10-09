@@ -653,11 +653,13 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
+	// The output may be a game buffer that later draws and dispatches bind, not only a copy
+	// source, so publish it to every stage as Record does.
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
-	                        0, nullptr);
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
+	                        &barriers[1], 0, nullptr);
 }
 
 TileManager::Result TileManager::TransformColor(Result input, ColorTransform transform,

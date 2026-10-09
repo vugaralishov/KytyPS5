@@ -827,6 +827,41 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+// Guest thread stacks (start -> end), kept apart from g_virtual_ranges so that
+// ProtectGuestHostMemory can consult them from GPU fault handling without taking a lock that is
+// held while guest memory is being read.
+static std::mutex                   g_stack_ranges_mutex;
+static std::map<uint64_t, uint64_t> g_stack_ranges;
+
+static void AddStackRange(uint64_t start, uint64_t size) {
+	std::lock_guard lock(g_stack_ranges_mutex);
+	g_stack_ranges[start] = start + size;
+}
+
+static void RemoveStackRange(uint64_t start, uint64_t size) {
+	std::lock_guard lock(g_stack_ranges_mutex);
+	const auto      end = start + size;
+	auto            it  = g_stack_ranges.upper_bound(start);
+	if (it != g_stack_ranges.begin()) {
+		--it;
+	}
+	while (it != g_stack_ranges.end() && it->first < end) {
+		const auto range_start = it->first;
+		const auto range_end   = it->second;
+		if (range_end <= start) {
+			++it;
+			continue;
+		}
+		it = g_stack_ranges.erase(it);
+		if (range_start < start) {
+			g_stack_ranges.emplace(range_start, start);
+		}
+		if (end < range_end) {
+			g_stack_ranges.emplace(end, range_end);
+		}
+	}
+}
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -1006,7 +1041,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 #endif
 }
 
-static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
+static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, int* error = nullptr);
 
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
@@ -1021,6 +1056,10 @@ void Initialize() {
 }
 
 void Shutdown() {
+	{
+		std::lock_guard lock(g_stack_ranges_mutex);
+		g_stack_ranges.clear();
+	}
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();
@@ -2259,7 +2298,10 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                              const char* name) {
-	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
+	// Same as MapDirectMemory: a null out-pointer is a guest fault, not an emulator bug.
+	if (addr_in_out == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
 
 	constexpr size_t   PAGE_SIZE                = 0x4000;
 	constexpr size_t   MAXIMUM_NAME_SIZE        = 32;
@@ -2303,7 +2345,8 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;
 
 	if (!DecodeMemoryProtection(prot, &mode, &gpu_mode)) {
-		EXIT("unknown prot: %d\n", prot);
+		LOGF_COLOR(Log::Color::Red, "\t unknown prot: %d\n", prot);
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
@@ -2312,7 +2355,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 
 	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0 ||
-		    (in_addr & (map_alignment - 1u)) != 0) {
+		    (in_addr & (map_alignment - 1u)) != 0 || len > UINT64_MAX - in_addr) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
@@ -2327,9 +2370,13 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			reserved_target = true;
 			out_addr        = in_addr;
 		}
-		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
+		int replace_error = OK;
+		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len, &replace_error)) {
 			reserved_target = true;
 			out_addr        = in_addr;
+		}
+		if (replace_error != OK) {
+			return replace_error;
 		}
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
@@ -2581,6 +2628,9 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 		}
 	} else if (range.type == VirtualRangeType::Stack) {
 		owner_unmapped = g_guest_address_space->ReleaseCommitted(vaddr, len);
+		if (owner_unmapped) {
+			RemoveStackRange(vaddr, len);
+		}
 	} else {
 		uint64_t ignored_host = 0;
 		owner_unmapped        = g_flexible_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host);
@@ -2864,11 +2914,13 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 
 	const auto mapped_aliases = g_physical_memory->FindMappings(start, len);
 	for (const auto& alias: mapped_aliases) {
-		VirtualRanges::Range range {};
+		// Renaming or re-protecting part of a mapping splits its virtual range (direct ranges
+		// never merge back), so the alias may span several consecutive Direct pieces.
+		std::vector<VirtualRanges::Range> alias_ranges;
 		if (!g_guest_address_space->BackingContains(alias.map_vaddr, alias.map_size) ||
-		    !g_virtual_ranges->Query(alias.map_vaddr, 0, &range) ||
-		    range.type != VirtualRangeType::Direct ||
-		    alias.map_size > range.start + range.size - alias.map_vaddr) {
+		    !g_virtual_ranges->QuerySpan(alias.map_vaddr, alias.map_size, &alias_ranges) ||
+		    std::any_of(alias_ranges.begin(), alias_ranges.end(),
+		                [](const auto& range) { return range.type != VirtualRangeType::Direct; })) {
 			EXIT("direct-memory alias escaped guest address-space ownership\n");
 		}
 	}
@@ -3039,7 +3091,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	};
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
-		    (alignment != 0 && in_addr % alignment != 0)) {
+		    (alignment != 0 && in_addr % alignment != 0) || len > UINT64_MAX - in_addr) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
@@ -3099,11 +3151,12 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				UnmapGpuRange(in_addr, len);
 				reserved_target = true;
 			}
-			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
+			int replace_error = OK;
+			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len, &replace_error)) {
 				reserved_target = true;
 			}
 			if (!reserved_target) {
-				return KERNEL_ERROR_ENOMEM;
+				return replace_error != OK ? replace_error : KERNEL_ERROR_ENOMEM;
 			}
 			if (map_shared_fixed(in_addr)) {
 				out_addr       = in_addr;
@@ -3283,8 +3336,7 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	EXIT_NOT_IMPLEMENTED(addr == nullptr);
-
+	// Address 0 is never part of a guest range, so a null addr simply fails the lookup below.
 	VirtualRanges::Range range {};
 	if (!g_virtual_ranges->Query(reinterpret_cast<uint64_t>(addr), 0, &range)) {
 		return KERNEL_ERROR_EACCES;
@@ -3303,7 +3355,17 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 	return OK;
 }
 
-static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
+// When the guest request itself is refused (not a host failure), *error receives the error code.
+static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, int* error) {
+	if (error != nullptr) {
+		*error = OK;
+	}
+	if (size == 0 || UINT64_MAX - start < size) {
+		if (error != nullptr) {
+			*error = KERNEL_ERROR_EINVAL;
+		}
+		return false;
+	}
 
 	struct ReplacedChunk {
 		VirtualRanges::Range                        range {};
@@ -3351,9 +3413,16 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			return false;
 		}
 		if (range.type == VirtualRangeType::Pooled) {
-			EXIT("reserve-fixed replacement of pooled memory is unsupported: addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     replaced.range.start, replaced.range.size);
+			// Nothing has been changed yet, so refuse the guest request instead of aborting.
+			LOGF_COLOR(
+			    Log::Color::Red,
+			    "\t reserve-fixed replacement of pooled memory is unsupported: addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 "\n",
+			    replaced.range.start, replaced.range.size);
+			if (error != nullptr) {
+				*error = KERNEL_ERROR_EBUSY;
+			}
+			return false;
 		}
 		chunks.push_back(replaced);
 
@@ -3496,6 +3565,9 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	}
 
 	for (const auto& chunk: chunks) {
+		if (chunk.range.type == VirtualRangeType::Stack) {
+			RemoveStackRange(chunk.range.start, chunk.range.size);
+		}
 		if (g_free_callback != nullptr && IsCommittedRangeType(chunk.range.type)) {
 			g_free_callback(chunk.range.start, chunk.range.size);
 		}
@@ -3532,15 +3604,19 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	uint64_t out_addr            = 0;
 	bool     range_already_added = false;
 	if ((flags & GUEST_MAP_FIXED) != 0) {
-		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0) {
+		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0 || len > UINT64_MAX - in_addr) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
-		if (ReplaceFixedRangeWithReserved(in_addr, len)) {
+		int replace_error = OK;
+		if (ReplaceFixedRangeWithReserved(in_addr, len, &replace_error)) {
 			out_addr            = in_addr;
 			range_already_added = true;
+		}
+		if (replace_error != OK) {
+			return replace_error;
 		}
 	} else {
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
@@ -3814,6 +3890,9 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
 		return 0;
 	}
+	if (type == VirtualRangeType::Stack) {
+		AddStackRange(vaddr, mapped_size);
+	}
 	MapGpuRange(vaddr, mapped_size);
 	return vaddr;
 }
@@ -3878,9 +3957,120 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	return true;
 }
 
+// The GPU page tracker asks for the access it needs to observe; never grant more than the guest's
+// own protection, so memory the guest made read-only (or no-access) stays that way. Write
+// implies read on the host, and executable guest pages keep execute while they are readable.
+static bool ProtectTransientWithinGuest(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges) ||
+	    ranges.empty()) {
+		return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	}
+
+	constexpr auto read  = static_cast<uint32_t>(VirtualMemory::Mode::Read);
+	constexpr auto write = static_cast<uint32_t>(VirtualMemory::Mode::Write);
+	constexpr auto exec  = static_cast<uint32_t>(VirtualMemory::Mode::Execute);
+	const auto     end   = vaddr + size;
+	for (const auto& range: ranges) {
+		const auto start = (std::max)(vaddr, range.start);
+		const auto stop  = (std::min)(end, range.start + range.size);
+		if (start >= stop) {
+			continue;
+		}
+		uint32_t guest = 0;
+		guest |= (range.protection & PROT_CPU_READ) != 0 ? read : 0;
+		guest |= (range.protection & PROT_CPU_WRITE) != 0 ? write : 0;
+		guest |= (range.protection & PROT_CPU_EXEC) != 0 ? exec : 0;
+		uint32_t effective = static_cast<uint32_t>(mode) & guest & (read | write);
+		if ((effective & write) != 0) {
+			effective |= read;
+		}
+		if ((guest & exec) != 0 && (effective & read) != 0) {
+			effective |= exec;
+		}
+		if (!g_guest_address_space->ProtectTransient(start, stop - start,
+		                                             static_cast<VirtualMemory::Mode>(effective))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Appends the parts of [vaddr, vaddr + size) that lie in guest thread stacks.
+static void CollectGuestStackRanges(uint64_t vaddr, uint64_t size,
+                                    std::vector<std::pair<uint64_t, uint64_t>>* out) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return;
+	}
+	const auto      end = vaddr + size;
+	std::lock_guard lock(g_stack_ranges_mutex);
+	auto            it = g_stack_ranges.upper_bound(vaddr);
+	if (it != g_stack_ranges.begin()) {
+		--it;
+	}
+	for (; it != g_stack_ranges.end() && it->first < end; ++it) {
+		if (it->second > vaddr) {
+			out->emplace_back((std::max)(vaddr, it->first), (std::min)(end, it->second));
+		}
+	}
+}
+
+bool IsGuestStackRange(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> stacks;
+	CollectGuestStackRanges(vaddr, size, &stacks);
+	return !stacks.empty();
+}
+
+bool IsUnprotectableGuestRange(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return IsGuestStackRange(vaddr, size);
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
+void GetUnprotectableGuestRanges(uint64_t vaddr, uint64_t size,
+                                 std::vector<std::pair<uint64_t, uint64_t>>* out) {
+	EXIT_IF(out == nullptr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CollectGuestStackRanges(vaddr, size, out);
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	if (g_guest_address_space == nullptr) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool writable =
+	    (static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0;
+	if (!writable && size != 0 && UINT64_MAX - vaddr >= size) {
+		// Windows dispatches exceptions, including the GPU-tracking fault itself, on the faulting
+		// thread's stack, and there is no alternate signal stack. A read-only guest stack page
+		// makes that dispatch fail and the process dies, so guest stacks are never protected
+		// here. The GPU caches query GetUnprotectableGuestRanges and do not rely on faults there.
+		const auto                                 end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> stacks;
+		CollectGuestStackRanges(vaddr, size, &stacks);
+		if (!stacks.empty()) {
+			auto current = vaddr;
+			for (const auto& [stack_start, stack_end]: stacks) {
+				if (current < stack_start &&
+				    !ProtectTransientWithinGuest(current, stack_start - current, mode)) {
+					return false;
+				}
+				current = (std::max)(current, stack_end);
+			}
+			return current >= end || ProtectTransientWithinGuest(current, end - current, mode);
+		}
+	}
+#endif
+	return ProtectTransientWithinGuest(vaddr, size, mode);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
@@ -3908,8 +4098,11 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	auto               aligned_addr = vaddr & ~(PAGE_SIZE - 1);
 	const auto         page_offset  = vaddr - aligned_addr;
 	if (len > UINT64_MAX - page_offset || len + page_offset > UINT64_MAX - (PAGE_SIZE - 1)) {
-		EXIT("memory-protection range overflows: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, static_cast<uint64_t>(len));
+		LOGF_COLOR(Log::Color::Red,
+		           "\t memory-protection range overflows: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		           "\n",
+		           vaddr, static_cast<uint64_t>(len));
+		return KERNEL_ERROR_EINVAL;
 	}
 	auto aligned_len = (len + page_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
@@ -3927,18 +4120,32 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
 	    std::any_of(old_ranges.begin(), old_ranges.end(),
 	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
-		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     aligned_addr, aligned_len);
+		// FreeBSD mprotect reports an invalid address range with EINVAL.
+		LOGF_COLOR(Log::Color::Red,
+		           "\t memory-protection range is not fully mapped: addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 "\n",
+		           aligned_addr, aligned_len);
+		return KERNEL_ERROR_EINVAL;
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
+		LOGF_COLOR(Log::Color::Red,
+		           "\t host memory-protection update failed: addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 " prot=0x%08x\n",
+		           aligned_addr, aligned_len, prot);
+		// The host update may have been applied to a prefix; put back the recorded protections.
+		for (const auto& old_range: old_ranges) {
+			VirtualMemory::Mode old_range_mode = VirtualMemory::Mode::NoAccess;
+			GpuAccessMode       old_range_gpu  = GpuAccessMode::NoAccess;
+			if (DecodeMemoryProtection(old_range.protection, &old_range_mode, &old_range_gpu)) {
+				(void)g_guest_address_space->Protect(old_range.start, old_range.size,
+				                                     old_range_mode);
+			}
+		}
+		return KERNEL_ERROR_ENOMEM;
 	}
 	for (const auto& old_range: old_ranges) {
 		if (old_range.type == VirtualRangeType::Direct) {

@@ -1,9 +1,14 @@
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -77,6 +82,7 @@ ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	layout.coord = cursor;
 	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLodClamp)) layout.clamp = cursor++;
 	return layout;
 }
 
@@ -145,17 +151,21 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
                   uint32_t first, uint32_t components, bool cube = false) {
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
-	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
-	                                                   : ZeroF32(ctx.state);
+	// A host image with more coordinates than the instruction must not read the trailing LOD or
+	// LOD clamp as a coordinate.
+	const auto trailing = (HasFlag(mem, Decoder::ImageSampleFlagLod) ? 1u : 0u) +
+	                      (HasFlag(mem, Decoder::ImageSampleFlagLodClamp) ? 1u : 0u);
+	const auto limit =
+	    mem.image_address_components > trailing ? mem.image_address_components - trailing : 0u;
+	auto y = limit > first + 1u ? AddressF32(ctx, mem, address, first + 1u) : ZeroF32(ctx.state);
 	if (cube) {
 		x = CubeAxis(ctx.state, x);
 		y = CubeAxis(ctx.state, y);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		auto z = mem.image_address_components > first + 2u
-		             ? AddressF32(ctx, mem, address, first + 2u)
-		             : ZeroF32(ctx.state);
+		auto z =
+		    limit > first + 2u ? AddressF32(ctx, mem, address, first + 2u) : ZeroF32(ctx.state);
 		if (cube) z = CubeLayer(ctx.state, z);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 3),
 		                              result, x, y, z);
@@ -356,6 +366,115 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	} else {
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 2),
 		                              result, values[0], values[1]);
+	}
+	return result;
+}
+
+// The address dword packing the six-bit texel offsets (x[5:0], y[13:8], z[21:16]).
+std::optional<IR::Value> TexelOffsetWord(const IR::MemoryInfo& mem, const IR::Inst& address,
+                                         const ImageSampleLayout& layout) {
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return std::nullopt;
+	}
+	const auto packed =
+	    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.offset).bit_offset /
+	    32u;
+	if (packed >= address.NumArgs()) return std::nullopt;
+	return address.Arg(packed).Resolve();
+}
+
+// ConstOffset operand for constant texel offsets: 0 when they are all zero, nullopt when one
+// lies outside the [-8, 7] range Vulkan guarantees for minTexelOffset/maxTexelOffset.
+std::optional<uint32_t> ConstTexelOffset(EmitterState& state, uint32_t packed,
+                                         ImageDimension dimension) {
+	const auto              components = ImageDimensionInfoFor(dimension).spatial_components;
+	std::array<uint32_t, 3> values {};
+	bool                    nonzero = false;
+	for (uint32_t index = 0; index < components; index++) {
+		const auto value = static_cast<int32_t>(packed << (26u - index * 8u)) >> 26;
+		if (value < -8 || value > 7) return std::nullopt;
+		nonzero |= value != 0;
+		values[index] = ConstantI32(state, value);
+	}
+	if (!nonzero) return 0u;
+	switch (components) {
+		case 1u: return values[0];
+		case 2u:
+			return state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2),
+			                              values[0], values[1]);
+		default:
+			return state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 3),
+			                              values[0], values[1], values[2]);
+	}
+}
+
+// Vulkan allows only constant offsets on sampling instructions, so a runtime texel offset
+// moves the coordinates by offset / size of the nearest sampled mip instead: the explicit LOD,
+// the implicit LOD of a pixel shader, or the base mip (also exact for Lod 0 samples outside
+// pixel shaders). Gradient and bias samples use their unbiased implicit or base mip.
+uint32_t OffsetSampleCoord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                           const IR::Inst& address, const ImageSampleLayout& layout,
+                           const IR::ImageResource& image, uint32_t sampled, uint32_t coord) {
+	auto&       state = ctx.state;
+	const auto& info  = ImageDimensionInfoFor(image.dimension);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto handle = Unary(state, spv::OpImage, ImageType(state, image), sampled);
+	uint32_t   lod    = 0;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
+		lod = AddressF32(ctx, mem, address, layout.lod);
+	} else if (state.program.stage == ShaderType::Pixel &&
+	           !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) &&
+	           !HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
+		const auto query =
+		    Binary(state, spv::OpImageQueryLod, TypeF32Vector(state, 2), sampled,
+		           CoordF32(ctx, mem, address, layout.coord, info.spatial_components, image.cube));
+		lod = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod, query, 0u);
+	}
+	auto mip = ConstantU32(state, 0);
+	if (lod != 0u) {
+		const auto nearest = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(
+		    state, Binary(state, spv::OpFAdd, TypeF32(state), lod, ConstantF32Value(state, 0.5f)),
+		    ZeroF32(state));
+		const auto levels = Unary(state, spv::OpImageQueryLevels, TypeU32(state), handle);
+		mip = EmitUMin32(state, Unary(state, spv::OpConvertFToU, TypeU32(state), nearest),
+		                 Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1)));
+	}
+	const auto size = Binary(state, spv::OpImageQuerySizeLod,
+	                         ImageViewSizeType(state, image.dimension), handle, mip);
+	const auto packed =
+	    Unary(state, spv::OpBitcast, TypeI32(state), AddressU32(ctx, mem, address, layout.offset));
+	const auto              components = info.coordinate_components;
+	std::array<uint32_t, 3> values {};
+	for (uint32_t index = 0; index < components; index++) {
+		auto value  = coord;
+		auto extent = size;
+		if (components != 1u) {
+			value  = state.builder.AllocateId();
+			extent = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, index);
+		}
+		// Array layers are not offset.
+		if (index < info.spatial_components) {
+			const auto texels = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), texels, packed,
+			                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+			const auto delta = Binary(state, spv::OpFDiv, TypeF32(state),
+			                          Unary(state, spv::OpConvertSToF, TypeF32(state), texels),
+			                          Unary(state, spv::OpConvertUToF, TypeF32(state), extent));
+			value            = Binary(state, spv::OpFAdd, TypeF32(state), value, delta);
+		}
+		values[index] = value;
+	}
+	if (components == 1u) return values[0];
+	const auto result = state.builder.AllocateId();
+	if (components == 3u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          values[0], values[1], values[2]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          values[0], values[1]);
 	}
 	return result;
 }
@@ -805,27 +924,69 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
 			}
+			if (layout.clamp != NoImageComponent) {
+				// MinLod is not allowed with an explicit Lod operand, so clamp the LOD directly.
+				lod = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(
+				    state, lod, AddressF32(ctx, mem, *address, layout.clamp));
+			}
 			operands.push_back(lod);
 		} else if (layout.bias != NoImageComponent) {
 			operand_mask |= spv::ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
+		// Implicit-LOD and gradient samples carry the *_cl clamp as the MinLod operand.
+		uint32_t min_lod = 0;
+		if (layout.clamp != NoImageComponent &&
+		    (HasFlag(mem, Decoder::ImageSampleFlagDerivative) || !explicit_lod)) {
+			if (state.host_features.min_lod) {
+				state.builder.RequireCapability(spv::CapabilityMinLod);
+				operand_mask |= spv::ImageOperandsMinLodMask;
+				min_lod = AddressF32(ctx, mem, *address, layout.clamp);
+			} else {
+				// Without shaderResourceMinLod the clamp cannot be expressed for implicit or
+				// gradient LODs; sampling proceeds unclamped.
+				static std::atomic<bool> reported {false};
+				if (!reported.exchange(true)) {
+					LOGF("shader recompiler: shaderResourceMinLod is unavailable; ignoring the LOD "
+					     "clamp of *_cl image samples (first hash=0x%016" PRIx64 ")\n",
+					     state.program.shader_hash);
+				}
+			}
+		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+		const auto offset_word = TexelOffsetWord(mem, *address, layout);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			auto coord = CoordF32(ctx, mem, *address, layout.coord,
+			                      ImageDimensionInfoFor(candidate.dimension).coordinate_components,
+			                      candidate.cube);
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			auto       sample_mask  = operand_mask;
+			uint32_t   const_offset = 0;
+			if (offset_word.has_value()) {
+				const auto constant =
+				    offset_word->IsImmediate() && offset_word->GetType() == IR::Type::U32
+				        ? ConstTexelOffset(state, offset_word->U32(), candidate.dimension)
+				        : std::nullopt;
+				if (!constant.has_value()) {
+					coord =
+					    OffsetSampleCoord(ctx, mem, *address, layout, candidate, sampled, coord);
+				} else if (*constant != 0u) {
+					sample_mask |= spv::ImageOperandsConstOffsetMask;
+					const_offset = *constant;
+				}
+			}
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {
 				sample_operands.push_back(dref_value);
 			}
-			if (operand_mask != 0u) {
-				sample_operands.push_back(operand_mask);
+			if (sample_mask != 0u) {
+				sample_operands.push_back(sample_mask);
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
+				// ConstOffset follows Bias/Lod/Grad and precedes MinLod in image-operand bit order.
+				if (const_offset != 0u) sample_operands.push_back(const_offset);
+				if (min_lod != 0u) sample_operands.push_back(min_lod);
 			}
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;

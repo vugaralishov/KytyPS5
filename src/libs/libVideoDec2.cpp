@@ -7,8 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace Libs {
 
@@ -201,17 +202,19 @@ static_assert(sizeof(Videodec2OutputInfo) == 56);
 static_assert(sizeof(Videodec2FrameBuffer) == 32);
 static_assert(sizeof(Videodec2AvcPictureInfo) == 120);
 
-static std::mutex                g_decoder_mutex;
-static std::unordered_set<void*> g_decoders;
+// Shared ownership lets a call finish with a decoder that another thread deletes meanwhile.
+static std::mutex                                               g_decoder_mutex;
+static std::unordered_map<void*, std::shared_ptr<DecoderState>> g_decoders;
 
 static bool IsOutputInfoSizeValid(size_t this_size) {
 	return this_size == sizeof(Videodec2OutputInfo) ||
 	       (this_size | 8u) == sizeof(Videodec2OutputInfo);
 }
 
-static DecoderState* GetDecoder(Videodec2Decoder decoder) {
+static std::shared_ptr<DecoderState> GetDecoder(Videodec2Decoder decoder) {
 	std::scoped_lock lock(g_decoder_mutex);
-	return g_decoders.contains(decoder) ? static_cast<DecoderState*>(decoder) : nullptr;
+	const auto       it = g_decoders.find(decoder);
+	return it != g_decoders.end() ? it->second : nullptr;
 }
 
 static void FillNoPictureOutput(const Videodec2FrameBuffer* frame_buffer,
@@ -431,7 +434,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 
 	{
 		std::scoped_lock lock(g_decoder_mutex);
-		g_decoders.insert(state);
+		g_decoders.emplace(state, std::shared_ptr<DecoderState>(state, Decoder::Destroy));
 	}
 
 	*decoder = state;
@@ -441,18 +444,19 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 	PRINT_NAME();
 
-	DecoderState* state = nullptr;
+	std::shared_ptr<DecoderState> state;
 	{
 		std::scoped_lock lock(g_decoder_mutex);
 		auto             it = g_decoders.find(decoder);
 		if (it == g_decoders.end()) {
 			return VIDEODEC2_ERROR_DECODER_INSTANCE;
 		}
-		state = static_cast<DecoderState*>(*it);
+		state = std::move(it->second);
 		g_decoders.erase(it);
 	}
 
-	Decoder::Destroy(state);
+	// Destroys the decoder now, or when the last in-flight call releases it.
+	state.reset();
 
 	return OK;
 }
@@ -462,7 +466,8 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
                                     Videodec2OutputInfo*  output_info) {
 	PRINT_NAME();
 
-	auto* state = GetDecoder(decoder);
+	const auto holder = GetDecoder(decoder);
+	auto*      state  = holder.get();
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
 	}
@@ -510,7 +515,8 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
                                    Videodec2OutputInfo* output_info) {
 	PRINT_NAME();
 
-	auto* state = GetDecoder(decoder);
+	const auto holder = GetDecoder(decoder);
+	auto*      state  = holder.get();
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
 	}
@@ -545,7 +551,8 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
 	PRINT_NAME();
 
-	auto* state = GetDecoder(decoder);
+	const auto holder = GetDecoder(decoder);
+	auto*      state  = holder.get();
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
 	}

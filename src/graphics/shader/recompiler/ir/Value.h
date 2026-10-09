@@ -21,6 +21,8 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	// Without this, a const Inst* silently converts to bool and becomes the constant true.
+	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);

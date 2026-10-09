@@ -167,12 +167,19 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			EXIT_IF(request_id == 0);
 			return request_id;
 		}
+		// The flip parameters come from guest PM4 packets; an invalid flip is dropped, and the
+		// rest of the EOP (memory write, interrupt) still runs. Request id 0 marks the drop.
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
-			EXIT("GPU flip submission failed, result=%d handle=%d index=%d mode=%d arg=%" PRId64
-			     "\n",
-			     result, handle, index, flip_mode, flip_arg);
+			LOGF("GPU flip dropped, result=%d handle=%d index=%d mode=%d arg=%" PRId64 "\n", result,
+			     handle, index, flip_mode, flip_arg);
+			return 0;
 		}
-		video_out.WaitForSubmitSlot(handle);
+		if (!video_out.WaitForSubmitSlot(handle)) {
+			LOGF("GPU flip dropped, no submit slot can free up: handle=%d index=%d arg=%" PRId64
+			     "\n",
+			     handle, index, flip_arg);
+			return 0;
+		}
 	}
 }
 
@@ -191,7 +198,9 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
-		renderer.GetVideoOut().CompleteFlip(request_id);
+		if (request_id != 0) {
+			renderer.GetVideoOut().CompleteFlip(request_id);
+		}
 		renderer.TriggerInterrupt(event_id, 0);
 	});
 }
@@ -208,6 +217,9 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	if (request_id == 0) {
+		return;
+	}
 	scheduler.DeferPriorityOperation(
 	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 }
@@ -222,6 +234,9 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	if (request_id == 0) {
+		return;
+	}
 	scheduler.DeferPriorityOperation(
 	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 }
@@ -293,6 +308,8 @@ void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_s
 	const auto size   = uint64_t {dw_size} * sizeof(uint32_t);
 	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||
 	        gds.Mapped().empty());
+	// GDS lives in host-visible memory that may be non-coherent.
+	gds.Invalidate(offset, size);
 	std::memcpy(dst, gds.Mapped().data() + offset, static_cast<size_t>(size));
 }
 

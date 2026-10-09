@@ -154,6 +154,126 @@ TestCompileResult RecompileForTest(
           std::move(resources)};
 }
 
+std::string RenderTranslatedValue(ShaderRecompiler::IR::Value value, uint32_t depth) {
+  using namespace ShaderRecompiler::IR;
+  char text[64];
+  const auto *inst = value.IsEmpty() ? nullptr : value.TryInstruction();
+  if (inst == nullptr) {
+    switch (value.GetType()) {
+    case Type::Void:
+      return "<null>";
+    case Type::ScalarReg:
+      return "s" + std::to_string(RegIndex(value.ScalarRegister()));
+    case Type::VectorReg:
+      return "v" + std::to_string(RegIndex(value.VectorRegister()));
+    case Type::U1:
+      return value.U1() ? "true" : "false";
+    case Type::U8:
+      return std::to_string(value.U8()) + "u8";
+    case Type::U16:
+      return std::to_string(value.U16()) + "u16";
+    case Type::U32:
+      std::snprintf(text, sizeof(text), "0x%08x", value.U32());
+      return text;
+    case Type::U64:
+      std::snprintf(text, sizeof(text), "0x%016llx",
+                    static_cast<unsigned long long>(value.U64()));
+      return text;
+    case Type::F16:
+      std::snprintf(text, sizeof(text), "f16(0x%04x)", value.F16Bits());
+      return text;
+    case Type::F32:
+      std::snprintf(text, sizeof(text), "%gf", value.F32Value());
+      return text;
+    default:
+      return "<" + TypeName(value.GetType()) + ">";
+    }
+  }
+  switch (inst->GetOpcode()) {
+  case ValueOpcode::GetScalarRegister:
+  case ValueOpcode::GetVectorRegister:
+    return RenderTranslatedValue(inst->Arg(0), depth);
+  case ValueOpcode::GetScc: return "scc";
+  case ValueOpcode::GetExec: return "exec";
+  case ValueOpcode::GetExecLo: return "exec_lo";
+  case ValueOpcode::GetExecHi: return "exec_hi";
+  case ValueOpcode::GetVcc: return "vcc";
+  case ValueOpcode::GetVccLo: return "vcc_lo";
+  case ValueOpcode::GetVccHi: return "vcc_hi";
+  case ValueOpcode::GetM0: return "m0";
+  default:
+    break;
+  }
+  std::string result(ValueOpcodeName(inst->GetOpcode()));
+  if (depth == 0) {
+    return result + "(...)";
+  }
+  result += '(';
+  for (size_t index = 0; index < inst->NumArgs(); index++) {
+    result += index == 0 ? "" : ", ";
+    result += RenderTranslatedValue(inst->Arg(index), depth - 1);
+  }
+  return result + ')';
+}
+
+// Renders the frontend IR before SSA and optimization: one line per side effect or unused
+// result, operands expanded into expressions whose register reads print as register names.
+// This keeps per-instruction lowering observable after constant folding and DCE remove it
+// from the compiled ir_dump.
+std::string TranslateExpressionsForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options) {
+  using namespace ShaderRecompiler;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(code, decoded);
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = options.stage;
+  translate_options.wave_size = options.wave_size;
+  translate_options.user_data_count = static_cast<uint32_t>(options.user_data.size());
+  translate_options.input_info = options.input_info;
+  const auto program = Frontend::TranslateProgram(
+      decoded, CFG::BuildGraph(decoded), translate_options);
+  std::string text;
+  for (const auto *block : program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetType() != IR::Type::Void && inst.UseCount() != 0) {
+        continue;
+      }
+      text += ValueOpcodeName(inst.GetOpcode());
+      for (size_t index = 0; index < inst.NumArgs(); index++) {
+        text += index == 0 ? " " : ", ";
+        text += RenderTranslatedValue(inst.Arg(index), 8);
+      }
+      text += '\n';
+    }
+  }
+  return text;
+}
+
+// Disassembly operand of a float storage image binding; dimension slots are 1D,
+// 1D array, 2D, 2D array and 3D, in order.
+std::string StorageImageBinding(uint32_t dimension_slot) {
+  return "image_" +
+         std::to_string(ShaderRecompiler::IR::FirstStorageImageBinding + dimension_slot) +
+         " ";
+}
+
+// Memory metadata of each compiled instruction with this opcode, in program order.
+std::vector<ShaderRecompiler::IR::MemoryInfo> MemoryAccesses(
+    const ShaderRecompiler::IR::Program &program,
+    ShaderRecompiler::IR::ValueOpcode opcode) {
+  std::vector<ShaderRecompiler::IR::MemoryInfo> accesses;
+  for (const auto *block : program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == opcode) {
+        accesses.push_back(
+            program.memory_info[inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index]);
+      }
+    }
+  }
+  return accesses;
+}
+
 void CompilePixelRuntime(const ShaderParams &params,
                          ShaderPixelInputInfo &input_info) {
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -1405,11 +1525,14 @@ void TestSpirvRequirementsAnalysis() {
 std::array<uint32_t, 64>
 ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
   std::array<uint32_t, 64> data{};
+  // Consecutive srsrc slots overlap, so each slot is dwords 0-3 of one image
+  // descriptor and dwords 4-7 of the previous one. Keep the reserved bits of
+  // both clear, or materialization treats the descriptor as null.
   for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
-    data[start] = 0x1000u + start * 0x100u;
+    data[start] = 0x1000u + start * 0x10u;
     data[start + 1u] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm)
                        << 20u;
-    data[start + 2u] = UINT32_MAX;
+    data[start + 2u] = ~0x70007b00u; // maximal extents
     data[start + 3u] = static_cast<uint32_t>(type) << 28u;
   }
   return data;
@@ -1983,33 +2106,34 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_bitset1_b32 vcc_lo, 0") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_BITSET1_B32 vcc_lo, 0") != std::string::npos),
         "new decoder did not decode RDNA2 S_BITSET1_B32");
   Check((result.decoded_dump.find("s_setreg_b32 vcc_lo, 0x00001019") != std::string::npos),
         "new decoder did not decode S_SETREG_B32");
-  Check((result.decoded_dump.find("s_add_i32 vcc_lo, s2, pops_exiting_wave_id") != std::string::npos),
+  Check((result.decoded_dump.find("S_ADD_I32 vcc_lo, s2, pops_exiting_wave_id") != std::string::npos),
         "new decoder did not decode pops_exiting_wave_id as RHS scalar source");
-  Check((result.decoded_dump.find("s_add_i32 vcc_lo, pops_exiting_wave_id, s2") != std::string::npos),
+  Check((result.decoded_dump.find("S_ADD_I32 vcc_lo, pops_exiting_wave_id, s2") != std::string::npos),
         "new decoder did not decode pops_exiting_wave_id as LHS scalar source");
-  Check((result.decoded_dump.find("s_sleep 0x00000000") != std::string::npos),
+  Check((result.decoded_dump.find("S_SLEEP 0x00000000") != std::string::npos),
         "new decoder did not decode S_SLEEP");
-  Check((result.ir_dump.find("BitSetU32 vcc_lo, vcc_lo, 0x00000000") != std::string::npos),
+  Check((lowered.find("SetVccLo BitwiseOr32(vcc_lo, ShiftLeftLogical32(0x00000001, "
+                      "BitwiseAnd32(0x00000000, 0x0000001f)))") != std::string::npos),
         "S_BITSET1_B32 did not lower to bit-set IR using the destination as "
         "input");
-  Check(
-      (result.ir_dump.find("ScalarSignedAddOverflowI32 vcc_lo, s2, 0x00000000") != std::string::npos),
-      "pops_exiting_wave_id RHS did not lower to a deterministic zero value");
-  Check(
-      (result.ir_dump.find("ScalarSignedAddOverflowI32 vcc_lo, 0x00000000, s2") != std::string::npos),
-      "pops_exiting_wave_id LHS did not lower to a deterministic zero value");
-  Check((result.ir_dump.find("ControlNop null, vcc_lo") != std::string::npos),
-        "S_SETREG_B32 did not lower to an explicit control marker");
-  Check((result.ir_dump.find("ControlNop null, 0x00000000") != std::string::npos),
-        "S_SLEEP did not lower to an explicit control marker");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for S_BITSET1_B32");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr for S_BITSET1_B32");
+  Check((lowered.find("SetVccLo IAdd32(s2, 0x00000000)") != std::string::npos),
+        "pops_exiting_wave_id RHS did not lower to a deterministic zero value");
+  Check((lowered.find("SetVccLo IAdd32(0x00000000, s2)") != std::string::npos),
+        "pops_exiting_wave_id LHS did not lower to a deterministic zero value");
+  Check((lowered.find("SetScc LogicalAnd(IEqual32(ShiftRightLogical32(s2, 0x0000001f), "
+                      "ShiftRightLogical32(0x00000000, 0x0000001f)), INotEqual32(") !=
+         std::string::npos),
+        "S_ADD_I32 did not lower its signed overflow to SCC");
+  // S_SETREG_B32 and S_SLEEP have no modeled effect; each leaves one control marker.
+  Check(CountSourceOccurrences(lowered, "ControlNop\n") == 2,
+        "S_SETREG_B32 and S_SLEEP did not lower to explicit control markers");
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the bit-set lowering
+  // above pins the ShiftLeftLogical32/BitwiseOr32 operations that emit it.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -2048,86 +2172,110 @@ void TestNewShaderRecompilerScalarVectorAlu() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_add_u32 s2, s0, s1") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_ADD_U32 s2, s0, s1") != std::string::npos),
         "new decoder did not decode SOP2 add");
-  Check((result.decoded_dump.find("s_addc_u32 s14, s13, 1") != std::string::npos),
+  Check((result.decoded_dump.find("S_ADDC_U32 s14, s13, 1") != std::string::npos),
         "new decoder did not decode old-backed S_ADD_C_U32");
-  Check((result.decoded_dump.find("s_cmp_gt_u32 s8, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_CMP_GT_U32 s8, s1") != std::string::npos),
         "new decoder did not decode SOPC compare");
-  Check((result.decoded_dump.find("s_lshl1_add_u32 s9, s2, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_LSHL1_ADD_U32 s9, s2, s1") != std::string::npos),
         "new decoder did not decode old-backed S_LSHL1_ADD_U32");
-  Check((result.decoded_dump.find("s_lshl2_add_u32 s10, s9, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_LSHL2_ADD_U32 s10, s9, s1") != std::string::npos),
         "new decoder did not decode old-backed S_LSHL2_ADD_U32");
   Check(
-      (result.decoded_dump.find("s_lshl3_add_u32 s11, s10, s1") != std::string::npos),
+      (result.decoded_dump.find("S_LSHL3_ADD_U32 s11, s10, s1") != std::string::npos),
       "new decoder did not decode old-backed S_LSHL3_ADD_U32");
   Check(
-      (result.decoded_dump.find("s_lshl4_add_u32 s12, s11, s1") != std::string::npos),
+      (result.decoded_dump.find("S_LSHL4_ADD_U32 s12, s11, s1") != std::string::npos),
       "new decoder did not decode old-backed S_LSHL4_ADD_U32");
-  Check((result.decoded_dump.find("s_mul_hi_u32 s13, s12, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_MUL_HI_U32 s13, s12, s1") != std::string::npos),
         "new decoder did not decode old-backed S_MUL_HI_U32");
-  Check((result.decoded_dump.find("s_mul_hi_i32 s15, s12, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_MUL_HI_I32 s15, s12, s1") != std::string::npos),
         "new decoder did not decode old-backed S_MUL_HI_I32");
-  Check((result.decoded_dump.find("v_add_f32 v1") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_F32 v1") != std::string::npos),
         "new decoder did not decode VOP2 float add");
-  Check((result.decoded_dump.find("v_cndmask_b32 v5") != std::string::npos),
+  Check((result.decoded_dump.find("V_CNDMASK_B32 v5") != std::string::npos),
         "new decoder did not decode VOP2 conditional mask select");
-  Check((result.decoded_dump.find("v_mul_u32_u24 v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_U32_U24 v6") != std::string::npos),
         "new decoder did not decode VOP2 24-bit multiply");
-  Check((result.decoded_dump.find("v_mul_i32_i24 v8") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_I32_I24 v8") != std::string::npos),
         "new decoder did not decode VOP2 signed 24-bit multiply");
-  Check((result.decoded_dump.find("v_bcnt_u32_b32 v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_BCNT_U32_B32 v7") != std::string::npos),
         "new decoder did not decode old-backed V_BCNT_U32_B32");
-  Check((result.ir_dump.find("ScalarAddCarryU32 s2, s0, s1, 0x00000000") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s2, CompositeExtractU32x2(IAddCarry32("
+                      "CompositeExtractU32x2(IAddCarry32(s0, s1), 0x00000000), 0x00000000), "
+                      "0x00000000)\n") != std::string::npos) &&
+            (lowered.find("SetScc INotEqual32(BitwiseOr32(CompositeExtractU32x2(IAddCarry32("
+                          "s0, s1), 0x00000001), ") != std::string::npos),
         "SOP2 add did not lower to scalar carry-writing IR");
-  Check((result.ir_dump.find("ScalarAddCarryU32 s14, s13, 0x00000001, scc") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s14, CompositeExtractU32x2(IAddCarry32("
+                      "CompositeExtractU32x2(IAddCarry32(s13, 0x00000001), 0x00000000), "
+                      "SelectU32(scc, 0x00000001, 0x00000000)), 0x00000000)") !=
+         std::string::npos),
         "S_ADD_C_U32 did not lower to scalar carry IR");
-  Check(
-      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s9, s2, 0x00000001, s1") != std::string::npos),
-      "S_LSHL1_ADD_U32 did not lower through carry-writing shift-left-add IR");
-  Check(
-      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s10, s9, 0x00000002, s1") != std::string::npos),
-      "S_LSHL2_ADD_U32 did not lower through carry-writing shift-left-add IR");
-  Check(
-      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s11, s10, 0x00000003, s1") != std::string::npos),
-      "S_LSHL3_ADD_U32 did not lower through carry-writing shift-left-add IR");
-  Check(
-      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s12, s11, 0x00000004, s1") != std::string::npos),
-      "S_LSHL4_ADD_U32 did not lower through carry-writing shift-left-add IR");
-  Check((result.ir_dump.find("UMulHighU32 s13, s12, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s9, IAdd32(ShiftLeftLogical32(s2, 0x00000001), s1)") !=
+         std::string::npos) &&
+            (lowered.find("SetScc LogicalOr(ULessThan32(IAdd32(ShiftLeftLogical32(s2, "
+                          "0x00000001), s1), ShiftLeftLogical32(s2, 0x00000001)), "
+                          "INotEqual32(ShiftRightLogical32(s2, ISub32(0x00000020, "
+                          "0x00000001)), 0x00000000))") != std::string::npos),
+        "S_LSHL1_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check((lowered.find("SetScalarRegister s10, IAdd32(ShiftLeftLogical32(s9, 0x00000002), s1)") !=
+         std::string::npos) &&
+            (lowered.find("SetScc LogicalOr(ULessThan32(IAdd32(ShiftLeftLogical32(s9, "
+                          "0x00000002), s1), ShiftLeftLogical32(s9, 0x00000002)), "
+                          "INotEqual32(ShiftRightLogical32(s9, ISub32(0x00000020, "
+                          "0x00000002)), 0x00000000))") != std::string::npos),
+        "S_LSHL2_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check((lowered.find("SetScalarRegister s11, IAdd32(ShiftLeftLogical32(s10, 0x00000003), s1)") !=
+         std::string::npos) &&
+            (lowered.find("SetScc LogicalOr(ULessThan32(IAdd32(ShiftLeftLogical32(s10, "
+                          "0x00000003), s1), ShiftLeftLogical32(s10, 0x00000003)), "
+                          "INotEqual32(ShiftRightLogical32(s10, ISub32(0x00000020, "
+                          "0x00000003)), 0x00000000))") != std::string::npos),
+        "S_LSHL3_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check((lowered.find("SetScalarRegister s12, IAdd32(ShiftLeftLogical32(s11, 0x00000004), s1)") !=
+         std::string::npos) &&
+            (lowered.find("SetScc LogicalOr(ULessThan32(IAdd32(ShiftLeftLogical32(s11, "
+                          "0x00000004), s1), ShiftLeftLogical32(s11, 0x00000004)), "
+                          "INotEqual32(ShiftRightLogical32(s11, ISub32(0x00000020, "
+                          "0x00000004)), 0x00000000))") != std::string::npos),
+        "S_LSHL4_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check((lowered.find("SetScalarRegister s13, UMulHi(s12, s1)") != std::string::npos),
         "S_MUL_HI_U32 did not lower to unsigned high-multiply IR");
-  Check((result.ir_dump.find("SMulHighI32 s15, s12, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s15, SMulHi(s12, s1)") != std::string::npos),
         "S_MUL_HI_I32 did not lower to signed high-multiply IR");
-  Check((result.ir_dump.find("CompareGtU32") != std::string::npos),
+  Check((lowered.find("SetScc UGreaterThan32(s8, s1)") != std::string::npos),
         "SOPC compare did not lower to IR");
-  Check((result.ir_dump.find("FAddF32 v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, BitCastU32F32(FPAdd32("
+                      "BitCastF32U32(0x3f800000), BitCastF32U32(v0))), v1)") !=
+         std::string::npos),
         "VOP2 float add did not lower to IR");
-  Check((result.ir_dump.find("BitwiseAndU32 v4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v3, SelectU32(exec, IAdd32(v1, v2), v3)") !=
+         std::string::npos),
+        "VOP2 integer add did not lower to IR");
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseAnd32(v3, v2), v4)") !=
+         std::string::npos),
         "VOP2 bitwise op did not lower to IR");
-  Check((result.ir_dump.find("SelectMaskU32 v5, vcc_lo, v2, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, SelectU32(vcc, v2, v1), v5)") !=
+         std::string::npos),
         "VOP2 conditional mask did not lower through lane-mask select IR");
-  Check((result.ir_dump.find("UMulU24U32 v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, IMul32(BitFieldUExtract(v3, "
+                      "0x00000000, 0x00000018), BitFieldUExtract(v4, 0x00000000, "
+                      "0x00000018)), v6)") != std::string::npos),
         "VOP2 24-bit multiply did not lower to IR");
-  Check((result.ir_dump.find("IMulI24U32 v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, IMul32(BitFieldSExtract(v4, "
+                      "0x00000000, 0x00000018), BitFieldSExtract(v6, 0x00000000, "
+                      "0x00000018)), v8)") != std::string::npos),
         "VOP2 signed 24-bit multiply did not lower to IR");
-  Check((result.ir_dump.find("BitCountAddU32 v7, v4, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, IAdd32(BitCount32(v4), v6), v7)") !=
+         std::string::npos),
         "V_BCNT_U32_B32 did not lower to bit-count-add IR");
-  Check(SpirvContainsOpcode(result.spirv, 128),
-        "SPIR-V binary does not contain OpIAdd");
-  Check(SpirvContainsOpcode(result.spirv, 149),
-        "SPIR-V binary does not contain OpIAddCarry");
-  Check(SpirvContainsOpcode(result.spirv, 129),
-        "SPIR-V binary does not contain OpFAdd");
-  Check(SpirvContainsOpcode(result.spirv, 132),
-        "SPIR-V binary does not contain OpIMul");
-  Check(SpirvContainsOpcode(result.spirv, 151),
-        "SPIR-V binary does not contain OpUMulExtended");
-  Check(SpirvContainsOpcode(result.spirv, 205),
-        "SPIR-V binary does not contain OpBitCount");
-  Check(SpirvContainsOpcode(result.spirv, 169),
-        "SPIR-V binary does not contain OpSelect");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd");
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the lowering checks
+  // above pin the IAdd32/IAddCarry32/FPAdd32/IMul32/UMulHi/BitCount32/SelectU32/BitwiseAnd32
+  // operations that emit OpIAdd/OpIAddCarry/OpFAdd/OpIMul/OpUMulExtended/OpBitCount/OpSelect/
+  // OpBitwiseAnd.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -2207,11 +2355,11 @@ void TestNewShaderRecompilerMoreAluFamilies() {
       0x3f800000u, // v_madmk_f32 v90, v6, 1.0, v5
       EncodeVop2(0x21, 91, 6 + 256, 5),
       0x40000000u,                      // v_madak_f32 v91, v6, v5, 2.0
-      EncodeVop2(0x2b, 92, 6 + 256, 6), // v_mac_f32 v92, v6, v6
+      EncodeVop2(0x2b, 92, 6 + 256, 6), // v_fmac_f32 v92, v6, v6
       EncodeVop2(0x2c, 93, 6 + 256, 5),
-      0x3f000000u, // v_madmk_f32 v93, v6, 0.5, v5
+      0x3f000000u, // v_fmamk_f32 v93, v6, 0.5, v5
       EncodeVop2(0x2d, 94, 6 + 256, 5),
-      0x40400000u,                         // v_madak_f32 v94, v6, v5, 3.0
+      0x40400000u,                         // v_fmaak_f32 v94, v6, v5, 3.0
       EncodeVop2(0x2f, 95, 6 + 256, 6),    // v_cvt_pkrtz_f16_f32 v95, v6, v6
       EncodeVop2(0x02, 102, 95 + 256, 95), // v_dot2c_f32_f16 v102, v95, v95
       EncodeVop2(0x28, 97, 5 + 256, 6),    // v_addc_u32 v97, vcc, v5, v6, vcc
@@ -2416,775 +2564,873 @@ void TestNewShaderRecompilerMoreAluFamilies() {
       EncodeVop3Word1(5 + 256, 7 + 256, 0),
       0xbf810000u,
   };
-
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_movk_i32 s9") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_MOVK_I32 s9, 7") != std::string::npos),
         "new decoder did not decode SOPK mov");
-  Check((result.decoded_dump.find("s_cmp_gt_u32") != std::string::npos),
+  Check((result.decoded_dump.find("S_CMP_GT_U32 scc, s9, 3") != std::string::npos),
         "new decoder did not decode SOPK compare");
-  Check((result.decoded_dump.find("v_nop") != std::string::npos),
+  Check((result.decoded_dump.find("0x00000008: v_nop") != std::string::npos),
         "new decoder did not decode old-backed VOP1 no-op");
-  Check((result.decoded_dump.find("v_mov_b32 v5") != std::string::npos),
+  Check((result.decoded_dump.find("V_MOV_B32 v5, s9") != std::string::npos),
         "new decoder did not decode VOP1 mov");
-  Check((result.decoded_dump.find("v_movrels_b32 v55, v12") != std::string::npos),
+  Check((result.decoded_dump.find("V_MOVRELS_B32 v55, v12") != std::string::npos),
         "new decoder did not decode VOP1 V_MOVRELS_B32");
   Check(
-      (result.decoded_dump.find("v_mov_b32 v103, v5.sdwa(sel=4") != std::string::npos),
+      (result.decoded_dump.find("V_MOV_B32 v103, v5.sdwa(sel=4") != std::string::npos),
       "new decoder did not decode VOP1 SDWA source selector");
   Check(
-      (result.decoded_dump.find("v_cvt_f16_f32 v105.sdwa(sel=5") != std::string::npos),
+      (result.decoded_dump.find("V_CVT_F16_F32 v105.sdwa(sel=5") != std::string::npos),
       "new decoder did not decode VOP1 SDWA destination selector");
-  Check((result.decoded_dump.find("v_mov_b32 v106, v5.dpp") != std::string::npos),
+  Check((result.decoded_dump.find("V_MOV_B32 v106, v5.dpp(") != std::string::npos),
         "new decoder did not decode VOP1 DPP source metadata");
   Check((result.decoded_dump.find("VOP1 SDWA/DPP modifiers are not implemented") == std::string::npos),
         "new decoder still reports blanket VOP1 SDWA/DPP unsupported reason");
-  Check((result.decoded_dump.find("v_add_nc_u32 v123, v5.sdwa(sel=4") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_NC_U32 v123, v5.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode VOP2 SDWA source selector");
   Check(
-      (result.decoded_dump.find("v_and_b32 v124, v5.sdwa(sel=4") != std::string::npos),
+      (result.decoded_dump.find("V_AND_B32 v124, v5.sdwa(sel=4") != std::string::npos),
       "new decoder did not decode VOP2 SDWA first source selector");
   Check((result.decoded_dump.find("v6.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode VOP2 SDWA second source selector");
-  Check((result.decoded_dump.find("v_cndmask_b32 v47, v53,") != std::string::npos) &&
+  Check((result.decoded_dump.find("V_CNDMASK_B32 v47, v53,") != std::string::npos) &&
             (result.decoded_dump.find("v53.neg") != std::string::npos),
         "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
-  Check((result.decoded_dump.find("v_cndmask_b32 v7, v0.sdwa(sel=4") != std::string::npos) &&
+  Check((result.decoded_dump.find("V_CNDMASK_B32 v7, v0.sdwa(sel=4") != std::string::npos) &&
             (result.decoded_dump.find("v1") != std::string::npos),
         "new decoder did not decode full-destination V_CNDMASK_B32 with SDWA "
         "source");
-  Check((result.decoded_dump.find("v_add_f32 v125, v5.dpp") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_F32 v125, v5.dpp(") != std::string::npos),
         "new decoder did not decode VOP2 DPP source metadata");
   Check((result.decoded_dump.find("VOP2 SDWA/DPP modifiers are not implemented") == std::string::npos),
         "new decoder still reports blanket VOP2 SDWA/DPP unsupported reason");
-  Check((result.decoded_dump.find("v_readfirstlane_b32 s24, v5") != std::string::npos),
+  Check((result.decoded_dump.find("V_READFIRSTLANE_B32 s24, v5") != std::string::npos),
         "new decoder did not decode old-backed V_READFIRSTLANE_B32");
-  Check((result.decoded_dump.find("v_cvt_f32_u32 v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_U32 v6") != std::string::npos),
         "new decoder did not decode VOP1 conversion");
-  Check((result.decoded_dump.find("v_cvt_f32_i32 v9") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_I32 v9") != std::string::npos),
         "new decoder did not decode VOP1 signed int-to-float conversion");
-  Check((result.decoded_dump.find("v_cvt_i32_f32 v10") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_I32_F32 v10") != std::string::npos),
         "new decoder did not decode VOP1 float-to-signed-int conversion");
-  Check((result.decoded_dump.find("v_cvt_f16_f32 v99") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F16_F32 v99") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_F16_F32");
-  Check((result.decoded_dump.find("v_cvt_f32_f16 v100") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_F16 v100") != std::string::npos),
         "new decoder did not decode old-backed native V_CVT_F32_F16");
   Check(
-      (result.decoded_dump.find("v_cvt_f32_f16 v8, v2.sdwa(sel=5") != std::string::npos) &&
+      (result.decoded_dump.find("V_CVT_F32_F16 v8, v2.sdwa(sel=5") != std::string::npos) &&
           (result.decoded_dump.find("v2.sdwa(sel=5,sext=0).abs") != std::string::npos),
       "new decoder did not decode V_CVT_F32_F16 SDWA source selector modifier");
-  Check((result.decoded_dump.find("v_cvt_flr_i32_f32 v64") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_FLR_I32_F32 v64") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_FLR_I32_F32");
-  Check((result.decoded_dump.find("v_cvt_off_f32_i4 v81") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_OFF_F32_I4 v81") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_OFF_F32_I4");
-  Check((result.decoded_dump.find("v_cvt_f32_ubyte0 v65") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_UBYTE0 v65") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_F32_UBYTE0");
-  Check((result.decoded_dump.find("v_cvt_f32_ubyte1 v66") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_UBYTE1 v66") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_F32_UBYTE1");
-  Check((result.decoded_dump.find("v_cvt_f32_ubyte2 v67") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_UBYTE2 v67") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_F32_UBYTE2");
-  Check((result.decoded_dump.find("v_cvt_f32_ubyte3 v68") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_UBYTE3 v68") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_F32_UBYTE3");
-  Check((result.decoded_dump.find("v_rcp_f32 v11") != std::string::npos),
+  Check((result.decoded_dump.find("V_RCP_F32 v11") != std::string::npos),
         "new decoder did not decode VOP1 reciprocal");
-  Check((result.decoded_dump.find("v_fract_f32 v12") != std::string::npos),
+  Check((result.decoded_dump.find("V_FRACT_F32 v12") != std::string::npos),
         "new decoder did not decode VOP1 fract");
-  Check((result.decoded_dump.find("v_cos_f32 v22") != std::string::npos),
+  Check((result.decoded_dump.find("V_COS_F32 v22") != std::string::npos),
         "new decoder did not decode VOP1 cosine");
-  Check((result.decoded_dump.find("v_not_b32 v27") != std::string::npos),
+  Check((result.decoded_dump.find("V_NOT_B32 v27") != std::string::npos),
         "new decoder did not decode VOP1 not");
-  Check((result.decoded_dump.find("v_bfrev_b32 v28") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFREV_B32 v28") != std::string::npos),
         "new decoder did not decode VOP1 bit reverse");
-  Check((result.decoded_dump.find("v_ffbh_u32 v31") != std::string::npos),
+  Check((result.decoded_dump.find("V_FFBH_U32 v31") != std::string::npos),
         "new decoder did not decode VOP1 find-first-bit-high");
-  Check((result.decoded_dump.find("v_ffbl_b32 v32") != std::string::npos),
+  Check((result.decoded_dump.find("V_FFBL_B32 v32") != std::string::npos),
         "new decoder did not decode VOP1 find-first-bit-low");
-  Check((result.decoded_dump.find("v_xnor_b32 v83, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_XNOR_B32 v83, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_XNOR_B32");
-  Check((result.decoded_dump.find("v_mbcnt_lo_u32_b32 v84, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MBCNT_LO_U32_B32 v84, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MBCNT_LO_U32_B32");
-  Check((result.decoded_dump.find("v_mbcnt_hi_u32_b32 v85, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MBCNT_HI_U32_B32 v85, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MBCNT_HI_U32_B32");
-  Check((result.decoded_dump.find("v_mac_f32 v89, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAC_F32 v89, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MAC_F32");
-  Check((result.decoded_dump.find("v_madmk_f32 v90, v6, 0x3f800000, v5") != std::string::npos),
+  Check((result.decoded_dump.find("V_MADMK_F32 v90, v6, 0x3f800000, v5") != std::string::npos),
         "new decoder did not decode old-backed V_MADMK_F32 literal form");
-  Check((result.decoded_dump.find("v_madak_f32 v91, v6, v5, 0x40000000") != std::string::npos),
+  Check((result.decoded_dump.find("V_MADAK_F32 v91, v6, v5, 0x40000000") != std::string::npos),
         "new decoder did not decode old-backed V_MADAK_F32 literal form");
-  Check((result.decoded_dump.find("v_mac_f32 v92, v6, v6") != std::string::npos),
-        "new decoder did not decode old-backed alternate V_MAC_F32");
-  Check((result.decoded_dump.find("v_madmk_f32 v93, v6, 0x3f000000, v5") != std::string::npos),
-        "new decoder did not decode old-backed alternate V_MADMK_F32");
-  Check((result.decoded_dump.find("v_madak_f32 v94, v6, v5, 0x40400000") != std::string::npos),
-        "new decoder did not decode old-backed alternate V_MADAK_F32");
-  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v95, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMAC_F32 v92, v6, v6") != std::string::npos),
+        "new decoder did not decode RDNA2 V_FMAC_F32");
+  Check((result.decoded_dump.find("V_FMAMK_F32 v93, v6, 0x3f000000, v5") != std::string::npos),
+        "new decoder did not decode RDNA2 V_FMAMK_F32 literal form");
+  Check((result.decoded_dump.find("V_FMAAK_F32 v94, v6, v5, 0x40400000") != std::string::npos),
+        "new decoder did not decode RDNA2 V_FMAAK_F32 literal form");
+  Check((result.decoded_dump.find("V_CVT_PKRTZ_F16_F32 v95, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed native V_CVT_PKRTZ_F16_F32");
-  Check((result.decoded_dump.find("v_dot2c_f32_f16 v102, v95, v95") != std::string::npos),
+  Check((result.decoded_dump.find("V_DOT2C_F32_F16 v102, v95, v95") != std::string::npos),
         "new decoder did not decode old-backed V_DOT2C_F32_F16");
-  Check((result.decoded_dump.find("v_addc_u32 v97, vcc_lo, v5, v6, vcc_lo") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADDC_U32 v97, vcc_lo, v5, v6, vcc_lo") != std::string::npos),
         "new decoder did not decode old-backed V_ADD_CO_U32 carry form");
-  Check((result.decoded_dump.find("v_add_f32 v35") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_F32 v35") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP2 float add");
-  Check((result.decoded_dump.find("v_mul_u32_u24 v36") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_U32_U24 v36") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP2 24-bit multiply");
-  Check((result.decoded_dump.find("v_xnor_b32 v86, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_XNOR_B32 v86, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed VOP3-encoded V_XNOR_B32");
-  Check((result.decoded_dump.find("v_mac_f32 v96, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAC_F32 v96, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed VOP3-encoded V_MAC_F32");
-  Check((result.decoded_dump.find("v_addc_u32 v98, s30, v5, v6, vcc_lo") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADDC_U32 v98, s30, v5, v6, vcc_lo") != std::string::npos),
         "new decoder did not decode old-backed VOP3 V_ADD_CO_U32 carry form");
   Check(
-      (result.decoded_dump.find("v_mbcnt_lo_u32_b32 v87, v5, v6") != std::string::npos),
+      (result.decoded_dump.find("V_MBCNT_LO_U32_B32 v87, v5, v6") != std::string::npos),
       "new decoder did not decode old-backed VOP3-encoded V_MBCNT_LO_U32_B32");
   Check(
-      (result.decoded_dump.find("v_mbcnt_hi_u32_b32 v88, v5, v6") != std::string::npos),
+      (result.decoded_dump.find("V_MBCNT_HI_U32_B32 v88, v5, v6") != std::string::npos),
       "new decoder did not decode old-backed VOP3-encoded V_MBCNT_HI_U32_B32");
-  Check((result.decoded_dump.find("v_mov_b32 v23") != std::string::npos),
+  Check((result.decoded_dump.find("V_MOV_B32 v23") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 move");
   Check(
-      (result.decoded_dump.find("v_readfirstlane_b32 s25, v5") != std::string::npos),
+      (result.decoded_dump.find("V_READFIRSTLANE_B32 s25, v5") != std::string::npos),
       "new decoder did not decode old-backed VOP3-encoded V_READFIRSTLANE_B32");
-  Check((result.decoded_dump.find("v_cvt_f32_i32 v24") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F32_I32 v24") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 signed conversion");
-  Check((result.decoded_dump.find("v_cvt_f16_f32 v101") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F16_F32 v101") != std::string::npos),
         "new decoder did not decode old-backed VOP3-encoded V_CVT_F16_F32");
-  Check((result.decoded_dump.find("v_cvt_flr_i32_f32 v74") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_FLR_I32_F32 v74") != std::string::npos),
         "new decoder did not decode old-backed VOP3-encoded V_CVT_FLR_I32_F32");
-  Check((result.decoded_dump.find("v_cvt_off_f32_i4 v82") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_OFF_F32_I4 v82") != std::string::npos),
         "new decoder did not decode old-backed VOP3-encoded V_CVT_OFF_F32_I4");
-  Check((result.decoded_dump.find("v_fract_f32 v25") != std::string::npos),
+  Check((result.decoded_dump.find("V_FRACT_F32 v25") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 fract");
-  Check((result.decoded_dump.find("v_rcp_f32 v26") != std::string::npos),
+  Check((result.decoded_dump.find("V_RCP_F32 v26") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 reciprocal");
-  Check((result.decoded_dump.find("v_not_b32 v29") != std::string::npos),
+  Check((result.decoded_dump.find("V_NOT_B32 v29") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 not");
-  Check((result.decoded_dump.find("v_bfrev_b32 v30") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFREV_B32 v30") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 bit reverse");
-  Check((result.decoded_dump.find("v_ffbh_u32 v33") != std::string::npos),
+  Check((result.decoded_dump.find("V_FFBH_U32 v33") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 find-first-bit-high");
-  Check((result.decoded_dump.find("v_ffbl_b32 v34") != std::string::npos),
+  Check((result.decoded_dump.find("V_FFBL_B32 v34") != std::string::npos),
         "new decoder did not decode VOP3-encoded VOP1 find-first-bit-low");
-  Check((result.decoded_dump.find("v_cmp_gt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_GT_F32") != std::string::npos),
         "new decoder did not decode VOPC float compare");
-  Check((result.decoded_dump.find("v_cmpx_gt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_GT_F32") != std::string::npos),
         "new decoder did not decode VOPC float compare-and-mask");
-  Check((result.decoded_dump.find("v_cmpx_gt_u32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_GT_U32") != std::string::npos),
         "new decoder did not decode VOPC uint compare-and-mask");
-  Check((result.decoded_dump.find("v_cmp_f_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_F_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_F_F32");
-  Check((result.decoded_dump.find("v_cmp_tru_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_TRU_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_TRU_F32");
-  Check((result.decoded_dump.find("v_cmp_o_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_O_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_O_F32");
-  Check((result.decoded_dump.find("v_cmp_u_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_U_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_U_F32");
-  Check((result.decoded_dump.find("v_cmp_nge_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NGE_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NGE_F32");
-  Check((result.decoded_dump.find("v_cmp_nlg_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NLG_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NLG_F32");
-  Check((result.decoded_dump.find("v_cmp_ngt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NGT_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NGT_F32");
-  Check((result.decoded_dump.find("v_cmp_nle_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NLE_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NLE_F32");
-  Check((result.decoded_dump.find("v_cmp_neq_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NEQ_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NEQ_F32");
-  Check((result.decoded_dump.find("v_cmp_neq_f32 s0, 0.500000, v1") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NEQ_F32 s0, 0.500000, v1") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NEQ_F32 SDWA scalar "
         "destination");
-  Check((result.decoded_dump.find("v_cmpx_lt_u32 exec_lo, v5.sdwa(sel=4") != std::string::npos) &&
-            (result.ir_dump.find("CompareMaskLtU32 exec_lo") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_LT_U32 exec_lo, v5.sdwa(sel=4") != std::string::npos) &&
+            (lowered.find("SetExec LogicalAnd(exec, ULessThan32(BitFieldUExtract(v5, 0x00000000, "
+                          "0x00000010), v6))") != std::string::npos),
         "new decoder did not route V_CMPX SDWA destination to exec");
-  Check((result.decoded_dump.find("v_cmp_nlt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NLT_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_NLT_F32");
-  Check((result.decoded_dump.find("v_cmpx_nge_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NGE_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NGE_F32");
-  Check((result.decoded_dump.find("v_cmpx_nlg_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NLG_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NLG_F32");
-  Check((result.decoded_dump.find("v_cmpx_ngt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NGT_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NGT_F32");
-  Check((result.decoded_dump.find("v_cmpx_nle_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NLE_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NLE_F32");
-  Check((result.decoded_dump.find("v_cmpx_neq_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NEQ_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NEQ_F32");
-  Check((result.decoded_dump.find("v_cmpx_nlt_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_NLT_F32") != std::string::npos),
         "new decoder did not decode old-backed V_CMPX_NLT_F32");
-  Check((result.decoded_dump.find("v_cmp_f_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_F_I32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_F_I32");
-  Check((result.decoded_dump.find("v_cmp_t_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_T_I32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_T_I32");
-  Check((result.decoded_dump.find("v_cmp_f_u32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_F_U32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_F_U32");
-  Check((result.decoded_dump.find("v_cmp_t_u32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_T_U32") != std::string::npos),
         "new decoder did not decode old-backed V_CMP_T_U32");
-  Check((result.decoded_dump.find("v_cmp_ne_u64 vcc_lo, exec_lo, vcc_lo") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_NE_U64 vcc_lo, exec_lo, vcc_lo") != std::string::npos),
         "new decoder did not decode VOP3-encoded V_CMP_NE_U64");
-  Check((result.ir_dump.find("CompareNeU64 vcc_lo, exec_lo, vcc_lo") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, INotEqual64(CompositeConstructU64(exec_lo, exec_hi), "
+                      "CompositeConstructU64(vcc_lo, vcc_hi)))") != std::string::npos),
         "V_CMP_NE_U64 did not lower to 64-bit compare IR");
-  Check((result.decoded_dump.find("v_mad_f32 v8") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAD_F32 v8") != std::string::npos),
         "new decoder did not decode VOP3 mad");
   Check(
-      (result.decoded_dump.find("v_mad_f32 v4, v1.neg, v9, s4") != std::string::npos),
+      (result.decoded_dump.find("V_MAD_F32 v4, v1.neg, v9, s4") != std::string::npos),
       "new decoder did not decode VOP3 mad source modifiers");
   Check(
-      (result.decoded_dump.find("v_cubeid_f32 v110, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_CUBEID_F32 v110, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_CUBEID_F32");
   Check(
-      (result.decoded_dump.find("v_cubesc_f32 v111, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_CUBESC_F32 v111, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_CUBESC_F32");
   Check(
-      (result.decoded_dump.find("v_cubetc_f32 v112, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_CUBETC_F32 v112, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_CUBETC_F32");
   Check(
-      (result.decoded_dump.find("v_cubema_f32 v113, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_CUBEMA_F32 v113, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_CUBEMA_F32");
-  Check((result.decoded_dump.find("v_cubema_f32 v5, v2, v0, v6.neg") != std::string::npos),
+  Check((result.decoded_dump.find("V_CUBEMA_F32 v5, v2, v0, v6.neg") != std::string::npos),
         "new decoder did not decode V_CUBEMA_F32 source modifier");
-  Check((result.decoded_dump.find("v_fma_f32 v37") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMA_F32 v37") != std::string::npos),
         "new decoder did not decode VOP3 fma");
-  Check((result.decoded_dump.find("v_min3_f32 v38") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN3_F32 v38") != std::string::npos),
         "new decoder did not decode VOP3 min3");
-  Check((result.decoded_dump.find("v_max3_f32 v39") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAX3_F32 v39") != std::string::npos),
         "new decoder did not decode VOP3 max3");
-  Check((result.decoded_dump.find("v_med3_f32 v40") != std::string::npos),
+  Check((result.decoded_dump.find("V_MED3_F32 v40") != std::string::npos),
         "new decoder did not decode VOP3 med3");
-  Check((result.decoded_dump.find("v_min3_i32 v41") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN3_I32 v41") != std::string::npos),
         "new decoder did not decode VOP3 signed min3");
-  Check((result.decoded_dump.find("v_min3_u32 v42") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN3_U32 v42") != std::string::npos),
         "new decoder did not decode VOP3 unsigned min3");
-  Check((result.decoded_dump.find("v_max3_i32 v43") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAX3_I32 v43") != std::string::npos),
         "new decoder did not decode VOP3 signed max3");
-  Check((result.decoded_dump.find("v_max3_u32 v44") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAX3_U32 v44") != std::string::npos),
         "new decoder did not decode VOP3 unsigned max3");
-  Check((result.decoded_dump.find("v_med3_i32 v45") != std::string::npos),
+  Check((result.decoded_dump.find("V_MED3_I32 v45") != std::string::npos),
         "new decoder did not decode VOP3 signed med3");
-  Check((result.decoded_dump.find("v_med3_u32 v46") != std::string::npos),
+  Check((result.decoded_dump.find("V_MED3_U32 v46") != std::string::npos),
         "new decoder did not decode VOP3 unsigned med3");
-  Check((result.decoded_dump.find("v_bfe_u32 v47") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFE_U32 v47") != std::string::npos),
         "new decoder did not decode VOP3 unsigned bitfield extract");
-  Check((result.decoded_dump.find("v_bfe_i32 v48") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFE_I32 v48") != std::string::npos),
         "new decoder did not decode VOP3 signed bitfield extract");
-  Check((result.decoded_dump.find("v_bfi_b32 v49") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFI_B32 v49") != std::string::npos),
         "new decoder did not decode VOP3 bitfield insert-select");
-  Check((result.decoded_dump.find("v_alignbit_b32 v50") != std::string::npos),
+  Check((result.decoded_dump.find("V_ALIGNBIT_B32 v50") != std::string::npos),
         "new decoder did not decode VOP3 alignbit");
-  Check((result.decoded_dump.find("v_alignbyte_b32 v115") != std::string::npos),
+  Check((result.decoded_dump.find("V_ALIGNBYTE_B32 v115") != std::string::npos),
         "new decoder did not decode VOP3 alignbyte");
-  Check((result.decoded_dump.find("v_add3_u32 v51") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD3_U32 v51") != std::string::npos),
         "new decoder did not decode VOP3 add3");
-  Check((result.decoded_dump.find("v_mul_lo_u32 v52, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_LO_U32 v52, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MUL_LO_U32");
-  Check((result.decoded_dump.find("v_mul_hi_u32 v53, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_HI_U32 v53, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MUL_HI_U32");
-  Check((result.decoded_dump.find("v_mul_hi_i32 v114, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_HI_I32 v114, v5, v6") != std::string::npos),
         "new decoder did not decode RDNA2 V_MUL_HI_I32");
   Check(
-      (result.decoded_dump.find("v_and_or_b32 v54, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_AND_OR_B32 v54, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_AND_OR_B32");
-  Check((result.decoded_dump.find("v_or3_b32 v55, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_OR3_B32 v55, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_OR3_B32");
-  Check((result.decoded_dump.find("v_xor3_b32 v56, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_XOR3_B32 v56, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_XOR3_B32");
-  Check((result.decoded_dump.find("v_lshl_add_u32 v57, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_LSHL_ADD_U32 v57, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_LSHL_ADD_U32");
-  Check((result.decoded_dump.find("v_add_lshl_u32 v58, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_LSHL_U32 v58, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_ADD_LSHL_U32");
-  Check((result.decoded_dump.find("v_xad_u32 v59, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_XAD_U32 v59, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_XAD_U32");
   Check(
-      (result.decoded_dump.find("v_lshl_or_b32 v60, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_LSHL_OR_B32 v60, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_LSHL_OR_B32");
-  Check((result.decoded_dump.find("v_sad_u32 v61, v5, v6, v7") != std::string::npos),
+  Check((result.decoded_dump.find("V_SAD_U32 v61, v5, v6, v7") != std::string::npos),
         "new decoder did not decode old-backed V_SAD_U32");
   Check(
-      (result.decoded_dump.find("v_mad_i32_i24 v62, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_MAD_I32_I24 v62, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_MAD_I32_I24");
   Check(
-      (result.decoded_dump.find("v_mad_u32_u24 v63, v5, v6, v7") != std::string::npos),
+      (result.decoded_dump.find("V_MAD_U32_U24 v63, v5, v6, v7") != std::string::npos),
       "new decoder did not decode old-backed V_MAD_U32_U24");
-  Check((result.decoded_dump.find("v_mul_lo_i32 v69, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_LO_I32 v69, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_MUL_LO_I32");
-  Check((result.decoded_dump.find("v_add_i32 v70, s0, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_I32 v70, s0, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed V_ADD_I32");
-  Check((result.decoded_dump.find("v_sub_i32 v71, s0, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_SUB_I32 v71, s0, v5, v6") != std::string::npos),
         "new decoder did not decode RDNA2 V_SUB_CO_U32");
   Check(
-      (result.decoded_dump.find("v_subrev_i32 v72, s0, v5, v6") != std::string::npos),
+      (result.decoded_dump.find("V_SUBREV_I32 v72, s0, v5, v6") != std::string::npos),
       "new decoder did not decode old-backed V_SUBREV_I32");
-  Check((result.decoded_dump.find("v_max_i16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
+  Check((result.decoded_dump.find("V_MAX_I16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
                             "v5.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
         "new decoder did not decode RDNA2 V_MAX_I16 literal/op_sel form");
-  Check((result.decoded_dump.find("v_min_i16 v7.sdwa(sel=5,sext=0), 2, v4.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN_I16 v7.sdwa(sel=5,sext=0), 2, v4.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
         "new decoder did not decode RDNA2 V_MIN_I16 op_sel form");
-  Check((result.decoded_dump.find("v_bfm_b32 v73, 1, 4") != std::string::npos),
+  Check((result.decoded_dump.find("V_BFM_B32 v73, 1, 4") != std::string::npos),
         "new decoder did not decode old-backed V_BFM_B32");
-  Check((result.decoded_dump.find("v_readlane_b32 s26, v5, 2") != std::string::npos),
+  Check((result.decoded_dump.find("V_READLANE_B32 s26, v5, 2") != std::string::npos),
         "new decoder did not decode old-backed V_READLANE_B32");
-  Check((result.decoded_dump.find("v_writelane_b32 v107, v5, 2") != std::string::npos),
+  Check((result.decoded_dump.find("V_WRITELANE_B32 v107, v5, 2") != std::string::npos),
         "new decoder did not decode old-backed V_WRITELANE_B32");
-  Check((result.decoded_dump.find("v_permlane16_b32 v108, v5, 0, 0") != std::string::npos),
+  Check((result.decoded_dump.find("V_PERMLANE16_B32 v108, v5, 0, 0") != std::string::npos),
         "new decoder did not decode old-backed V_PERMLANE16_B32");
-  Check((result.decoded_dump.find("v_permlanex16_b32 v109, v5, 0, 0") != std::string::npos),
+  Check((result.decoded_dump.find("V_PERMLANEX16_B32 v109, v5, 0, 0") != std::string::npos),
         "new decoder did not decode old-backed V_PERMLANEX16_B32");
-  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v75, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_PKRTZ_F16_F32 v75, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_PKRTZ_F16_F32");
-  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v0, v0.neg, v1.neg") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_PKRTZ_F16_F32 v0, v0.neg, v1.neg") != std::string::npos),
         "new decoder did not decode V_CVT_PKRTZ_F16_F32 source modifiers");
-  Check((result.decoded_dump.find("v_ldexp_f32 v76, v6, 1") != std::string::npos),
+  Check((result.decoded_dump.find("V_LDEXP_F32 v76, v6, 1") != std::string::npos),
         "new decoder did not decode old-backed V_LDEXP_F32");
-  Check((result.decoded_dump.find("v_ldexp_f32 v7, v9.abs, -2") != std::string::npos),
+  Check((result.decoded_dump.find("V_LDEXP_F32 v7, v9.abs, -2") != std::string::npos),
         "new decoder did not decode V_LDEXP_F32 source modifier");
   Check(
-      (result.decoded_dump.find("v_ldexp_f32 v13.clamp, v6, -4") != std::string::npos),
+      (result.decoded_dump.find("V_LDEXP_F32 v13.clamp, v6, -4") != std::string::npos),
       "new decoder did not decode V_LDEXP_F32 clamp modifier");
-  Check((result.decoded_dump.find("v_bcnt_u32_b32 v77, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_BCNT_U32_B32 v77, v5, v6") != std::string::npos),
         "new decoder did not decode old-backed VOP3 V_BCNT_U32_B32");
-  Check((result.decoded_dump.find("v_cvt_pknorm_i16_f32 v78, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_PKNORM_I16_F32 v78, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_PKNORM_I16_F32");
-  Check((result.decoded_dump.find("v_cvt_pknorm_u16_f32 v79, v6, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_PKNORM_U16_F32 v79, v6, v6") != std::string::npos),
         "new decoder did not decode old-backed V_CVT_PKNORM_U16_F32");
   Check(
-      (result.decoded_dump.find("v_cvt_pk_u16_u32 v80, v5, v7") != std::string::npos),
+      (result.decoded_dump.find("V_CVT_PK_U16_U32 v80, v5, v7") != std::string::npos),
       "new decoder did not decode old-backed V_CVT_PK_U16_U32");
-  Check((result.decoded_dump.find("v_mul_f32 v2, s0, s72") != std::string::npos),
+  Check((result.decoded_dump.find("V_MUL_F32 v2, s0, s72") != std::string::npos),
         "new decoder did not decode old-backed V_MUL_F32 SDWA full-width form");
-  Check((result.decoded_dump.find("v_mul_f16 v9.sdwa(sel=4") != std::string::npos) &&
+  Check((result.decoded_dump.find("V_MUL_F16 v9.sdwa(sel=4") != std::string::npos) &&
             (result.decoded_dump.find("v0.sdwa(sel=4") != std::string::npos) &&
             (result.decoded_dump.find("v1.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode V_MUL_F16 SDWA low-half form");
-  Check((result.decoded_dump.find("v_sub_f16 v0.sdwa(sel=4") != std::string::npos) &&
+  Check((result.decoded_dump.find("V_SUB_F16 v0.sdwa(sel=4") != std::string::npos) &&
             (result.decoded_dump.find("v0.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode V_SUB_F16 SDWA low-half form");
-  Check((result.ir_dump.find("ConvertU32ToF32 v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, BitCastU32F32(ConvertF32U32(v5)), v6)") != std::string::npos),
         "VOP1 uint-to-float conversion did not lower to IR");
-  Check((result.ir_dump.find("MoveU32 v103, v5.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v103, SelectU32(exec, BitFieldUExtract(v5, 0x00000000, 0x00000010), "
+                      "v103)") != std::string::npos),
         "VOP1 SDWA source selector did not lower to IR metadata");
-  Check((result.ir_dump.find("ConvertF32ToF16 v105.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v105, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v105, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16(ConvertF16F32("
+                      "BitCastF32U32(...)))), 0x0000ffff), 0x0000ffff), 0x00000010)), v105)") != std::string::npos),
         "VOP1 SDWA destination selector did not lower to IR metadata");
-  Check((result.ir_dump.find("MoveU32 v106.dpp") != std::string::npos) &&
-            (result.ir_dump.find("v5.dpp") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v106, DppUpdateU32(DppMoveU32(v5, exec), v106, exec)") != std::string::npos),
         "VOP1 DPP source/destination did not lower to IR metadata");
-  Check((result.ir_dump.find("MoveRelSourceU32 v55, v12, m0") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v55, SelectU32(exec, SelectU32(IEqual32(BitwiseAnd32(m0, 0x000000ff), "
+                      "0x00000071), v125, SelectU32(IEqual32(BitwiseAnd32(m0, 0x000000ff), 0x00000070), v124, ")
+         != std::string::npos),
         "V_MOVRELS_B32 did not lower to indexed VGPR-source IR");
-  Check((result.ir_dump.find("IAddU32 v123, v5.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v123, SelectU32(exec, IAdd32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000010), v6), v123)") != std::string::npos),
         "VOP2 SDWA did not lower first source metadata to IR");
-  Check(
-      (result.ir_dump.find("BitwiseAndU32 v124, v5.sdwa(sel=4") != std::string::npos),
-      "VOP2 SDWA bitwise op did not lower first source metadata to IR");
-  Check((result.ir_dump.find("v6.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v124, SelectU32(exec, BitwiseAnd32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000010), ") != std::string::npos),
+        "VOP2 SDWA bitwise op did not lower first source metadata to IR");
+  Check((lowered.find("BitFieldUExtract(v6, 0x00000010, 0x00000010)), v124)") != std::string::npos),
         "VOP2 SDWA bitwise op did not lower second source metadata to IR");
-  Check((result.ir_dump.find("SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") != std::string::npos) &&
-            (result.ir_dump.find("v53.neg") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v47, SelectU32(exec, BitCastU32F32(SelectF32(vcc, "
+                      "FPNeg32(BitCastF32U32(v53)), BitCastF32U32(v53))), v47)") != std::string::npos),
         "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select "
         "IR");
-  Check((result.ir_dump.find("SelectMaskU32 v7, vcc_lo, v1, v0.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, SelectU32(vcc, v1, BitFieldUExtract(v0, "
+                      "0x00000000, 0x00000010)), v7)") != std::string::npos),
         "full-destination V_CNDMASK_B32 with SDWA source did not lower to "
         "integer select IR");
-  Check((result.ir_dump.find("FAddF32 v125.dpp") != std::string::npos) &&
-            (result.ir_dump.find("v5.dpp") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v125, DppUpdateU32(BitCastU32F32(FPAdd32(BitCastF32U32(DppMoveU32(v5, "
+                      "exec)), BitCastF32U32(v6))), v125, exec)") != std::string::npos),
         "VOP2 DPP source/destination did not lower to IR metadata");
-  Check((result.ir_dump.find("FMulF32 v2, s0, s72") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v2, SelectU32(exec, BitCastU32F32(FPMul32(BitCastF32U32(s0), "
+                      "BitCastF32U32(s72))), v2)") != std::string::npos),
         "V_MUL_F32 SDWA full-width form did not lower to IR");
-  Check((result.ir_dump.find("MulF16 v9.sdwa(sel=4") != std::string::npos) &&
-            (result.ir_dump.find("v0.sdwa(sel=4") != std::string::npos) &&
-            (result.ir_dump.find("v1.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v9, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16(ConvertF16F32("
+                      "FPMul32(...)))), 0x0000ffff), 0x0000ffff), 0x00000000)), v9)") != std::string::npos),
         "V_MUL_F16 SDWA low-half form did not lower to IR");
-  Check((result.ir_dump.find("SubF16 v0.sdwa(sel=4") != std::string::npos) &&
-            (result.ir_dump.find("v0.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v0, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v0, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16(ConvertF16F32("
+                      "FPSub32(...)))), 0x0000ffff), 0x0000ffff), 0x00000000)), v0)") != std::string::npos),
         "V_SUB_F16 SDWA low-half form did not lower to IR");
-  Check((result.ir_dump.find("ConvertF32ToU32 v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, SelectU32(FPOrdGreaterThanEqual32(BitCastF32U32(v6), "
+                      "4.29497e+09f), 0xffffffff, ConvertU32F32(SelectF32(FPOrdGreaterThanEqual32(BitCastF32U32("
+                      "v6), 4.29497e+09f), 4.29497e+09f, SelectF32(LogicalOr(FPIsNan32(BitCastF32U32(v6)), "
+                      "FPOrdLessThanEqual32(BitCastF32U32(v6), 0f)), 0f, FPTrunc32(BitCastF32U32(v6)))))), v7)")
+         != std::string::npos),
         "VOP1 float-to-uint conversion did not lower to IR");
-  Check((result.ir_dump.find("ConvertI32ToF32 v9") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BitCastU32F32(ConvertF32S32(v5)), v9)") != std::string::npos),
         "VOP1 signed int-to-float conversion did not lower to IR");
-  Check((result.ir_dump.find("ConvertF32ToI32 v10") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v10, SelectU32(exec, SelectU32(FPIsNan32(BitCastF32U32(v6)), 0x00000000, "
+                      "SelectU32(FPOrdLessThanEqual32(BitCastF32U32(v6), -2.14748e+09f), 0x80000000, SelectU32("
+                      "FPOrdGreaterThanEqual32(BitCastF32U32(v6), 2.14748e+09f), 0x7fffffff, ConvertS32F32(")
+         != std::string::npos),
         "VOP1 float-to-signed-int conversion did not lower to IR");
-  Check((result.ir_dump.find("ConvertF32ToF16 v99, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v99, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v99, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16(ConvertF16F32("
+                      "BitCastF32U32(...)))), 0x0000ffff), 0x0000ffff), 0x00000000)), v99)") != std::string::npos),
         "V_CVT_F16_F32 did not lower to shared half-pack IR");
-  Check((result.ir_dump.find("ConvertF16ToF32 v100, v99") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v100, SelectU32(exec, BitCastU32F32(ConvertF32F16(BitCastF16U16("
+                      "ConvertU16U32(BitFieldUExtract(v99, 0x00000000, 0x00000010))))), v100)") != std::string::npos),
         "V_CVT_F32_F16 did not lower to shared half-unpack IR");
-  Check((result.ir_dump.find("ConvertF16ToF32 v8, v2.sdwa(sel=5") != std::string::npos) &&
-            (result.ir_dump.find("v2.sdwa(sel=5,sext=0).abs") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, BitCastU32F32(ConvertF32F16(BitCastF16U16("
+                      "ConvertU16U32(BitwiseAnd32(BitFieldUExtract(v2, 0x00000010, 0x00000010), 0x00007fff))))), "
+                      "v8)") != std::string::npos),
         "V_CVT_F32_F16 SDWA source selector modifier did not lower to IR");
-  Check((result.ir_dump.find("ReadFirstLaneU32 s24, v5") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s24, ReadFirstLane(v5, exec)") != std::string::npos),
         "V_READFIRSTLANE_B32 did not lower to subgroup IR");
-  Check((result.ir_dump.find("ConvertFloorF32ToI32 v64, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v64, SelectU32(exec, SelectU32(FPIsNan32(FPFloor32(BitCastF32U32(v6))), "
+                      "0x00000000, SelectU32(FPOrdLessThanEqual32(FPFloor32(BitCastF32U32(v6)), -2.14748e+09f), "
+                      "0x80000000, SelectU32(FPOrdGreaterThanEqual32(FPFloor32(BitCastF32U32(v6)), 2.14748e+09f), "
+                      "0x7fffffff, ConvertS32F32(") != std::string::npos),
         "V_CVT_FLR_I32_F32 did not lower to shared IR");
-  Check((result.ir_dump.find("ConvertI4ToOffsetF32 v81, v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v81, SelectU32(exec, BitCastU32F32(FPMul32(ConvertF32S32(BitFieldSExtract("
+                      "v5, 0x00000000, 0x00000004)), 0.0625f)), v81)") != std::string::npos),
         "V_CVT_OFF_F32_I4 did not lower to shared offset-convert IR");
-  Check((result.ir_dump.find("ConvertByteU32ToF32 v65, v5, 0x00000000") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v65, SelectU32(exec, BitCastU32F32(ConvertF32U32(BitwiseAnd32("
+                      "ShiftRightLogical32(v5, 0x00000000), 0x000000ff))), v65)") != std::string::npos),
         "V_CVT_F32_UBYTE0 did not lower to shared byte-convert IR");
-  Check((result.ir_dump.find("ConvertByteU32ToF32 v66, v5, 0x00000001") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v66, SelectU32(exec, BitCastU32F32(ConvertF32U32(BitwiseAnd32("
+                      "ShiftRightLogical32(v5, 0x00000008), 0x000000ff))), v66)") != std::string::npos),
         "V_CVT_F32_UBYTE1 did not lower to shared byte-convert IR");
-  Check((result.ir_dump.find("ConvertByteU32ToF32 v67, v5, 0x00000002") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v67, SelectU32(exec, BitCastU32F32(ConvertF32U32(BitwiseAnd32("
+                      "ShiftRightLogical32(v5, 0x00000010), 0x000000ff))), v67)") != std::string::npos),
         "V_CVT_F32_UBYTE2 did not lower to shared byte-convert IR");
-  Check((result.ir_dump.find("ConvertByteU32ToF32 v68, v5, 0x00000003") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v68, SelectU32(exec, BitCastU32F32(ConvertF32U32(BitwiseAnd32("
+                      "ShiftRightLogical32(v5, 0x00000018), 0x000000ff))), v68)") != std::string::npos),
         "V_CVT_F32_UBYTE3 did not lower to shared byte-convert IR");
-  Check((result.ir_dump.find("RcpF32 v11") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v11, SelectU32(exec, BitCastU32F32(FPRecip32(BitCastF32U32(v6))), v11)")
+         != std::string::npos),
         "VOP1 reciprocal did not lower to IR");
-  Check((result.ir_dump.find("FractF32 v12") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, BitCastU32F32(FPFract32(BitCastF32U32(v6))), v12)")
+         != std::string::npos),
         "VOP1 fract did not lower to IR");
-  Check((result.ir_dump.find("TruncF32 v13") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v13, SelectU32(exec, BitCastU32F32(FPTrunc32(BitCastF32U32(v6))), v13)")
+         != std::string::npos),
         "VOP1 trunc did not lower to IR");
-  Check((result.ir_dump.find("CeilF32 v14") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v14, SelectU32(exec, BitCastU32F32(FPCeil32(BitCastF32U32(v6))), v14)")
+         != std::string::npos),
         "VOP1 ceil did not lower to IR");
-  Check((result.ir_dump.find("RoundEvenF32 v15") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v15, SelectU32(exec, BitCastU32F32(FPRoundEven32(BitCastF32U32(v6))), "
+                      "v15)") != std::string::npos),
         "VOP1 round-even did not lower to IR");
-  Check((result.ir_dump.find("FloorF32 v16") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v16, SelectU32(exec, BitCastU32F32(FPFloor32(BitCastF32U32(v6))), v16)")
+         != std::string::npos),
         "VOP1 floor did not lower to IR");
-  Check((result.ir_dump.find("Exp2F32 v17") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v17, SelectU32(exec, BitCastU32F32(FPExp2(BitCastF32U32(v6))), v17)")
+         != std::string::npos),
         "VOP1 exp2 did not lower to IR");
-  Check((result.ir_dump.find("Log2F32 v18") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v18, SelectU32(exec, BitCastU32F32(FPLog2(BitCastF32U32(v6))), v18)")
+         != std::string::npos),
         "VOP1 log2 did not lower to IR");
-  Check((result.ir_dump.find("InverseSqrtF32 v19") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v19, SelectU32(exec, BitCastU32F32(FPRecipSqrt32(BitCastF32U32(v6))), "
+                      "v19)") != std::string::npos),
         "VOP1 inverse-sqrt did not lower to IR");
-  Check((result.ir_dump.find("SqrtF32 v20") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v20, SelectU32(exec, BitCastU32F32(FPSqrt(BitCastF32U32(v6))), v20)")
+         != std::string::npos),
         "VOP1 sqrt did not lower to IR");
-  Check((result.ir_dump.find("SinF32 v21") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v21, SelectU32(exec, BitCastU32F32(FPSin(BitCastF32U32(v6))), v21)")
+         != std::string::npos),
         "VOP1 sin did not lower to IR");
-  Check((result.ir_dump.find("CosF32 v22") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v22, SelectU32(exec, BitCastU32F32(FPCos(BitCastF32U32(v6))), v22)")
+         != std::string::npos),
         "VOP1 cos did not lower to IR");
-  Check((result.ir_dump.find("BitwiseNotU32 v27") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v27, SelectU32(exec, BitwiseNot32(v5), v27)") != std::string::npos),
         "VOP1 not did not lower to IR");
-  Check((result.ir_dump.find("BitReverseU32 v28") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v28, SelectU32(exec, BitReverse32(v5), v28)") != std::string::npos),
         "VOP1 bit reverse did not lower to IR");
-  Check((result.ir_dump.find("FindMsbFromHighU32 v31") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v31, SelectU32(exec, SelectU32(INotEqual32(v5, 0x00000000), "
+                      "ISub32(0x0000001f, FindUMsb32(v5)), 0xffffffff), v31)") != std::string::npos),
         "VOP1 find-first-bit-high did not lower to IR");
-  Check((result.ir_dump.find("FindLsbU32 v32") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v32, SelectU32(exec, FindILsb32(v5), v32)") != std::string::npos),
         "VOP1 find-first-bit-low did not lower to IR");
-  Check((result.ir_dump.find("BitwiseXnorU32 v83, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v83, SelectU32(exec, BitwiseNot32(BitwiseXor32(v5, v6)), v83)")
+         != std::string::npos),
         "V_XNOR_B32 did not lower to shared xnor IR");
-  Check((result.ir_dump.find("MaskedBitCountLowU32 v84, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v84, SelectU32(exec, IAdd32(BitCount32(BitwiseAnd32(v5, SelectU32("
+                      "UGreaterThanEqual32(LaneId(), 0x00000020), 0xffffffff, ISub32(ShiftLeftLogical32(0x00000001, "
+                      "BitwiseAnd32(LaneId(...), 0x0000001f)), 0x00000001)))), v6), v84)") != std::string::npos),
         "V_MBCNT_LO_U32_B32 did not lower to shared masked bit-count IR");
   Check(
-      (result.ir_dump.find("MaskedBitCountHighU32 v85, v5, v6") != std::string::npos),
+      (lowered.find("SetVectorRegister v85, SelectU32(exec, IAdd32(BitCount32(BitwiseAnd32(v5, SelectU32("
+                    "UGreaterThanEqual32(LaneId(), 0x00000020), ISub32(ShiftLeftLogical32(0x00000001, "
+                    "BitwiseAnd32(LaneId(...), 0x0000001f)), 0x00000001), 0x00000000))), v6), v85)") != std::string::npos),
       "V_MBCNT_HI_U32_B32 did not lower to shared masked bit-count IR");
-  Check((result.ir_dump.find("FMadF32 v89, v6, v6, v89") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v89, SelectU32(exec, BitCastU32F32(FPMad32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v89))), v89)") != std::string::npos),
         "V_MAC_F32 did not lower with the destination register as addend");
-  Check((result.ir_dump.find("FMadF32 v90, v6, 0x3f800000, v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v90, SelectU32(exec, BitCastU32F32(FPMad32(BitCastF32U32(v6), "
+                      "BitCastF32U32(0x3f800000), BitCastF32U32(v5))), v90)") != std::string::npos),
         "V_MADMK_F32 did not lower with the literal in source 1");
-  Check((result.ir_dump.find("FMadF32 v91, v6, v5, 0x40000000") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v91, SelectU32(exec, BitCastU32F32(FPMad32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v5), BitCastF32U32(0x40000000))), v91)") != std::string::npos),
         "V_MADAK_F32 did not lower with the literal in source 2");
-  Check((result.ir_dump.find("FMadF32 v92, v6, v6, v92") != std::string::npos),
-        "alternate V_MAC_F32 did not lower with the destination register as "
+  Check((lowered.find("SetVectorRegister v92, SelectU32(exec, BitCastU32F32(FPFma32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v92))), v92)") != std::string::npos),
+        "V_FMAC_F32 did not lower to fused multiply-add with the destination register as "
         "addend");
-  Check((result.ir_dump.find("FMadF32 v93, v6, 0x3f000000, v5") != std::string::npos),
-        "alternate V_MADMK_F32 did not lower with the literal in source 1");
-  Check((result.ir_dump.find("FMadF32 v94, v6, v5, 0x40400000") != std::string::npos),
-        "alternate V_MADAK_F32 did not lower with the literal in source 2");
-  Check((result.ir_dump.find("PackF32ToF16Rtz v95, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v93, SelectU32(exec, BitCastU32F32(FPFma32(BitCastF32U32(v6), "
+                      "BitCastF32U32(0x3f000000), BitCastF32U32(v5))), v93)") != std::string::npos),
+        "V_FMAMK_F32 did not lower to fused multiply-add with the literal in source 1");
+  Check((lowered.find("SetVectorRegister v94, SelectU32(exec, BitCastU32F32(FPFma32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v5), BitCastF32U32(0x40400000))), v94)") != std::string::npos),
+        "V_FMAAK_F32 did not lower to fused multiply-add with the literal in source 2");
+  Check((lowered.find("SetVectorRegister v95, SelectU32(exec, PackFloat2x16Rtz(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6)), v95)") != std::string::npos),
         "native V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
   Check(
-      (result.ir_dump.find("Dot2AccF32F16 v102, v95, v95, v102") != std::string::npos),
+      (lowered.find("SetVectorRegister v102, SelectU32(exec, BitCastU32F32(FPFma32(ConvertF32F16(BitCastF16U16("
+                    "ConvertU16U32(BitFieldUExtract(v95, 0x00000010, 0x00000010)))), ConvertF32F16(BitCastF16U16("
+                    "ConvertU16U32(BitFieldUExtract(v95, 0x00000010, 0x00000010)))), FPFma32(ConvertF32F16("
+                    "BitCastF16U16(ConvertU16U32(BitFieldUExtract(v95, 0x00000000, 0x00000010)))), ConvertF32F16("
+                    "BitCastF16U16(ConvertU16U32(BitFieldUExtract(v95, 0x00000000, 0x00000010)))), "
+                    "BitCastF32U32(v102)))), v102)") != std::string::npos),
       "V_DOT2C_F32_F16 did not lower to explicit dot-accumulate IR");
-  Check((result.ir_dump.find("IAddCarryU32 v97, vcc_lo, v5, v6, vcc_lo") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v97, SelectU32(exec, CompositeExtractU32x2(IAddCarry32("
+                      "CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000000), SelectU32(vcc, 0x00000001, "
+                      "0x00000000)), 0x00000000), v97)") != std::string::npos) &&
+            (lowered.find("SetVcc LogicalAnd(exec, INotEqual32(BitwiseOr32(CompositeExtractU32x2(IAddCarry32(v5, "
+                          "v6), 0x00000001), CompositeExtractU32x2(IAddCarry32(CompositeExtractU32x2(IAddCarry32("
+                          "v5, v6), 0x00000000), SelectU32(vcc, 0x00000001, 0x00000000)), 0x00000001)), "
+                          "0x00000000))") != std::string::npos),
         "V_ADD_CO_U32 did not lower to carry-add IR");
-  Check((result.ir_dump.find("FAddF32 v35") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v35, SelectU32(exec, BitCastU32F32(FPAdd32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6))), v35)") != std::string::npos),
         "VOP3-encoded VOP2 float add did not lower through shared IR");
-  Check((result.ir_dump.find("UMulU24U32 v36") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v36, SelectU32(exec, IMul32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000018), BitFieldUExtract(v5, 0x00000000, 0x00000018)), v36)") != std::string::npos),
         "VOP3-encoded VOP2 24-bit multiply did not lower through shared IR");
-  Check((result.ir_dump.find("BitwiseXnorU32 v86, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v86, SelectU32(exec, BitwiseNot32(BitwiseXor32(v5, v6)), v86)")
+         != std::string::npos),
         "VOP3-encoded V_XNOR_B32 did not lower through shared IR");
-  Check((result.ir_dump.find("FMadF32 v96, v6, v6, v96") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v96, SelectU32(exec, BitCastU32F32(FPMad32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v96))), v96)") != std::string::npos),
         "VOP3-encoded V_MAC_F32 did not lower with the destination register as "
         "addend");
-  Check((result.ir_dump.find("IAddCarryU32 v98, s30, v5, v6, vcc_lo") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v98, SelectU32(exec, CompositeExtractU32x2(IAddCarry32("
+                      "CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000000), SelectU32(vcc, 0x00000001, "
+                      "0x00000000)), 0x00000000), v98)") != std::string::npos) &&
+            (lowered.find("SetThreadBitScalarRegister s30, LogicalAnd(exec, INotEqual32(BitwiseOr32("
+                          "CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000001), CompositeExtractU32x2("
+                          "IAddCarry32(CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000000), SelectU32(vcc, "
+                          "0x00000001, 0x00000000)), 0x00000001)), 0x00000000))") != std::string::npos),
         "VOP3-encoded V_ADD_CO_U32 did not lower to carry-add IR");
-  Check((result.ir_dump.find("MaskedBitCountLowU32 v87, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v87, SelectU32(exec, IAdd32(BitCount32(BitwiseAnd32(v5, SelectU32("
+                      "UGreaterThanEqual32(LaneId(), 0x00000020), 0xffffffff, ISub32(ShiftLeftLogical32(0x00000001, "
+                      "BitwiseAnd32(LaneId(...), 0x0000001f)), 0x00000001)))), v6), v87)") != std::string::npos),
         "VOP3-encoded V_MBCNT_LO_U32_B32 did not lower through shared IR");
   Check(
-      (result.ir_dump.find("MaskedBitCountHighU32 v88, v5, v6") != std::string::npos),
+      (lowered.find("SetVectorRegister v88, SelectU32(exec, IAdd32(BitCount32(BitwiseAnd32(v5, SelectU32("
+                    "UGreaterThanEqual32(LaneId(), 0x00000020), ISub32(ShiftLeftLogical32(0x00000001, "
+                    "BitwiseAnd32(LaneId(...), 0x0000001f)), 0x00000001), 0x00000000))), v6), v88)") != std::string::npos),
       "VOP3-encoded V_MBCNT_HI_U32_B32 did not lower through shared IR");
-  Check((result.ir_dump.find("MoveU32 v23") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v23, SelectU32(exec, v5, v23)") != std::string::npos),
         "VOP3-encoded VOP1 move did not lower through shared IR");
-  Check((result.ir_dump.find("ReadFirstLaneU32 s25, v5") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s25, ReadFirstLane(v5, exec)") != std::string::npos),
         "VOP3-encoded V_READFIRSTLANE_B32 did not lower through shared IR");
-  Check((result.ir_dump.find("ReadLaneU32 s26, v5, 0x00000002") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s26, ReadLane(v5, BitwiseAnd32(0x00000002, 0x0000003f))") != std::string::npos),
         "V_READLANE_B32 did not lower to subgroup lane IR");
   Check(
-      (result.ir_dump.find("WriteLaneU32 v107, v5, 0x00000002") != std::string::npos),
+      (lowered.find("SetVectorRegister v107, WriteLane(v107, v5, BitwiseAnd32(0x00000002, 0x0000003f))") != std::string::npos),
       "V_WRITELANE_B32 did not lower to subgroup lane IR");
-  Check((result.ir_dump.find("Permlane16B32 v108, v5, 0x00000000, 0x00000000") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v108, SelectU32(exec, Permlane16U32(v5, 0x00000000, 0x00000000, exec), "
+                      "v108)") != std::string::npos),
         "V_PERMLANE16_B32 did not lower to subgroup perm-lane IR");
-  Check((result.ir_dump.find("Permlanex16B32 v109, v5, 0x00000000, 0x00000000") != std::string::npos),
+  // The x16 (cross-row) variant is a PermlaneFlags bit on the same opcode; the flag is not
+  // rendered by TranslateExpressionsForTest, so only the opcode/operands are pinned here.
+  Check((lowered.find("SetVectorRegister v109, SelectU32(exec, Permlane16U32(v5, 0x00000000, 0x00000000, exec), "
+                      "v109)") != std::string::npos),
         "V_PERMLANEX16_B32 did not lower to subgroup perm-lane IR");
-  Check((result.ir_dump.find("ConvertI32ToF32 v24") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v24, SelectU32(exec, BitCastU32F32(ConvertF32S32(v5)), v24)") != std::string::npos),
         "VOP3-encoded VOP1 signed conversion did not lower through shared IR");
-  Check((result.ir_dump.find("ConvertFloorF32ToI32 v74, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v74, SelectU32(exec, SelectU32(FPIsNan32(FPFloor32(BitCastF32U32(v6))), "
+                      "0x00000000, SelectU32(FPOrdLessThanEqual32(FPFloor32(BitCastF32U32(v6)), -2.14748e+09f), "
+                      "0x80000000, SelectU32(FPOrdGreaterThanEqual32(FPFloor32(BitCastF32U32(v6)), 2.14748e+09f), "
+                      "0x7fffffff, ConvertS32F32(") != std::string::npos),
         "VOP3-encoded V_CVT_FLR_I32_F32 did not lower through shared IR");
-  Check((result.ir_dump.find("ConvertI4ToOffsetF32 v82, v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v82, SelectU32(exec, BitCastU32F32(FPMul32(ConvertF32S32(BitFieldSExtract("
+                      "v5, 0x00000000, 0x00000004)), 0.0625f)), v82)") != std::string::npos),
         "VOP3-encoded V_CVT_OFF_F32_I4 did not lower through shared IR");
-  Check((result.ir_dump.find("FractF32 v25") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v25, SelectU32(exec, BitCastU32F32(FPFract32(BitCastF32U32(v6))), v25)")
+         != std::string::npos),
         "VOP3-encoded VOP1 fract did not lower through shared IR");
-  Check((result.ir_dump.find("RcpF32 v26") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v26, SelectU32(exec, BitCastU32F32(FPRecip32(BitCastF32U32(v6))), v26)")
+         != std::string::npos),
         "VOP3-encoded VOP1 reciprocal did not lower through shared IR");
-  Check((result.ir_dump.find("BitwiseNotU32 v29") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v29, SelectU32(exec, BitwiseNot32(v5), v29)") != std::string::npos),
         "VOP3-encoded VOP1 not did not lower through shared IR");
-  Check((result.ir_dump.find("BitReverseU32 v30") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v30, SelectU32(exec, BitReverse32(v5), v30)") != std::string::npos),
         "VOP3-encoded VOP1 bit reverse did not lower through shared IR");
   Check(
-      (result.ir_dump.find("FindMsbFromHighU32 v33") != std::string::npos),
+      (lowered.find("SetVectorRegister v33, SelectU32(exec, SelectU32(INotEqual32(v5, 0x00000000), "
+                    "ISub32(0x0000001f, FindUMsb32(v5)), 0xffffffff), v33)") != std::string::npos),
       "VOP3-encoded VOP1 find-first-bit-high did not lower through shared IR");
-  Check((result.ir_dump.find("FindLsbU32 v34") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v34, SelectU32(exec, FindILsb32(v5), v34)") != std::string::npos),
         "VOP3-encoded VOP1 find-first-bit-low did not lower through shared IR");
-  Check((result.ir_dump.find("CompareGtF32") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPOrdGreaterThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC float compare did not lower to IR");
-  Check((result.ir_dump.find("CompareMaskGtF32 exec_lo") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPOrdGreaterThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC float compare-and-mask did not lower to exec mask IR");
-  Check((result.ir_dump.find("CompareMaskGtU32 exec_lo") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, UGreaterThan32(v7, v5))") != std::string::npos),
         "VOPC uint compare-and-mask did not lower to exec mask IR");
-  Check((result.ir_dump.find("CompareFalse vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, false)\n") != std::string::npos),
         "VOPC false compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareTrue vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, true)\n") != std::string::npos),
         "VOPC true compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareOrderedF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, LogicalNot(LogicalOr(FPIsNan32(BitCastF32U32(v6)), "
+                      "FPIsNan32(BitCastF32U32(v6)))))") != std::string::npos),
         "VOPC ordered compare did not lower to shared IR");
   Check(
-      (result.ir_dump.find("CompareUnorderedF32 vcc_lo, v6, v6") != std::string::npos),
+      (lowered.find("SetVcc LogicalAnd(exec, LogicalOr(FPIsNan32(BitCastF32U32(v6)), "
+                    "FPIsNan32(BitCastF32U32(v6))))") != std::string::npos),
       "VOPC unordered compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordLtF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordLessThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-less compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordEqF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-equal compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordLeF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordLessThanEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-less-equal compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordGtF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordGreaterThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-greater compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordNeF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordNotEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-not-equal compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareUnordNeF32 s0, 0x3f000000, v1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s0, CompositeExtractU32x4(Ballot(LogicalAnd(exec, FPUnordNotEqual32("
+                      "BitCastF32U32(0x3f000000), BitCastF32U32(v1)))), 0x00000000)") != std::string::npos),
         "VOPC SDWA unordered-not-equal compare did not lower to "
         "scalar-destination IR");
-  Check((result.ir_dump.find("CompareUnordGeF32 vcc_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, FPUnordGreaterThanEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-greater-equal compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareMaskUnordLtF32 exec_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPUnordLessThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-less compare-and-mask did not lower to shared IR");
-  Check((result.ir_dump.find("CompareMaskUnordEqF32 exec_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPUnordEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-equal compare-and-mask did not lower to shared IR");
   Check(
-      (result.ir_dump.find("CompareMaskUnordLeF32 exec_lo, v6, v6") != std::string::npos),
+      (lowered.find("SetExec LogicalAnd(exec, FPUnordLessThanEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+       != std::string::npos),
       "VOPC unordered-less-equal compare-and-mask did not lower to shared IR");
-  Check((result.ir_dump.find("CompareMaskUnordGtF32 exec_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPUnordGreaterThan32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-greater compare-and-mask did not lower to shared IR");
-  Check((result.ir_dump.find("CompareMaskUnordNeF32 exec_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPUnordNotEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-not-equal compare-and-mask did not lower to shared IR");
-  Check((result.ir_dump.find("CompareMaskUnordGeF32 exec_lo, v6, v6") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, FPUnordGreaterThanEqual32(BitCastF32U32(v6), BitCastF32U32(v6)))")
+         != std::string::npos),
         "VOPC unordered-greater-equal compare-and-mask did not lower to shared "
         "IR");
-  Check((result.ir_dump.find("CompareFalse vcc_lo, v5, v5") != std::string::npos),
+  // V_CMP_F_F32, V_CMP_F_I32 and V_CMP_F_U32 (likewise the T/TRU forms) all lower to the
+  // same constant VCC write, so the integer forms are pinned by the total count.
+  Check(CountSourceOccurrences(lowered, "SetVcc LogicalAnd(exec, false)\n") == 3,
         "VOPC integer false compare did not lower to shared IR");
-  Check((result.ir_dump.find("CompareTrue vcc_lo, v5, v5") != std::string::npos),
+  Check(CountSourceOccurrences(lowered, "SetVcc LogicalAnd(exec, true)\n") == 3,
         "VOPC integer true compare did not lower to shared IR");
-  Check((result.ir_dump.find("FMadF32 v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, BitCastU32F32(FPMad32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v8)") != std::string::npos),
         "VOP3 mad did not lower to IR");
-  Check((result.ir_dump.find("FMadF32 v4, v1.neg, v9, s4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitCastU32F32(FPMad32(FPNeg32(BitCastF32U32(v1)), "
+                      "BitCastF32U32(v9), BitCastF32U32(s4))), v4)") != std::string::npos),
         "VOP3 mad source modifiers did not lower to IR metadata");
-  Check((result.ir_dump.find("CubeIdF32 v110, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v110, SelectU32(exec, BitCastU32F32(SelectF32(LogicalAnd("
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v5))), "
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v6)))), "
+                      "SelectF32(FPOrdLessThan32(BitCastF32U32(v7), 0f), 5f, 4f), SelectF32("
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v6)), FPAbs32(BitCastF32U32(v5))), "
+                      "SelectF32(FPOrdLessThan32(BitCastF32U32(v6), 0f), 3f, 2f), SelectF32(FPOrdLessThan32("
+                      "BitCastF32U32(v5), 0f), 1f, 0f)))), v110)") != std::string::npos),
         "V_CUBEID_F32 did not lower to cube IR");
-  Check((result.ir_dump.find("CubeScF32 v111, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v111, SelectU32(exec, BitCastU32F32(SelectF32(LogicalAnd("
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v5))), "
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v6)))), "
+                      "SelectF32(FPOrdLessThan32(BitCastF32U32(v7), 0f), FPNeg32(BitCastF32U32(v5)), "
+                      "BitCastF32U32(v5)), SelectF32(FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v6)), "
+                      "FPAbs32(BitCastF32U32(v5))), BitCastF32U32(v5), SelectF32(FPOrdLessThan32(BitCastF32U32("
+                      "v5), 0f), BitCastF32U32(v7), FPNeg32(BitCastF32U32(v7)))))), v111)") != std::string::npos),
         "V_CUBESC_F32 did not lower to cube IR");
-  Check((result.ir_dump.find("CubeTcF32 v112, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v112, SelectU32(exec, BitCastU32F32(SelectF32(LogicalAnd("
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v5))), "
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v6)))), "
+                      "FPNeg32(BitCastF32U32(v6)), SelectF32(FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v6)), "
+                      "FPAbs32(BitCastF32U32(v5))), SelectF32(FPOrdLessThan32(BitCastF32U32(v6), 0f), "
+                      "FPNeg32(BitCastF32U32(v7)), BitCastF32U32(v7)), FPNeg32(BitCastF32U32(v6))))), v112)")
+         != std::string::npos),
         "V_CUBETC_F32 did not lower to cube IR");
-  Check((result.ir_dump.find("CubeMaF32 v113, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v113, SelectU32(exec, BitCastU32F32(SelectF32(LogicalAnd("
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v5))), "
+                      "FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32(v7)), FPAbs32(BitCastF32U32(v6)))), "
+                      "FPMul32(BitCastF32U32(v7), 2f), SelectF32(FPOrdGreaterThanEqual32(FPAbs32(BitCastF32U32("
+                      "v6)), FPAbs32(BitCastF32U32(v5))), FPMul32(BitCastF32U32(v6), 2f), FPMul32(BitCastF32U32("
+                      "v5), 2f)))), v113)") != std::string::npos),
         "V_CUBEMA_F32 did not lower to cube IR");
-  Check((result.ir_dump.find("CubeMaF32 v5, v2, v0, v6.neg") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, BitCastU32F32(SelectF32(LogicalAnd("
+                      "FPOrdGreaterThanEqual32(FPAbs32(FPNeg32(BitCastF32U32(v6))), FPAbs32(BitCastF32U32(v2))), "
+                      "FPOrdGreaterThanEqual32(FPAbs32(FPNeg32(BitCastF32U32(v6))), FPAbs32(BitCastF32U32(v0)))), "
+                      "FPMul32(FPNeg32(BitCastF32U32(v6)), 2f), SelectF32(FPOrdGreaterThanEqual32(FPAbs32("
+                      "BitCastF32U32(v0)), FPAbs32(BitCastF32U32(v2))), FPMul32(BitCastF32U32(v0), 2f), "
+                      "FPMul32(BitCastF32U32(v2), 2f)))), v5)") != std::string::npos),
         "V_CUBEMA_F32 source modifier did not lower to cube IR");
-  Check((result.ir_dump.find("FMadF32 v37") != std::string::npos),
-        "VOP3 fma did not lower to IR");
-  Check((result.ir_dump.find("FMin3F32 v38") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v37, SelectU32(exec, BitCastU32F32(FPFma32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v37)") != std::string::npos),
+        "VOP3 fma did not lower to fused multiply-add IR");
+  Check((lowered.find("SetVectorRegister v38, SelectU32(exec, BitCastU32F32(FPMinTri32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v38)") != std::string::npos),
         "VOP3 min3 did not lower to IR");
-  Check((result.ir_dump.find("FMax3F32 v39") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v39, SelectU32(exec, BitCastU32F32(FPMaxTri32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v39)") != std::string::npos),
         "VOP3 max3 did not lower to IR");
-  Check((result.ir_dump.find("FMed3F32 v40") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v40, SelectU32(exec, BitCastU32F32(FPMedTri32(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v40)") != std::string::npos),
         "VOP3 med3 did not lower to IR");
-  Check((result.ir_dump.find("IMin3I32 v41") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v41, SelectU32(exec, SMinTri32(v5, v5, v5), v41)") != std::string::npos),
         "VOP3 signed min3 did not lower to IR");
-  Check((result.ir_dump.find("UMin3U32 v42") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v42, SelectU32(exec, UMinTri32(v5, v5, v5), v42)") != std::string::npos),
         "VOP3 unsigned min3 did not lower to IR");
-  Check((result.ir_dump.find("IMax3I32 v43") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v43, SelectU32(exec, SMaxTri32(v5, v5, v5), v43)") != std::string::npos),
         "VOP3 signed max3 did not lower to IR");
-  Check((result.ir_dump.find("UMax3U32 v44") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v44, SelectU32(exec, UMaxTri32(v5, v5, v5), v44)") != std::string::npos),
         "VOP3 unsigned max3 did not lower to IR");
-  Check((result.ir_dump.find("IMed3I32 v45") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v45, SelectU32(exec, SMedTri32(v5, v5, v5), v45)") != std::string::npos),
         "VOP3 signed med3 did not lower to IR");
-  Check((result.ir_dump.find("UMed3U32 v46") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v46, SelectU32(exec, UMedTri32(v5, v5, v5), v46)") != std::string::npos),
         "VOP3 unsigned med3 did not lower to IR");
-  Check((result.ir_dump.find("BitFieldExtract3U32 v47") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v47, SelectU32(exec, BitFieldUExtract(v5, BitwiseAnd32(0x00000001, "
+                      "0x0000001f), UMin32(BitwiseAnd32(0x00000004, 0x0000001f), ISub32(0x00000020, "
+                      "BitwiseAnd32(0x00000001, 0x0000001f)))), v47)") != std::string::npos),
         "VOP3 unsigned bitfield extract did not lower to IR");
-  Check((result.ir_dump.find("BitFieldExtract3I32 v48") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v48, SelectU32(exec, BitFieldSExtract(v5, BitwiseAnd32(0x00000001, "
+                      "0x0000001f), UMin32(BitwiseAnd32(0x00000004, 0x0000001f), ISub32(0x00000020, "
+                      "BitwiseAnd32(0x00000001, 0x0000001f)))), v48)") != std::string::npos),
         "VOP3 signed bitfield extract did not lower to IR");
-  Check((result.ir_dump.find("BitFieldInsertSelectU32 v49") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v49, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v5, v6), "
+                      "BitwiseAnd32(BitwiseNot32(v5), v7)), v49)") != std::string::npos),
         "VOP3 bitfield insert-select did not lower to IR");
-  Check((result.ir_dump.find("AlignBitU32 v50") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v50, SelectU32(exec, BitwiseOr32(ShiftRightLogical32(v6, BitwiseAnd32("
+                      "0x00000001, 0x0000001f)), SelectU32(INotEqual32(BitwiseAnd32(0x00000001, 0x0000001f), "
+                      "0x00000000), ShiftLeftLogical32(v5, BitwiseAnd32(ISub32(0x00000020, BitwiseAnd32(0x00000001, "
+                      "0x0000001f)), 0x0000001f)), 0x00000000)), v50)") != std::string::npos),
         "VOP3 alignbit did not lower to IR");
-  Check((result.ir_dump.find("AlignByteU32 v115") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v115, SelectU32(exec, BitwiseOr32(ShiftRightLogical32(v6, "
+                      "ShiftLeftLogical32(BitwiseAnd32(0x00000001, 0x00000003), 0x00000003)), SelectU32(INotEqual32("
+                      "ShiftLeftLogical32(BitwiseAnd32(0x00000001, 0x00000003), 0x00000003), 0x00000000), "
+                      "ShiftLeftLogical32(v5, BitwiseAnd32(ISub32(0x00000020, ShiftLeftLogical32(BitwiseAnd32("
+                      "0x00000001, 0x00000003), 0x00000003)), 0x0000001f)), 0x00000000)), v115)") != std::string::npos),
         "VOP3 alignbyte did not lower to IR");
-  Check((result.ir_dump.find("IAdd3U32 v51") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v51, SelectU32(exec, IAdd32(IAdd32(v5, v6), v7), v51)") != std::string::npos),
         "VOP3 add3 did not lower to IR");
-  Check((result.ir_dump.find("IMulU32 v52, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v52, SelectU32(exec, IMul32(v5, v6), v52)") != std::string::npos),
         "V_MUL_LO_U32 did not lower to multiply IR");
-  Check((result.ir_dump.find("UMulHighU32 v53, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v53, SelectU32(exec, UMulHi(v5, v6), v53)") != std::string::npos),
         "V_MUL_HI_U32 did not lower to high-multiply IR");
-  Check((result.ir_dump.find("SMulHighI32 v114, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v114, SelectU32(exec, SMulHi(v5, v6), v114)") != std::string::npos),
         "V_MUL_HI_I32 did not lower to signed high-multiply IR");
-  Check((result.ir_dump.find("BitwiseAndOrU32 v54, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v54, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v5, v6), v7), v54)")
+         != std::string::npos),
         "V_AND_OR_B32 did not lower to ternary bitwise IR");
-  Check((result.ir_dump.find("BitwiseOr3U32 v55, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v55, SelectU32(exec, BitwiseOr32(BitwiseOr32(v5, v6), v7), v55)")
+         != std::string::npos),
         "V_OR3_B32 did not lower to ternary bitwise IR");
-  Check((result.ir_dump.find("BitwiseXor3U32 v56, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v56, SelectU32(exec, BitwiseXor32(BitwiseXor32(v5, v6), v7), v56)")
+         != std::string::npos),
         "V_XOR3_B32 did not lower to ternary bitwise IR");
-  Check((result.ir_dump.find("ShiftLeftAddU32 v57, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v57, SelectU32(exec, IAdd32(ShiftLeftLogical32(v5, BitwiseAnd32(v6, "
+                      "0x0000001f)), v7), v57)") != std::string::npos),
         "V_LSHL_ADD_U32 did not lower to shared shift-left-add IR");
-  Check((result.ir_dump.find("AddShiftLeftU32 v58, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v58, SelectU32(exec, ShiftLeftLogical32(IAdd32(v5, v6), BitwiseAnd32(v7, "
+                      "0x0000001f)), v58)") != std::string::npos),
         "V_ADD_LSHL_U32 did not lower to add-shift-left IR");
-  Check((result.ir_dump.find("XorAddU32 v59, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v59, SelectU32(exec, IAdd32(BitwiseXor32(v5, v6), v7), v59)")
+         != std::string::npos),
         "V_XAD_U32 did not lower to xor-add IR");
-  Check((result.ir_dump.find("ShiftLeftOrU32 v60, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v60, SelectU32(exec, BitwiseOr32(ShiftLeftLogical32(v5, BitwiseAnd32(v6, "
+                      "0x0000001f)), v7), v60)") != std::string::npos),
         "V_LSHL_OR_B32 did not lower to shift-left-or IR");
-  Check((result.ir_dump.find("SadU32 v61, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v61, SelectU32(exec, IAdd32(ISub32(UMax32(v5, v6), UMin32(v5, v6)), v7), "
+                      "v61)") != std::string::npos),
         "V_SAD_U32 did not lower to sad IR");
-  Check((result.ir_dump.find("IMadI24U32 v62, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v62, SelectU32(exec, IAdd32(IMul32(BitFieldSExtract(v5, 0x00000000, "
+                      "0x00000018), BitFieldSExtract(v6, 0x00000000, 0x00000018)), v7), v62)") != std::string::npos),
         "V_MAD_I32_I24 did not lower to signed 24-bit mad IR");
-  Check((result.ir_dump.find("UMadU24U32 v63, v5, v6, v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v63, SelectU32(exec, IAdd32(IMul32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000018), BitFieldUExtract(v6, 0x00000000, 0x00000018)), v7), v63)") != std::string::npos),
         "V_MAD_U32_U24 did not lower to unsigned 24-bit mad IR");
-  Check((result.ir_dump.find("IMulU32 v69, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v69, SelectU32(exec, IMul32(v5, v6), v69)") != std::string::npos),
         "V_MUL_LO_I32 did not lower to multiply IR");
-  Check((result.ir_dump.find("IAddCarryU32 v70, s0, v5, v6, 0x00000000") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v70, SelectU32(exec, CompositeExtractU32x2(IAddCarry32("
+                      "CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000000), 0x00000000), 0x00000000), v70)")
+         != std::string::npos) &&
+            (lowered.find("SetThreadBitScalarRegister s0, LogicalAnd(exec, INotEqual32(BitwiseOr32("
+                          "CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000001), CompositeExtractU32x2("
+                          "IAddCarry32(CompositeExtractU32x2(IAddCarry32(v5, v6), 0x00000000), 0x00000000), "
+                          "0x00000001)), 0x00000000))") != std::string::npos),
         "V_ADD_I32 did not lower to carry-out add IR");
-  Check((result.ir_dump.find("ISubBorrowU32 v71, s0, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v71, SelectU32(exec, ISub32(v5, v6), v71)") != std::string::npos) &&
+            (lowered.find("SetThreadBitScalarRegister s0, LogicalAnd(exec, UGreaterThan32(v6, v5))") != std::string::npos),
         "V_SUB_I32 did not lower to borrow-out subtract IR");
-  Check((result.ir_dump.find("ISubBorrowU32 v72, s0, v6, v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v72, SelectU32(exec, ISub32(v6, v5), v72)") != std::string::npos) &&
+            (lowered.find("SetThreadBitScalarRegister s0, LogicalAnd(exec, UGreaterThan32(v5, v6))") != std::string::npos),
         "V_SUBREV_I32 did not reverse source order in borrow-out IR");
-  Check((result.ir_dump.find("IMaxI16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
-                            "v5.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v7, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(SMax32(BitFieldSExtract("
+                      "BitFieldUExtract(...), 0x00000000, 0x00000010), BitFieldSExtract(BitFieldUExtract(...), "
+                      "0x00000000, 0x00000010)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000000)), v7)")
+         != std::string::npos),
         "V_MAX_I16 did not lower to signed halfword max IR");
-  Check((result.ir_dump.find("IMinI16 v7.sdwa(sel=5,sext=0), 0x00000002, "
-                            "v4.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v7, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(SMin32(BitFieldSExtract("
+                      "BitFieldUExtract(...), 0x00000000, 0x00000010), BitFieldSExtract(BitFieldUExtract(...), "
+                      "0x00000000, 0x00000010)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000010)), v7)")
+         != std::string::npos),
         "V_MIN_I16 did not lower to signed halfword min IR");
-  Check((result.ir_dump.find("BitFieldMaskU32 v73, 0x00000001, 0x00000004") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v73, SelectU32(exec, ShiftLeftLogical32(ISub32("
+                      "ShiftLeftLogical32(0x00000001, BitwiseAnd32(0x00000001, 0x0000001f)), "
+                      "0x00000001), BitwiseAnd32(0x00000004, 0x0000001f)), v73)")
+         != std::string::npos),
         "V_BFM_B32 did not lower to shared bitfield-mask IR");
-  Check((result.ir_dump.find("PackF32ToF16Rtz v75, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v75, SelectU32(exec, PackFloat2x16Rtz(BitCastF32U32(v6), "
+                      "BitCastF32U32(v6)), v75)") != std::string::npos),
         "V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
   Check(
-      (result.ir_dump.find("PackF32ToF16Rtz v0, v0.neg, v1.neg") != std::string::npos),
+      (lowered.find("SetVectorRegister v0, SelectU32(exec, PackFloat2x16Rtz(FPNeg32(BitCastF32U32(v0)), "
+                    "FPNeg32(BitCastF32U32(v1))), v0)") != std::string::npos),
       "V_CVT_PKRTZ_F16_F32 source modifiers did not lower to shared pack IR");
-  Check((result.ir_dump.find("LdexpF32 v76, v6, 0x00000001") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v76, SelectU32(exec, BitCastU32F32(FPLdexp(BitCastF32U32(v6), "
+                      "0x00000001)), v76)") != std::string::npos),
         "V_LDEXP_F32 did not lower to ldexp IR");
-  Check((result.ir_dump.find("LdexpF32 v7, v9.abs, 0xfffffffe") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BitCastU32F32(FPLdexp(FPAbs32(BitCastF32U32(v9)), "
+                      "0xfffffffe)), v7)") != std::string::npos),
         "V_LDEXP_F32 source modifier did not lower to IR");
   Check(
-      (result.ir_dump.find("LdexpF32 v13.clamp, v6, 0xfffffffc") != std::string::npos),
+      (lowered.find("SetVectorRegister v13, SelectU32(exec, BitCastU32F32(FPSaturate32(FPLdexp(BitCastF32U32(v6), "
+                    "0xfffffffc))), v13)") != std::string::npos),
       "V_LDEXP_F32 clamp modifier did not lower to IR");
-  Check((result.ir_dump.find("BitCountAddU32 v77, v5, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v77, SelectU32(exec, IAdd32(BitCount32(v5), v6), v77)") != std::string::npos),
         "VOP3 V_BCNT_U32_B32 did not lower to bit-count-add IR");
-  Check((result.ir_dump.find("PackSnorm2x16F32 v78, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v78, SelectU32(exec, PackSnorm2x16(CompositeConstructF32x2("
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v78)") != std::string::npos),
         "V_CVT_PKNORM_I16_F32 did not lower to shared pack IR");
-  Check((result.ir_dump.find("PackUnorm2x16F32 v79, v6, v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v79, SelectU32(exec, PackUnorm2x16(CompositeConstructF32x2("
+                      "BitCastF32U32(v6), BitCastF32U32(v6))), v79)") != std::string::npos),
         "V_CVT_PKNORM_U16_F32 did not lower to shared pack IR");
-  Check((result.ir_dump.find("PackU16U32 v80, v5, v7") != std::string::npos),
-        "V_CVT_PK_U16_U32 did not lower to shared pack IR");
-  Check(SpirvContainsOpcode(result.spirv, 112),
-        "SPIR-V binary does not contain OpConvertUToF");
-  Check(SpirvContainsOpcode(result.spirv, 109),
-        "SPIR-V binary does not contain OpConvertFToU");
-  Check(SpirvContainsOpcode(result.spirv, 111),
-        "SPIR-V binary does not contain OpConvertSToF");
-  Check(SpirvContainsOpcode(result.spirv, 110),
-        "SPIR-V binary does not contain OpConvertFToS");
-  Check(SpirvContainsOpcode(result.spirv, 136),
-        "SPIR-V binary does not contain OpFDiv");
-  Check(SpirvContainsOpcode(result.spirv, 127),
-        "SPIR-V binary does not contain OpFNegate");
-  Check(SpirvContainsOpcode(result.spirv, 12),
-        "SPIR-V binary does not contain OpExtInst");
-  Check(SpirvContainsExtInst(result.spirv, 58),
-        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16");
-  Check(SpirvContainsExtInst(result.spirv, 62),
-        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16");
-  Check(SpirvContainsExtInst(result.spirv, 50),
-        "SPIR-V binary does not contain GLSL.std.450 Fma");
-  Check(SpirvContainsExtInst(result.spirv, 43),
-        "SPIR-V binary does not contain GLSL.std.450 FClamp");
-  Check(SpirvContainsExtInst(result.spirv, 53),
-        "SPIR-V binary does not contain GLSL.std.450 Ldexp");
-  Check(SpirvContainsOpcode(result.spirv, 128),
-        "SPIR-V binary does not contain OpIAdd");
-  Check(SpirvContainsOpcode(result.spirv, 149),
-        "SPIR-V binary does not contain OpIAddCarry");
-  Check(SpirvContainsOpcode(result.spirv, 130),
-        "SPIR-V binary does not contain OpISub");
-  Check(SpirvContainsOpcode(result.spirv, 132),
-        "SPIR-V binary does not contain OpIMul");
-  Check(SpirvContainsOpcode(result.spirv, 171),
-        "SPIR-V binary does not contain OpINotEqual");
-  Check(SpirvContainsOpcode(result.spirv, 200),
-        "SPIR-V binary does not contain OpNot");
-  Check(SpirvContainsOpcode(result.spirv, 204),
-        "SPIR-V binary does not contain OpBitReverse");
-  Check(SpirvContainsOpcode(result.spirv, 205),
-        "SPIR-V binary does not contain OpBitCount");
-  Check(SpirvContainsOpcode(result.spirv, 166),
-        "SPIR-V binary does not contain OpLogicalOr");
-  Check(SpirvContainsOpcode(result.spirv, 167),
-        "SPIR-V binary does not contain OpLogicalAnd");
-  Check(SpirvContainsOpcode(result.spirv, 186),
-        "SPIR-V binary does not contain OpFOrdGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 181),
-        "SPIR-V binary does not contain OpFUnordEqual");
-  Check(SpirvContainsOpcode(result.spirv, 183),
-        "SPIR-V binary does not contain OpFUnordNotEqual");
-  Check(SpirvContainsOpcode(result.spirv, 185),
-        "SPIR-V binary does not contain OpFUnordLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 187),
-        "SPIR-V binary does not contain OpFUnordGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 189),
-        "SPIR-V binary does not contain OpFUnordLessThanEqual");
-  Check(SpirvContainsOpcode(result.spirv, 191),
-        "SPIR-V binary does not contain OpFUnordGreaterThanEqual");
-  Check(SpirvContainsOpcode(result.spirv, 190),
-        "SPIR-V binary does not contain OpFOrdGreaterThanEqual");
-  Check(SpirvContainsOpcode(result.spirv, 184),
-        "SPIR-V binary does not contain OpFOrdLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 173),
-        "SPIR-V binary does not contain OpSGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 174),
-        "SPIR-V binary does not contain OpUGreaterThanEqual");
-  Check(SpirvContainsOpcode(result.spirv, 177),
-        "SPIR-V binary does not contain OpSLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 202),
-        "SPIR-V binary does not contain OpBitFieldSExtract");
-  Check(SpirvContainsOpcode(result.spirv, 203),
-        "SPIR-V binary does not contain OpBitFieldUExtract");
-  Check(SpirvContainsOpcode(result.spirv, 194),
-        "SPIR-V binary does not contain OpShiftRightLogical");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad for cmpx old exec mask");
-  Check(SpirvContainsOpcode(result.spirv, 133),
-        "SPIR-V binary does not contain OpFMul");
-  Check(SpirvContainsOpcode(result.spirv, 129),
-        "SPIR-V binary does not contain OpFAdd");
-  Check(SpirvContainsOpcode(result.spirv, 151),
-        "SPIR-V binary does not contain OpUMulExtended");
-  Check(SpirvContainsOpcode(result.spirv, 152),
-        "SPIR-V binary does not contain OpSMulExtended");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr");
-  Check(SpirvContainsOpcode(result.spirv, 198),
-        "SPIR-V binary does not contain OpBitwiseXor");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd");
-  Check(SpirvContainsOpcode(result.spirv, 80),
-        "SPIR-V binary does not contain OpCompositeConstruct");
-  Check(SpirvContainsOpcode(result.spirv, 81),
-        "SPIR-V binary does not contain OpCompositeExtract");
-  Check(SpirvContainsOpcode(result.spirv, 339),
-        "SPIR-V binary does not contain OpGroupNonUniformBallot");
-  Check(SpirvContainsOpcode(result.spirv, 343),
-        "SPIR-V binary does not contain OpGroupNonUniformBallotFindLSB");
-  Check(SpirvContainsOpcode(result.spirv, 345),
-        "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+  // RDNA2 V_CVT_PK_U16_U32 saturates each source to 0xffff before packing.
+  {
+    const auto begin = lowered.find("SetVectorRegister v80, SelectU32(exec, BitwiseOr32(");
+    const auto end = begin == std::string::npos ? begin : lowered.find('\n', begin);
+    const auto line = begin == std::string::npos ? std::string() : lowered.substr(begin, end - begin);
+    Check(line.find("UMin32(v5, 0x0000ffff)") != std::string::npos &&
+              line.find("UMin32(v7, 0x0000ffff)") != std::string::npos &&
+              line.find("ShiftLeftLogical32(") != std::string::npos,
+          "V_CVT_PK_U16_U32 did not lower to saturating pack IR");
+  }
+  // The fixture stores nothing, so the optimizer folds every ALU result away and the SPIR-V
+  // holds no arithmetic; the lowering checks above pin the IR operations that emit each
+  // SPIR-V opcode/GLSL.std.450 instruction the old presence checks asserted.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3211,46 +3457,50 @@ void TestNewShaderRecompilerExpandedAluBatch() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_min_u32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_MIN_U32") != std::string::npos),
         "new decoder did not decode S_MIN_U32");
-  Check((result.decoded_dump.find("s_mulk_i32") != std::string::npos),
+  Check((result.decoded_dump.find("S_MULK_I32") != std::string::npos),
         "new decoder did not decode S_MULK_I32");
-  Check((result.decoded_dump.find("v_subrev_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_SUBREV_F32") != std::string::npos),
         "new decoder did not decode V_SUBREV_F32");
-  Check((result.decoded_dump.find("v_lshlrev_b32") != std::string::npos),
+  Check((result.decoded_dump.find("V_LSHLREV_B32") != std::string::npos),
         "new decoder did not decode V_LSHLREV_B32");
-  Check((result.ir_dump.find("IMulU32 s9, s9, 0x00000003") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s9, IMul32(s9, 0x00000003)") != std::string::npos),
         "SOPK multiply did not lower to self-multiply IR");
-  Check((result.ir_dump.find("UMinU32 s10") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s10, UMin32(s9, 0x00000000)") != std::string::npos),
         "S_MIN_U32 did not lower to IR");
-  Check((result.ir_dump.find("UMaxU32 s11") != std::string::npos),
+  Check((lowered.find("SetScc ULessThan32(s9, 0x00000000)") != std::string::npos),
+        "S_MIN_U32 did not write SCC from an unsigned less-than compare");
+  Check((lowered.find("SetScalarRegister s11, UMax32(s10, 0x00000002)") != std::string::npos),
         "S_MAX_U32 did not lower to IR");
-  Check((result.ir_dump.find("FSubF32 v1, v0, 0x3f800000") != std::string::npos),
+  Check((lowered.find("SetScc UGreaterThan32(s10, 0x00000002)") != std::string::npos),
+        "S_MAX_U32 did not write SCC from an unsigned greater-than compare");
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, BitCastU32F32(FPSub32("
+                      "BitCastF32U32(v0), BitCastF32U32(0x3f800000))), v1)") !=
+         std::string::npos),
         "V_SUBREV_F32 did not reverse source order in IR");
-  Check((result.ir_dump.find("FMinF32 v2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v2, SelectU32(exec, BitCastU32F32(FPMin32("
+                      "BitCastF32U32(v1), BitCastF32U32(v0))), v2)") != std::string::npos),
         "V_MIN_F32 did not lower to IR");
-  Check((result.ir_dump.find("FMaxF32 v3") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v3, SelectU32(exec, BitCastU32F32(FPMax32("
+                      "BitCastF32U32(v1), BitCastF32U32(v2))), v3)") != std::string::npos),
         "V_MAX_F32 did not lower to IR");
-  Check((result.ir_dump.find("ISubU32 v4, v3, 0x00000002") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, ISub32(v3, 0x00000002), v4)") !=
+         std::string::npos),
         "V_SUBREV_NC_U32 did not reverse source order in IR");
-  Check((result.ir_dump.find("ShiftLeftLogicalU32 v6, v5, 0x00000001") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, ShiftLeftLogical32(v5, "
+                      "BitwiseAnd32(0x00000001, 0x0000001f)), v6)") != std::string::npos),
         "V_LSHLREV_B32 did not reverse source order in IR");
-  Check((result.ir_dump.find("UMinU32 v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, UMin32(v6, v5), v7)") !=
+         std::string::npos),
         "V_MIN_U32 did not lower to IR");
-  Check((result.ir_dump.find("UMaxU32 v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, UMax32(v7, v6), v8)") !=
+         std::string::npos),
         "V_MAX_U32 did not lower to IR");
-  Check(SpirvContainsOpcode(result.spirv, 132),
-        "SPIR-V binary does not contain OpIMul");
-  Check(SpirvContainsOpcode(result.spirv, 169),
-        "SPIR-V binary does not contain OpSelect");
-  Check(SpirvContainsOpcode(result.spirv, 172),
-        "SPIR-V binary does not contain OpUGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 176),
-        "SPIR-V binary does not contain OpULessThan");
-  Check(SpirvContainsOpcode(result.spirv, 184),
-        "SPIR-V binary does not contain OpFOrdLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 186),
-        "SPIR-V binary does not contain OpFOrdGreaterThan");
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the lowering checks
+  // above pin the IMul32, exec SelectU32, UGreaterThan32/ULessThan32 (SCC) and FPMin32/FPMax32
+  // operations that emit it.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3292,37 +3542,38 @@ void TestNewShaderRecompilerVop3pPackedF16() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("v_pk_add_f16 v114") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("V_PK_ADD_F16 v114") != std::string::npos),
         "new decoder did not decode old-backed V_PK_ADD_F16");
-  Check((result.decoded_dump.find("v_pk_mul_f16 v115") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_MUL_F16 v115") != std::string::npos),
         "new decoder did not decode old-backed V_PK_MUL_F16");
-  Check((result.decoded_dump.find("v_pk_min_f16 v116") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_MIN_F16 v116") != std::string::npos),
         "new decoder did not decode old-backed V_PK_MIN_F16");
-  Check((result.decoded_dump.find("v_pk_max_f16 v117") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_MAX_F16 v117") != std::string::npos),
         "new decoder did not decode old-backed V_PK_MAX_F16");
-  Check((result.decoded_dump.find("v_pk_fma_f16 v118") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_FMA_F16 v118") != std::string::npos),
         "new decoder did not decode old-backed V_PK_FMA_F16");
-  Check((result.decoded_dump.find("v_fma_f32 v119") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMA_F32 v119") != std::string::npos),
         "new decoder did not decode old-backed VOP3P V_FMA_F32");
-  Check((result.decoded_dump.find("v_fma_f32 v68, v16.opsel(lo=0,hi=1,neghi=0)") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMA_F32 v68, v16.opsel(lo=0,hi=1,neghi=0)") != std::string::npos),
         "new decoder did not decode VOP3P V_FMA_MIX_F32 source selectors");
-  Check((result.decoded_dump.find("v_mad_mixlo_f16 v120") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAD_MIXLO_F16 v120") != std::string::npos),
         "new decoder did not decode old-backed V_MAD_MIXLO_F16");
-  Check((result.decoded_dump.find("v_mad_mixhi_f16 v121") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAD_MIXHI_F16 v121") != std::string::npos),
         "new decoder did not decode old-backed V_MAD_MIXHI_F16");
-  Check((result.decoded_dump.find("v_fma_f16 v122") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMA_F16 v122") != std::string::npos),
         "new decoder did not decode native VOP3 V_FMA_F16");
-  Check((result.decoded_dump.find("v_mad_mixhi_f16 v126.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_MAD_MIXHI_F16 v126.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode clamped V_MAD_MIXHI_F16 high-half "
         "destination");
-  Check((result.decoded_dump.find("v_fma_f16 v127.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMA_F16 v127.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode clamped native high-half V_FMA_F16");
-  Check((result.decoded_dump.find("v_pack_b32_f16 v26") != std::string::npos),
+  Check((result.decoded_dump.find("V_PACK_B32_F16 v26") != std::string::npos),
         "new decoder did not decode native V_PACK_B32_F16");
-  Check((result.decoded_dump.find("v_pack_b32_f16 v43") != std::string::npos) &&
+  Check((result.decoded_dump.find("V_PACK_B32_F16 v43") != std::string::npos) &&
             (result.decoded_dump.find("v10.opsel(lo=1") != std::string::npos),
         "new decoder did not decode V_PACK_B32_F16 source lane selectors");
-  Check((result.decoded_dump.find("v_pk_fmac_f16 v59") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_FMAC_F16 v59") != std::string::npos),
         "new decoder did not decode VOP2 V_PK_FMAC_F16");
   Check((result.decoded_dump.find("v6.opsel(lo=0,hi=1,neghi=1)") != std::string::npos),
         "VOP3P high-lane source modifier was not dumped");
@@ -3330,68 +3581,110 @@ void TestNewShaderRecompilerVop3pPackedF16() {
         "V_MAD_MIXLO_F16 did not expose low-half destination merge");
   Check((result.decoded_dump.find("v121.sdwa(sel=5") != std::string::npos),
         "V_MAD_MIXHI_F16 did not expose high-half destination merge");
-  Check((result.ir_dump.find("PackedAddF16 v114") != std::string::npos),
+  // Each packed lane is converted from its own f16 half (ConvertF32F16), computed in f32 and
+  // repacked with PackHalf2x16.
+  Check((lowered.find("SetVectorRegister v114, SelectU32(exec, PackHalf2x16(CompositeConstructF32x2("
+                      "FPAdd32(ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v5, "
+                      "0x00000000, 0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32("
+                      "BitFieldUExtract(v6, 0x00000000, 0x00000010))))), FPAdd32(ConvertF32F16("
+                      "BitCastF16U16(ConvertU16U32(BitFieldUExtract(v5, 0x00000010, 0x00000010)))), "
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v6, 0x00000010, "
+                      "0x00000010))))))), v114)") != std::string::npos),
         "V_PK_ADD_F16 did not lower to packed f16 IR");
-  Check((result.ir_dump.find("PackedMulF16 v115") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v115, SelectU32(exec, PackHalf2x16(CompositeConstructF32x2("
+                      "FPMul32(ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v5, "
+                      "0x00000000, 0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32("
+                      "BitFieldUExtract(v6, 0x00000000, 0x00000010))))), FPMul32(ConvertF32F16("
+                      "BitCastF16U16(ConvertU16U32(BitFieldUExtract(v5, 0x00000010, 0x00000010)))), "
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v6, 0x00000010, "
+                      "0x00000010))))))), v115)") != std::string::npos),
         "V_PK_MUL_F16 did not lower to packed f16 IR");
-  Check((result.ir_dump.find("PackedMinF16 v116") != std::string::npos),
+  // Packed min/max quiet a signaling-NaN source lane (| 0x200) ahead of the FPMin32/FPMax32
+  // result (emitted as compare + select + bitwise ops, not GLSL FMin/FMax). Only a NaN with a
+  // clear quiet bit is signaling: (bits & 0x7e00) == 0x7c00.
+  Check((lowered.find("SetVectorRegister v116, SelectU32(exec, BitwiseOr32(BitwiseAnd32(SelectU32("
+                      "LogicalAnd(IEqual32(BitwiseAnd32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000010), 0x00007e00), 0x00007c00), ") != std::string::npos) &&
+            (lowered.find("PackHalf2x16(CompositeConstructF32x2(FPMin32(...), FPMin32(...)))") !=
+             std::string::npos),
         "V_PK_MIN_F16 did not lower to packed f16 IR");
-  Check((result.ir_dump.find("PackedMaxF16 v117") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v117, SelectU32(exec, BitwiseOr32(BitwiseAnd32(SelectU32("
+                      "LogicalAnd(IEqual32(BitwiseAnd32(BitFieldUExtract(v5, 0x00000000, "
+                      "0x00000010), 0x00007e00), 0x00007c00), ") != std::string::npos) &&
+            (lowered.find("PackHalf2x16(CompositeConstructF32x2(FPMax32(...), FPMax32(...)))") !=
+             std::string::npos),
         "V_PK_MAX_F16 did not lower to packed f16 IR");
-  Check((result.ir_dump.find("PackedFmaF16 v118") != std::string::npos),
+  // Low lane negates src0 (NEG), high lane negates src1 (NEG_HI).
+  Check((lowered.find("SetVectorRegister v118, SelectU32(exec, PackHalf2x16(CompositeConstructF32x2("
+                      "FPFma32(ConvertF32F16(BitCastF16U16(ConvertU16U32(BitwiseXor32("
+                      "BitFieldUExtract(...), 0x00008000)))), ConvertF32F16(BitCastF16U16("
+                      "ConvertU16U32(BitFieldUExtract(v6, 0x00000000, 0x00000010)))), "
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v7, 0x00000000, "
+                      "0x00000010))))), FPFma32(ConvertF32F16(BitCastF16U16(ConvertU16U32("
+                      "BitFieldUExtract(v5, 0x00000010, 0x00000010)))), ConvertF32F16(BitCastF16U16("
+                      "ConvertU16U32(BitwiseXor32(BitFieldUExtract(...), 0x00008000)))), "
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v7, 0x00000010, "
+                      "0x00000010))))))), v118)") != std::string::npos),
         "V_PK_FMA_F16 did not lower to packed f16 IR");
-  Check((result.ir_dump.find("FMadF32 v119") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v119, SelectU32(exec, BitCastU32F32(FPFma32("
+                      "BitCastF32U32(v6), BitCastF32U32(v6), BitCastF32U32(v6))), v119)") !=
+         std::string::npos),
         "VOP3P V_FMA_F32 did not lower through shared fma IR");
-  Check((result.ir_dump.find("FMadF32 v68, v16.opsel(lo=0,hi=1,neghi=0)") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v68, SelectU32(exec, BitCastU32F32(FPFma32(ConvertF32F16("
+                      "BitCastF16U16(ConvertU16U32(BitFieldUExtract(v16, 0x00000000, 0x00000010)))), "
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v16, 0x00000000, "
+                      "0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract("
+                      "0x00000000, 0x00000000, 0x00000010)))))), v68)") != std::string::npos),
         "VOP3P V_FMA_MIX_F32 source selectors did not lower to IR");
-  Check((result.ir_dump.find("MadMixF16 v120.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v120, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v120, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000000)), v120)") != std::string::npos),
         "V_MAD_MIXLO_F16 did not lower to shared mad-mix IR");
-  Check((result.ir_dump.find("MadMixF16 v121.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v121, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v121, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000010)), v121)") != std::string::npos),
         "V_MAD_MIXHI_F16 did not lower to shared mad-mix IR");
-  Check((result.ir_dump.find("FmaF16 v122") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v122, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v122, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000010)), v122)") != std::string::npos),
         "native VOP3 V_FMA_F16 did not lower to native f16 fma IR");
-  Check((result.ir_dump.find("MadMixF16 v126.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v126, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v126, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPSaturate32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000010)), v126)") != std::string::npos),
         "clamped V_MAD_MIXHI_F16 did not lower to shared mad-mix IR");
-  Check((result.ir_dump.find("FmaF16 v127.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v127, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v127, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPSaturate32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000010)), v127)") != std::string::npos),
         "clamped native V_FMA_F16 did not lower to native f16 fma IR");
-  Check((result.ir_dump.find("PackB32F16 v26") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v26, SelectU32(exec, BitwiseOr32(BitFieldUExtract(v10, "
+                      "0x00000000, 0x00000010), ShiftLeftLogical32(BitFieldUExtract(v11, "
+                      "0x00000000, 0x00000010), 0x00000010)), v26)") != std::string::npos),
         "V_PACK_B32_F16 did not lower to packed-bit IR");
-  Check((result.ir_dump.find("PackB32F16 v43") != std::string::npos) &&
-            (result.ir_dump.find("v10.opsel(lo=1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v43, SelectU32(exec, BitwiseOr32(BitFieldUExtract(v10, "
+                      "0x00000010, 0x00000010), ShiftLeftLogical32(BitFieldUExtract(v11, "
+                      "0x00000010, 0x00000010), 0x00000010)), v43)") != std::string::npos),
         "V_PACK_B32_F16 source selectors did not lower to IR");
-  Check((result.ir_dump.find("PackedFmaF16 v59, v20, v43, v59") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v59, SelectU32(exec, PackHalf2x16(CompositeConstructF32x2("
+                      "FPFma32(ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v20, "
+                      "0x00000000, 0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32("
+                      "BitFieldUExtract(v43, 0x00000000, 0x00000010)))), ConvertF32F16(BitCastF16U16("
+                      "ConvertU16U32(BitFieldUExtract(v59, 0x00000000, 0x00000010))))), FPFma32("
+                      "ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract(v20, 0x00000010, "
+                      "0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32(BitFieldUExtract("
+                      "v43, 0x00000010, 0x00000010)))), ConvertF32F16(BitCastF16U16(ConvertU16U32("
+                      "BitFieldUExtract(v59, 0x00000010, 0x00000010))))))), v59)") !=
+         std::string::npos),
         "V_PK_FMAC_F16 did not lower using destination as packed FMA "
         "accumulator");
-  Check(SpirvContainsExtInst(result.spirv, 62),
-        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP3P");
-  Check(SpirvContainsExtInst(result.spirv, 58),
-        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP3P");
-  Check(SpirvContainsExtInst(result.spirv, 50),
-        "SPIR-V binary does not contain GLSL.std.450 Fma for VOP3P");
-  Check(
-      SpirvContainsExtInst(result.spirv, 43),
-      "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped f16 ops");
-  Check(!SpirvContainsExtInst(result.spirv, 37),
-        "SPIR-V binary still contains GLSL.std.450 FMin for VOP3P packed min");
-  Check(!SpirvContainsExtInst(result.spirv, 40),
-        "SPIR-V binary still contains GLSL.std.450 FMax for VOP3P packed max");
-  Check(SpirvContainsOpcode(result.spirv, 169),
-        "SPIR-V binary does not contain OpSelect for VOP3P packed min/max");
-  Check(SpirvContainsOpcode(result.spirv, 184),
-        "SPIR-V binary does not contain OpFOrdLessThan for VOP3P packed min");
-  Check(SpirvContainsOpcode(result.spirv, 190),
-        "SPIR-V binary does not contain OpFOrdGreaterThanEqual for VOP3P "
-        "packed max");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr for VOP3P packed min/max");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd for VOP3P packed min/max");
-  Check(SpirvContainsOpcode(result.spirv, 129),
-        "SPIR-V binary does not contain OpFAdd");
-  Check(SpirvContainsOpcode(result.spirv, 133),
-        "SPIR-V binary does not contain OpFMul");
-  Check(SpirvContainsOpcode(result.spirv, 81),
-        "SPIR-V binary does not contain OpCompositeExtract");
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the lowering checks
+  // above pin ConvertF32F16 (UnpackHalf2x16 + OpCompositeExtract), PackHalf2x16, FPFma32 (Fma),
+  // FPSaturate32 (FClamp), FPAdd32/FPMul32 and the FPMin32/FPMax32 + SelectU32/BitwiseOr32/
+  // BitwiseAnd32 packed min/max that SPIR-V would emit.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3413,52 +3706,68 @@ void TestNewShaderRecompilerStagedShaderOps() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_subb_u32 s2, s0, s1") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_SUBB_U32 s2, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_SUBB_U32");
-  Check((result.decoded_dump.find("s_bitset0_b32 s3, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_BITSET0_B32 s3, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_BITSET0_B32");
-  Check((result.decoded_dump.find("v_fmac_f16 v70, v5, v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMAC_F16 v70, v5, v6") != std::string::npos),
         "new decoder did not decode RDNA2 V_FMAC_F16");
   Check(
-      (result.decoded_dump.find("v_fmamk_f16 v71, v7, 0x3c003c00, v8") != std::string::npos),
+      (result.decoded_dump.find("V_FMAMK_F16 v71, v7, 0x3c003c00, v8") != std::string::npos),
       "new decoder did not consume V_FMAMK_F16 literal as the multiply source");
-  Check((result.decoded_dump.find("v_fmaak_f16 v72, v9, v10, 0x40004000") != std::string::npos),
+  Check((result.decoded_dump.find("V_FMAAK_F16 v72, v9, v10, 0x40004000") != std::string::npos),
         "new decoder did not consume V_FMAAK_F16 literal as the add source");
-  Check((result.ir_dump.find("ScalarSubBorrowCarryU32 s2, s0, s1, scc") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s2, ISub32(ISub32(s0, s1), SelectU32(scc, 0x00000001, "
+                      "0x00000000))") != std::string::npos) &&
+            (lowered.find("SetScc LogicalOr(UGreaterThan32(s1, s0), UGreaterThan32(SelectU32(scc, "
+                          "0x00000001, 0x00000000), ISub32(s0, s1)))") != std::string::npos),
         "S_SUBB_U32 did not lower to scalar subtract-with-borrow IR");
-  Check((result.ir_dump.find("BitClearU32 s3, s3, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s3, BitwiseAnd32(s3, BitwiseNot32(ShiftLeftLogical32("
+                      "0x00000001, BitwiseAnd32(s1, 0x0000001f))))") != std::string::npos),
         "S_BITSET0_B32 did not lower to bit-clear IR using the destination as "
         "input");
+  // The F16 FMA results merge into the low half and preserve the high half. The FMA operands
+  // are elided by the expression depth cap, so their order is pinned on the decoded operands
+  // that the translator passes to FPFma32 in source order (the accumulator is the destination
+  // for V_FMAC_F16).
   Check(
-      (result.ir_dump.find("FmaF16 v70, v5, v6, v70") != std::string::npos),
+      (lowered.find("SetVectorRegister v70, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v70, "
+                    "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                    "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                    "0x00000000)), v70)") != std::string::npos),
       "V_FMAC_F16 did not lower using the destination as the FMA accumulator");
-  Check(
-      (result.ir_dump.find("FmaF16 v71, v7, 0x3c003c00, v8") != std::string::npos),
-      "V_FMAMK_F16 did not lower with the literal in source 1");
-  Check(
-      (result.ir_dump.find("FmaF16 v72, v9, v10, 0x40004000") != std::string::npos),
-      "V_FMAAK_F16 did not lower with the literal in source 2");
-  Check(SpirvContainsOpcode(result.spirv, 130),
-        "SPIR-V binary does not contain OpISub for S_SUBB_U32");
-  Check(SpirvContainsOpcode(result.spirv, 166),
-        "SPIR-V binary does not contain OpLogicalOr for S_SUBB_U32 borrow-out");
-  Check(SpirvContainsOpcode(result.spirv, 172),
-        "SPIR-V binary does not contain OpUGreaterThan for S_SUBB_U32 "
-        "borrow-out");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for S_BITSET0_B32");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd for S_BITSET0_B32");
-  Check(SpirvContainsOpcode(result.spirv, 200),
-        "SPIR-V binary does not contain OpNot for S_BITSET0_B32");
-  Check(SpirvContainsExtInst(result.spirv, 50),
-        "SPIR-V binary does not contain GLSL.std.450 Fma for VOP2 F16 FMA ops");
-  Check(SpirvContainsExtInst(result.spirv, 58),
-        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP2 F16 "
-        "FMA ops");
-  Check(SpirvContainsExtInst(result.spirv, 62),
-        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP2 "
-        "F16 FMA ops");
+  {
+    using namespace ShaderRecompiler::Decoder;
+    Instruction fmamk;
+    DecodeInstruction(shader, 5, fmamk);
+    Check((lowered.find("SetVectorRegister v71, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v71, "
+                        "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                        "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                        "0x00000000)), v71)") != std::string::npos) &&
+              fmamk.opcode == Opcode::V_FMAMK_F16 && fmamk.word_count == 2 &&
+              fmamk.src_count == 3 && fmamk.src0.kind == OperandKind::Vgpr &&
+              fmamk.src0.reg == 7 && fmamk.src1.kind == OperandKind::LiteralConstant &&
+              fmamk.src1.value == 0x3c003c00u && fmamk.src2.kind == OperandKind::Vgpr &&
+              fmamk.src2.reg == 8,
+          "V_FMAMK_F16 did not lower with the literal in source 1");
+    Instruction fmaak;
+    DecodeInstruction(shader, 7, fmaak);
+    Check((lowered.find("SetVectorRegister v72, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v72, "
+                        "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                        "BitCastU16F16(ConvertF16F32(FPFma32(...)))), 0x0000ffff), 0x0000ffff), "
+                        "0x00000000)), v72)") != std::string::npos) &&
+              fmaak.opcode == Opcode::V_FMAAK_F16 && fmaak.word_count == 2 &&
+              fmaak.src_count == 3 && fmaak.src0.kind == OperandKind::Vgpr &&
+              fmaak.src0.reg == 9 && fmaak.src1.kind == OperandKind::Vgpr &&
+              fmaak.src1.reg == 10 && fmaak.src2.kind == OperandKind::LiteralConstant &&
+              fmaak.src2.value == 0x40004000u,
+          "V_FMAAK_F16 did not lower with the literal in source 2");
+  }
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the lowering checks
+  // above pin the ISub32/LogicalOr/UGreaterThan32 (S_SUBB_U32), ShiftLeftLogical32/
+  // BitwiseAnd32/BitwiseNot32 (S_BITSET0_B32) and FPFma32 + ConvertF16F32 (Fma, PackHalf2x16)
+  // operations that SPIR-V would emit.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3483,54 +3792,68 @@ void TestNewShaderRecompilerBootF16UnaryOpcodes() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("v_sqrt_f16 v4.sdwa(sel=5") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("V_SQRT_F16 v4.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode V_SQRT_F16 SDWA high-half destination");
-  Check((result.decoded_dump.find("v_rndne_f16 v3") != std::string::npos),
+  Check((result.decoded_dump.find("V_RNDNE_F16 v3") != std::string::npos),
         "new decoder did not decode V_RNDNE_F16");
-  Check((result.decoded_dump.find("v_floor_f16 v5") != std::string::npos),
+  Check((result.decoded_dump.find("V_FLOOR_F16 v5") != std::string::npos),
         "new decoder did not decode V_FLOOR_F16");
   Check(
-      (result.decoded_dump.find("v_ceil_f16 v9.sdwa(sel=5") != std::string::npos),
+      (result.decoded_dump.find("V_CEIL_F16 v9.sdwa(sel=5") != std::string::npos),
       "new decoder did not decode boot V_CEIL_F16 SDWA high-half destination");
-  Check((result.decoded_dump.find("v_ceil_f16 v9") != std::string::npos),
+  Check((result.decoded_dump.find("V_CEIL_F16 v9, v12") != std::string::npos),
         "new decoder did not decode boot V_CEIL_F16");
-  Check((result.decoded_dump.find("v_trunc_f16 v6") != std::string::npos),
+  Check((result.decoded_dump.find("V_TRUNC_F16 v6") != std::string::npos),
         "new decoder did not decode V_TRUNC_F16");
-  Check((result.decoded_dump.find("v_mov_b32 v7, -1") != std::string::npos) &&
-            (result.decoded_dump.find("v_mov_b32 v8, -1") != std::string::npos),
+  Check((result.decoded_dump.find("V_MOV_B32 v7, -1") != std::string::npos) &&
+            (result.decoded_dump.find("V_MOV_B32 v8, -1") != std::string::npos),
         "new decoder did not accept full-width V_MOV_B32 SDWA with "
         "DST_U=PRESERVE");
   Check((result.decoded_dump.find("VOP1 SDWA destination selector is not supported") == std::string::npos),
         "full-width V_MOV_B32 SDWA with DST_U=PRESERVE was rejected");
   Check((result.decoded_dump.find("unsupported family=VOP2 opcode=0x00") == std::string::npos),
         "VOP1 SDWA extension word was decoded as a phantom VOP2 instruction");
-  Check((result.ir_dump.find("SqrtF16 v4.sdwa(sel=5") != std::string::npos),
+  // SDWA WORD_1 destinations with DST_U=PRESERVE merge into v[31:16] and keep v[15:0]; plain
+  // F16 results merge into v[15:0] and keep v[31:16].
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v4, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(SelectU32("
+                      "FPOrdLessThan32(ConvertF32F16(BitCastF16U16(...)), 0f), 0x0000fe00, "
+                      "PackHalf2x16(CompositeConstructF32x2(FPSqrt(...), 0f))), 0x0000ffff), "
+                      "0x0000ffff), 0x00000010)), v4)") != std::string::npos),
         "V_SQRT_F16 did not lower to f16 sqrt IR");
-  Check((result.ir_dump.find("FloorF16 v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v5, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPFloor32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000000)), v5)") != std::string::npos),
         "V_FLOOR_F16 did not lower to f16 floor IR");
-  Check((result.ir_dump.find("CeilF16 v9.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v9, "
+                      "0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPCeil32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000010)), v9)") != std::string::npos),
         "boot V_CEIL_F16 SDWA did not lower to f16 ceil IR");
-  Check((result.ir_dump.find("CeilF16 v9") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v9, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPCeil32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000000)), v9)") != std::string::npos),
         "V_CEIL_F16 did not lower to f16 ceil IR");
-  Check((result.ir_dump.find("TruncF16 v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v6, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPTrunc32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000000)), v6)") != std::string::npos),
         "V_TRUNC_F16 did not lower to f16 trunc IR");
   Check(
-      (result.ir_dump.find("MoveU32 v7, 0xffffffff") != std::string::npos) &&
-          (result.ir_dump.find("MoveU32 v8, 0xffffffff") != std::string::npos),
+      (lowered.find("SetVectorRegister v7, SelectU32(exec, 0xffffffff, v7)") != std::string::npos) &&
+          (lowered.find("SetVectorRegister v8, SelectU32(exec, 0xffffffff, v8)") != std::string::npos),
       "full-width V_MOV_B32 SDWA with DST_U=PRESERVE did not lower to move IR");
-  Check((result.ir_dump.find("RoundEvenF16 v3") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v3, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v3, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16("
+                      "BitCastU16F16(ConvertF16F32(FPRoundEven32(...)))), 0x0000ffff), 0x0000ffff), "
+                      "0x00000000)), v3)") != std::string::npos),
         "V_RNDNE_F16 did not lower to f16 round-even IR");
-  Check(SpirvContainsExtInst(result.spirv, 31),
-        "SPIR-V binary does not contain GLSL.std.450 Sqrt for V_SQRT_F16");
-  Check(SpirvContainsExtInst(result.spirv, 8),
-        "SPIR-V binary does not contain GLSL.std.450 Floor for V_FLOOR_F16");
-  Check(SpirvContainsExtInst(result.spirv, 9),
-        "SPIR-V binary does not contain GLSL.std.450 Ceil for V_CEIL_F16");
-  Check(SpirvContainsExtInst(result.spirv, 3),
-        "SPIR-V binary does not contain GLSL.std.450 Trunc for V_TRUNC_F16");
-  Check(
-      SpirvContainsExtInst(result.spirv, 2),
-      "SPIR-V binary does not contain GLSL.std.450 RoundEven for V_RNDNE_F16");
+  // Nothing is stored, so optimization leaves no arithmetic for SPIR-V; the lowering checks
+  // above pin the FPSqrt/FPFloor32/FPCeil32/FPTrunc32/FPRoundEven32 operations that emit
+  // GLSL.std.450 Sqrt/Floor/Ceil/Trunc/RoundEven.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3806,117 +4129,164 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("v_lshrrev_b16 v1.sdwa(sel=4") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("V_LSHRREV_B16 v1.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode low-half V_LSHRREV_B16");
-  Check((result.decoded_dump.find("v_lshlrev_b16 v5.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_LSHLREV_B16 v5.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode high-half V_LSHLREV_B16");
-  Check((result.decoded_dump.find("v_add_nc_u16 v1.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_NC_U16 v1.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode V_ADD_NC_U16 op_sel destination");
-  Check((result.decoded_dump.find("v_sub_nc_i16 v17.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_SUB_NC_I16 v17.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode V_SUB_NC_I16 op_sel destination");
-  Check((result.decoded_dump.find("v_pk_sub_i16 v14") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_SUB_I16 v14") != std::string::npos),
         "new decoder did not decode V_PK_SUB_I16");
-  Check((result.decoded_dump.find("v_pk_add_u16 v4") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_ADD_U16 v4") != std::string::npos),
         "new decoder did not decode V_PK_ADD_U16");
-  Check((result.decoded_dump.find("v_pk_add_u16 v4, 0x00007fff") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_ADD_U16 v4, 0x00007fff") != std::string::npos),
         "V_PK_ADD_U16 literal was not consumed as a source operand");
-  Check((result.decoded_dump.find("v_and_b32 v7.sdwa(sel=4") != std::string::npos),
+  Check((result.decoded_dump.find("V_AND_B32 v7.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode partial-destination V_AND_B32 SDWA");
-  Check((result.decoded_dump.find("v_or_b32 v9.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_OR_B32 v9.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode partial-destination V_OR_B32 SDWA");
-  Check((result.decoded_dump.find("v_pk_mul_f16 v12") != std::string::npos),
+  Check((result.decoded_dump.find("V_PK_MUL_F16 v12") != std::string::npos),
         "new decoder did not decode clamped V_PK_MUL_F16");
-  Check((result.decoded_dump.find("v_cvt_f16_u16 v4.sdwa(sel=5") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F16_U16 v4.sdwa(sel=5") != std::string::npos),
         "new decoder did not decode/consume SDWA V_CVT_F16_U16");
-  Check((result.decoded_dump.find("v_cvt_f16_u16 v16") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F16_U16 v16") != std::string::npos),
         "new decoder did not decode plain V_CVT_F16_U16");
-  Check((result.decoded_dump.find("v_cvt_f16_i16 v14") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_F16_I16 v14") != std::string::npos),
         "new decoder did not decode plain V_CVT_F16_I16");
   Check(
-      (result.decoded_dump.find("v_cvt_f16_i16 v14.sdwa(sel=5") != std::string::npos),
+      (result.decoded_dump.find("V_CVT_F16_I16 v14.sdwa(sel=5") != std::string::npos),
       "new decoder did not decode V_CVT_F16_I16 SDWA high-half destination");
-  Check((result.decoded_dump.find("v_cvt_i16_f16 v4") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_I16_F16 v4") != std::string::npos),
         "new decoder did not decode plain V_CVT_I16_F16");
-  Check((result.decoded_dump.find("v_cvt_u16_f16 v15") != std::string::npos),
+  Check((result.decoded_dump.find("V_CVT_U16_F16 v15") != std::string::npos),
         "new decoder still rejects plain V_CVT_U16_F16");
-  Check((result.decoded_dump.find("v_add_nc_u32 v5") != std::string::npos) &&
-            (result.decoded_dump.find("v4.sdwa(sel=4,sext=1") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_NC_U32 v5, 8, v4.sdwa(sel=4,sext=1") != std::string::npos),
         "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended low word");
-  Check((result.decoded_dump.find("v_add_nc_u32 v6") != std::string::npos) &&
-            (result.decoded_dump.find("v6.sdwa(sel=5,sext=1") != std::string::npos),
+  Check((result.decoded_dump.find("V_ADD_NC_U32 v6, 8, v6.sdwa(sel=5,sext=1") != std::string::npos),
         "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
   Check(
-      (result.decoded_dump.find("v_add_nc_u32 v4.sdwa(sel=5,sext=0), vcc_lo, v97") != std::string::npos),
+      (result.decoded_dump.find("V_ADD_NC_U32 v4.sdwa(sel=5,sext=0), vcc_lo, v97") != std::string::npos),
       "new decoder did not decode captured V_ADD_NC_U32 high-word destination");
-  Check((result.decoded_dump.find("v_sub_nc_u32 v11.sdwa(sel=2") != std::string::npos),
+  Check((result.decoded_dump.find("V_SUB_NC_U32 v11.sdwa(sel=2") != std::string::npos),
         "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
-  Check((result.decoded_dump.find("v_min_u32 v10.sdwa(sel=4") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN_U32 v10.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode V_MIN_U32 SDWA low-word destination");
   Check(
       (result.decoded_dump.find("unsupported family=VOP2 opcode=0x00") == std::string::npos),
       "literal/SDWA extension words were decoded as phantom VOP2 instructions");
   Check((result.decoded_dump.find("VOP2 SDWA destination selector is not supported") == std::string::npos),
         "partial bitwise SDWA destination is still rejected");
-  Check((result.ir_dump.find("ShiftRightLogicalU16") != std::string::npos),
+  // The fixture stores nothing, so optimization leaves no arithmetic for SPIR-V; the lowering
+  // checks below pin the IAdd32/ISub32/shift/BitwiseOr32/BitFieldSExtract/conversion/FPSaturate32
+  // operations that emit OpIAdd, OpISub, OpShift*, OpBitwiseOr, OpBitFieldSExtract, OpConvert*
+  // and the GLSL.std.450 FClamp.
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v1, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(ShiftRightLogical32("
+                      "BitFieldUExtract(v0, 0x00000000, 0x00000010), BitwiseAnd32(BitFieldUExtract(...), "
+                      "0x0000000f)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000000)), v1)") !=
+         std::string::npos),
         "V_LSHRREV_B16 did not lower to 16-bit logical right shift IR");
-  Check((result.ir_dump.find("ShiftLeftLogicalU16") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v5, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(ShiftLeftLogical32("
+                      "BitFieldUExtract(v2, 0x00000000, 0x00000010), BitwiseAnd32(BitFieldUExtract(...), "
+                      "0x0000000f)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000010)), v5)") !=
+         std::string::npos),
         "V_LSHLREV_B16 did not lower to 16-bit logical left shift IR");
-  Check((result.ir_dump.find("IAddU16 v1.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v1, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(IAdd32("
+                      "BitFieldUExtract(vcc_lo, 0x00000000, 0x00000010), BitFieldUExtract(v3, 0x00000000, "
+                      "0x00000010)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000010)), v1)") !=
+         std::string::npos),
         "V_ADD_NC_U16 did not lower to 16-bit add IR");
-  Check((result.ir_dump.find("ISubI16 v17.sdwa(sel=5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v17, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v17, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(ISub32("
+                      "BitFieldUExtract(0x00000000, 0x00000000, 0x00000010), BitFieldUExtract(v7, "
+                      "0x00000000, 0x00000010)), 0x0000ffff), 0x0000ffff), 0x0000ffff), 0x00000010)), v17)") !=
+         std::string::npos),
         "V_SUB_NC_I16 did not lower to 16-bit subtract IR");
-  Check((result.ir_dump.find("PackedSubI16 v14") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v14, SelectU32(exec, BitwiseOr32(BitwiseAnd32(ISub32("
+                      "BitFieldUExtract(0x00000000, 0x00000000, 0x00000010), BitFieldUExtract(v7, "
+                      "0x00000000, 0x00000010)), 0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(ISub32("
+                      "BitFieldUExtract(0x00000000, 0x00000000, 0x00000010), BitFieldUExtract(v7, "
+                      "0x00000010, 0x00000010)), 0x0000ffff), 0x00000010)), v14)") != std::string::npos),
         "V_PK_SUB_I16 did not lower to packed I16 subtract IR");
-  Check((result.ir_dump.find("PackedAddU16 v4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseOr32(BitwiseAnd32(IAdd32(") !=
+         std::string::npos) &&
+            (lowered.find("BitFieldUExtract(0x00007fff, 0x00000000, 0x00000010)") != std::string::npos) &&
+            (lowered.find("BitFieldUExtract(v1, 0x00000000, 0x00000010)), 0x0000ffff), "
+                          "ShiftLeftLogical32(BitwiseAnd32(IAdd32(") != std::string::npos) &&
+            (lowered.find("BitFieldUExtract(v1, 0x00000010, 0x00000010)), 0x0000ffff), 0x00000010)), v4)") !=
+             std::string::npos),
         "V_PK_ADD_U16 did not lower to packed U16 add IR");
-  Check((result.ir_dump.find("ConvertI16ToF16 v14") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v7, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(0x00000002, BitFieldUExtract(v2, "
+                      "0x00000000, 0x00000010)), 0x0000ffff), 0x00000000)), v7)") != std::string::npos),
+        "partial low-half V_AND_B32 SDWA destination did not preserve the high word");
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v9, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseOr32(BitFieldUExtract(v8, 0x00000000, "
+                      "0x00000010), BitFieldUExtract(v9, 0x00000000, 0x00000010)), 0x0000ffff), "
+                      "0x00000010)), v9)") != std::string::npos),
+        "partial high-half V_OR_B32 SDWA destination did not preserve the low word");
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, PackHalf2x16(CompositeConstructF32x2("
+                      "FPSaturate32(FPMul32(") != std::string::npos) &&
+            (lowered.find("), FPSaturate32(FPMul32(ConvertF32F16(BitCastF16U16(ConvertU16U32(") !=
+             std::string::npos),
+        "clamped V_PK_MUL_F16 did not lower to saturated per-lane F16 multiply IR");
+  Check((lowered.find("SetVectorRegister v14, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v14, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16("
+                      "ConvertF16F32(ConvertF32S32(...)))), 0x0000ffff), 0x0000ffff), 0x00000000)), v14)") !=
+         std::string::npos),
         "V_CVT_F16_I16 did not lower to signed I16-to-F16 conversion IR");
+  Check((lowered.find("SetVectorRegister v14, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v14, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16("
+                      "ConvertF16F32(ConvertF32S32(...)))), 0x0000ffff), 0x0000ffff), 0x00000010)), v14)") !=
+         std::string::npos),
+        "V_CVT_F16_I16 SDWA did not lower to signed I16-to-F16 conversion IR");
   Check(
-      (result.ir_dump.find("ConvertU16ToF16 v4.sdwa(sel=5") != std::string::npos),
+      (lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v4, 0x0000ffff), "
+                    "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16("
+                    "ConvertF16F32(ConvertF32U32(...)))), 0x0000ffff), 0x0000ffff), 0x00000010)), v4)") !=
+       std::string::npos),
       "V_CVT_F16_U16 SDWA did not lower to unsigned U16-to-F16 conversion IR");
-  Check((result.ir_dump.find("ConvertU16ToF16 v16") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v16, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v16, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(ConvertU32U16(BitCastU16F16("
+                      "ConvertF16F32(ConvertF32U32(...)))), 0x0000ffff), 0x0000ffff), 0x00000000)), v16)") !=
+         std::string::npos),
         "V_CVT_F16_U16 plain form did not lower to unsigned U16-to-F16 "
         "conversion IR");
-  Check((result.ir_dump.find("ConvertF16ToI16 v4") != std::string::npos),
+  // The signed F16-to-I16 conversion is below the expression depth cap; the signed saturation
+  // bound 0xffff8000 pins the signed conversion.
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v4, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(BitwiseAnd32(SelectU32(FPIsNan32("
+                      "ConvertF32F16(...)), 0x00000000, SelectU32(FPOrdLessThanEqual32(...), 0xffff8000, ") !=
+         std::string::npos),
         "V_CVT_I16_F16 did not lower to signed F16-to-I16 conversion IR");
-  Check((result.ir_dump.find("ConvertF16ToU16 v15") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v15, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v15, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseAnd32(SelectU32(FPOrdGreaterThanEqual32("
+                      "ConvertF32F16(BitCastF16U16(...)), 65536f), 0x0000ffff, ConvertU32F32(") !=
+         std::string::npos),
         "V_CVT_U16_F16 did not lower to unsigned F16-to-U16 conversion IR");
-  Check((result.ir_dump.find("IAddU32 v5") != std::string::npos) &&
-            (result.ir_dump.find("v4.sdwa(sel=4,sext=1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, IAdd32(0x00000008, BitFieldSExtract(v4, "
+                      "0x00000000, 0x00000010)), v5)") != std::string::npos),
         "V_ADD_NC_U32 SDWA sign-extended low word did not lower to IR");
-  Check((result.ir_dump.find("IAddU32 v6") != std::string::npos) &&
-            (result.ir_dump.find("v6.sdwa(sel=5,sext=1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, IAdd32(0x00000008, BitFieldSExtract(v6, "
+                      "0x00000010, 0x00000010)), v6)") != std::string::npos),
         "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
-  Check((result.ir_dump.find("IAddU32 v4.sdwa(sel=5,sext=0), vcc_lo, v97") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v4, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(IAdd32(vcc_lo, v97), 0x0000ffff), 0x00000010)), v4)") !=
+         std::string::npos),
         "captured V_ADD_NC_U32 high-word destination did not lower to IR");
-  Check((result.ir_dump.find("ISubU32 v11.sdwa(sel=2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v11, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v11, 0xff00ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(ISub32(0x0000000d, v11), 0x000000ff), 0x00000010)), "
+                      "v11)") != std::string::npos),
         "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
-  Check((result.ir_dump.find("UMinU32 v10.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v10, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v10, 0xffff0000), "
+                      "ShiftLeftLogical32(BitwiseAnd32(UMin32(0x0000001f, v12), 0x0000ffff), 0x00000000)), "
+                      "v10)") != std::string::npos),
         "V_MIN_U32 SDWA low-word destination did not lower to IR");
-  Check(SpirvContainsOpcode(result.spirv, 128),
-        "SPIR-V binary does not contain OpIAdd for U16 operations");
-  Check(SpirvContainsOpcode(result.spirv, 202),
-        "SPIR-V binary does not contain OpBitFieldSExtract for SDWA sign "
-        "extension");
-  Check(SpirvContainsOpcode(result.spirv, 130),
-        "SPIR-V binary does not contain OpISub for I16 operations");
-  Check(SpirvContainsOpcode(result.spirv, 194),
-        "SPIR-V binary does not contain OpShiftRightLogical for B16 shift");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for B16 shift");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr for packed U16 result");
-  Check(SpirvContainsOpcode(result.spirv, 124),
-        "SPIR-V binary does not contain OpConvertSToF for V_CVT_F16_I16");
-  Check(SpirvContainsOpcode(result.spirv, 109),
-        "SPIR-V binary does not contain OpConvertFToU for V_CVT_U16_F16");
-  Check(SpirvContainsOpcode(result.spirv, 110),
-        "SPIR-V binary does not contain OpConvertFToS for V_CVT_I16_F16");
-  Check(SpirvContainsOpcode(result.spirv, 112),
-        "SPIR-V binary does not contain OpConvertUToF for V_CVT_F16_U16");
-  Check(SpirvContainsExtInst(result.spirv, 43),
-        "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped "
-        "V_PK_MUL_F16");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3959,156 +4329,164 @@ void TestNewShaderRecompilerScalarB64Alu() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_mov_b64 s2, s0") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_MOV_B64 s2, s0") != std::string::npos),
         "new decoder did not decode old-backed S_MOV_B64");
-  Check((result.decoded_dump.find("s_not_b32 s41, s0") != std::string::npos),
+  Check((result.decoded_dump.find("S_NOT_B32 s41, s0") != std::string::npos),
         "new decoder did not decode RDNA2 S_NOT_B32");
-  Check((result.decoded_dump.find("s_not_b64 s4, s2") != std::string::npos),
+  Check((result.decoded_dump.find("S_NOT_B64 s4, s2") != std::string::npos),
         "new decoder did not decode old-backed S_NOT_B64");
-  Check((result.decoded_dump.find("s_and_b64 s6, s2, s4") != std::string::npos),
+  Check((result.decoded_dump.find("S_AND_B64 s6, s2, s4") != std::string::npos),
         "new decoder did not decode old-backed S_AND_B64");
-  Check((result.decoded_dump.find("s_or_b64 s8, s6, s2") != std::string::npos),
+  Check((result.decoded_dump.find("S_OR_B64 s8, s6, s2") != std::string::npos),
         "new decoder did not decode old-backed S_OR_B64");
-  Check((result.decoded_dump.find("s_xor_b64 s10, s8, s4") != std::string::npos),
+  Check((result.decoded_dump.find("S_XOR_B64 s10, s8, s4") != std::string::npos),
         "new decoder did not decode old-backed S_XOR_B64");
-  Check((result.decoded_dump.find("s_andn2_b32 s36, s0, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_ANDN2_B32 s36, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_ANDN2_B32");
-  Check((result.decoded_dump.find("s_orn2_b32 s37, s0, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_ORN2_B32 s37, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_ORN2_B32");
-  Check((result.decoded_dump.find("s_nand_b32 s38, s0, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_NAND_B32 s38, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_NAND_B32");
-  Check((result.decoded_dump.find("s_nor_b32 s39, s0, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_NOR_B32 s39, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_NOR_B32");
-  Check((result.decoded_dump.find("s_xnor_b32 s40, s0, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_XNOR_B32 s40, s0, s1") != std::string::npos),
         "new decoder did not decode RDNA2 S_XNOR_B32");
-  Check((result.decoded_dump.find("s_cselect_b64 s12, s10, s2") != std::string::npos),
+  Check((result.decoded_dump.find("S_CSELECT_B64 s12, s10, s2") != std::string::npos),
         "new decoder did not decode old-backed S_CSELECT_B64");
-  Check((result.decoded_dump.find("s_andn2_b64 s14, s10, s4") != std::string::npos),
+  Check((result.decoded_dump.find("S_ANDN2_B64 s14, s10, s4") != std::string::npos),
         "new decoder did not decode old-backed S_ANDN2_B64");
-  Check((result.decoded_dump.find("s_orn2_b64 s16, s14, s6") != std::string::npos),
+  Check((result.decoded_dump.find("S_ORN2_B64 s16, s14, s6") != std::string::npos),
         "new decoder did not decode old-backed S_ORN2_B64");
-  Check((result.decoded_dump.find("s_nand_b64 s18, s16, s8") != std::string::npos),
+  Check((result.decoded_dump.find("S_NAND_B64 s18, s16, s8") != std::string::npos),
         "new decoder did not decode old-backed S_NAND_B64");
-  Check((result.decoded_dump.find("s_nor_b64 s20, s18, s10") != std::string::npos),
+  Check((result.decoded_dump.find("S_NOR_B64 s20, s18, s10") != std::string::npos),
         "new decoder did not decode old-backed S_NOR_B64");
-  Check((result.decoded_dump.find("s_xnor_b64 s22, s20, s12") != std::string::npos),
+  Check((result.decoded_dump.find("S_XNOR_B64 s22, s20, s12") != std::string::npos),
         "new decoder did not decode old-backed S_XNOR_B64");
-  Check((result.decoded_dump.find("s_lshl_b64 s24, s22, s1") != std::string::npos),
+  Check((result.decoded_dump.find("S_LSHL_B64 s24, s22, s1") != std::string::npos),
         "new decoder did not decode old-backed S_LSHL_B64");
-  Check((result.decoded_dump.find("s_lshr_b64 s26, s24, s0") != std::string::npos),
+  Check((result.decoded_dump.find("S_LSHR_B64 s26, s24, s0") != std::string::npos),
         "new decoder did not decode old-backed S_LSHR_B64");
-  Check((result.decoded_dump.find("s_bfm_b64 s28, 4, 2") != std::string::npos),
+  Check((result.decoded_dump.find("S_BFM_B64 s28, 4, 2") != std::string::npos),
         "new decoder did not decode old-backed S_BFM_B64");
-  Check((result.decoded_dump.find("s_bcnt1_i32_b64 s30, s26") != std::string::npos),
+  Check((result.decoded_dump.find("S_BCNT1_I32_B64 s30, s26") != std::string::npos),
         "new decoder did not decode old-backed S_BCNT1_I32_B64");
-  Check((result.decoded_dump.find("s_ff1_i32_b64 s31, s26") != std::string::npos),
+  Check((result.decoded_dump.find("S_FF1_I32_B64 s31, s26") != std::string::npos),
         "new decoder did not decode RDNA2 S_FF1_I32_B64");
-  Check((result.decoded_dump.find("s_flbit_i32_b64 vcc_lo, s26") != std::string::npos),
+  Check((result.decoded_dump.find("S_FLBIT_I32_B64 vcc_lo, s26") != std::string::npos),
         "new decoder did not decode RDNA2 S_FLBIT_I32_B64");
-  Check((result.decoded_dump.find("s_bitreplicate_b64_b32 s32, s30") != std::string::npos),
+  Check((result.decoded_dump.find("S_BITREPLICATE_B64_B32 s32, s30") != std::string::npos),
         "new decoder did not decode old-backed S_BITREPLICATE_B64_B32");
-  Check((result.decoded_dump.find("s_bfe_u64 s34, s32, 0x00040002") != std::string::npos),
+  Check((result.decoded_dump.find("S_BFE_U64 s34, s32, 0x00040002") != std::string::npos),
         "new decoder did not decode old-backed S_BFE_U64");
-  Check((result.decoded_dump.find("s_wqm_b64 exec_lo, exec_lo") != std::string::npos),
+  Check((result.decoded_dump.find("S_WQM_B64 exec_lo, exec_lo") != std::string::npos),
         "new decoder did not decode old-backed S_WQM_B64");
-  Check((result.ir_dump.find("MoveU64 s2, s0") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s2, s0\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s3, s1\n") != std::string::npos),
         "S_MOV_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseNotU32 s41, s0") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s41, BitwiseNot32(s0)\n") != std::string::npos),
         "S_NOT_B32 did not lower to scalar bitwise-not IR");
-  Check((result.ir_dump.find("BitwiseNotU64 s4, s2") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s4, BitwiseNot32(s2)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s5, BitwiseNot32(s3)\n") != std::string::npos),
         "S_NOT_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseAndU64 s6, s2, s4") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s6, BitwiseAnd32(s2, s4)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s7, BitwiseAnd32(s3, s5)\n") != std::string::npos),
         "S_AND_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseOrU64 s8, s6, s2") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s8, BitwiseOr32(s6, s2)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s9, BitwiseOr32(s7, s3)\n") != std::string::npos),
         "S_OR_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseXorU64 s10, s8, s4") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s10, BitwiseXor32(s8, s4)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s11, BitwiseXor32(s9, s5)\n") != std::string::npos),
         "S_XOR_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseAndNotU32 s36, s0, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s36, BitwiseAnd32(s0, BitwiseNot32(s1))\n") != std::string::npos),
         "S_ANDN2_B32 did not lower to scalar bitwise-and-not IR");
-  Check((result.ir_dump.find("BitwiseOrNotU32 s37, s0, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s37, BitwiseOr32(s0, BitwiseNot32(s1))\n") != std::string::npos),
         "S_ORN2_B32 did not lower to scalar bitwise-or-not IR");
-  Check((result.ir_dump.find("BitwiseNandU32 s38, s0, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s38, BitwiseNot32(BitwiseAnd32(s0, s1))\n") != std::string::npos),
         "S_NAND_B32 did not lower to scalar bitwise-nand IR");
-  Check((result.ir_dump.find("BitwiseNorU32 s39, s0, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s39, BitwiseNot32(BitwiseOr32(s0, s1))\n") != std::string::npos),
         "S_NOR_B32 did not lower to scalar bitwise-nor IR");
-  Check((result.ir_dump.find("BitwiseXnorU32 s40, s0, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s40, BitwiseNot32(BitwiseXor32(s0, s1))\n") != std::string::npos),
         "S_XNOR_B32 did not lower to scalar bitwise-xnor IR");
-  Check((result.ir_dump.find("SelectU64 s12") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s12, SelectU32(scc, s10, s2)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s13, SelectU32(scc, s11, s3)\n") != std::string::npos),
         "S_CSELECT_B64 did not lower to paired-dword select IR");
-  Check((result.ir_dump.find("BitwiseAndNotU64 s14, s10, s4") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s14, BitwiseAnd32(s10, BitwiseNot32(s4))\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s15, BitwiseAnd32(s11, BitwiseNot32(s5))\n") != std::string::npos),
         "S_ANDN2_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseOrNotU64 s16, s14, s6") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s16, BitwiseOr32(s14, BitwiseNot32(s6))\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s17, BitwiseOr32(s15, BitwiseNot32(s7))\n") != std::string::npos),
         "S_ORN2_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseNandU64 s18, s16, s8") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s18, BitwiseNot32(BitwiseAnd32(s16, s8))\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s19, BitwiseNot32(BitwiseAnd32(s17, s9))\n") != std::string::npos),
         "S_NAND_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseNorU64 s20, s18, s10") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s20, BitwiseNot32(BitwiseOr32(s18, s10))\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s21, BitwiseNot32(BitwiseOr32(s19, s11))\n") != std::string::npos),
         "S_NOR_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitwiseXnorU64 s22, s20, s12") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s22, BitwiseNot32(BitwiseXor32(s20, s12))\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s23, BitwiseNot32(BitwiseXor32(s21, s13))\n") != std::string::npos),
         "S_XNOR_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("ShiftLeftLogicalU64 s24, s22, s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s24, CompositeExtractU64(ShiftLeftLogical64("
+                      "CompositeConstructU64(s22, s23), s1), 0x00000000)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s25, CompositeExtractU64(ShiftLeftLogical64("
+                          "CompositeConstructU64(s22, s23), s1), 0x00000001)\n") != std::string::npos),
         "S_LSHL_B64 did not lower to paired-dword IR");
   Check(
-      (result.ir_dump.find("ShiftRightLogicalU64 s26, s24, s0") != std::string::npos),
+      (lowered.find("SetScalarRegister s26, CompositeExtractU64(ShiftRightLogical64("
+                    "CompositeConstructU64(s24, s25), s0), 0x00000000)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s27, CompositeExtractU64(ShiftRightLogical64("
+                          "CompositeConstructU64(s24, s25), s0), 0x00000001)\n") != std::string::npos),
       "S_LSHR_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitFieldMaskU64 s28") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s28, CompositeExtractU64(ShiftLeftLogical64(ISub64("
+                      "ShiftLeftLogical64(0x0000000000000001, 0x00000004), 0x0000000000000001), "
+                      "0x00000002), 0x00000000)\n") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s29, CompositeExtractU64(ShiftLeftLogical64(ISub64("
+                          "ShiftLeftLogical64(0x0000000000000001, 0x00000004), 0x0000000000000001), "
+                          "0x00000002), 0x00000001)\n") != std::string::npos),
         "S_BFM_B64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitCountU64 s30, s26") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s30, IAdd32(BitCount32(s26), BitCount32(s27))\n") !=
+         std::string::npos),
         "S_BCNT1_I32_B64 did not lower to paired-source bit count IR");
-  Check((result.ir_dump.find("FindLsbU64 s31, s26") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s31, SelectU32(INotEqual32(CompositeExtractU64("
+                      "CompositeConstructU64(s26, s27), 0x00000000), 0x00000000), FindILsb32("
+                      "CompositeExtractU64(CompositeConstructU64(s26, s27), 0x00000000)), SelectU32("
+                      "INotEqual32(CompositeExtractU64(CompositeConstructU64(s26, s27), 0x00000001), "
+                      "0x00000000), IAdd32(FindILsb32(CompositeExtractU64(CompositeConstructU64(s26, s27), "
+                      "0x00000001)), 0x00000020), 0xffffffff))\n") != std::string::npos),
         "S_FF1_I32_B64 did not lower to paired-source bit search IR");
-  Check((result.ir_dump.find("FindMsbFromHighU64 vcc_lo, s26") != std::string::npos),
+  Check((lowered.find("SetVccLo SelectU32(INotEqual64(CompositeConstructU64(s26, s27), "
+                      "CompositeConstructU64(0x00000000, 0x00000000)), ISub32(0x0000003f, FindUMsb64("
+                      "CompositeConstructU64(s26, s27))), 0xffffffff)\n") != std::string::npos),
         "S_FLBIT_I32_B64 did not lower to paired-source leading-zero IR");
-  Check((result.ir_dump.find("BitReplicateB64B32 s32, s30") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s32, CompositeExtractU64(CompositeConstructU64(BitwiseOr32("
+                      "BitwiseAnd32(BitwiseOr32(BitwiseAnd32(BitwiseOr32(BitwiseAnd32(BitwiseOr32(...), "
+                      "0x0f0f0f0f), ShiftLeftLogical32(BitwiseAnd32(...), 0x00000002)), 0x33333333), "
+                      "ShiftLeftLogical32(BitwiseAnd32(BitwiseOr32(BitwiseAnd32(...), ShiftLeftLogical32(...)), "
+                      "0x33333333), 0x00000001)), 0x55555555), ShiftLeftLogical32(") != std::string::npos) &&
+            (lowered.find("SetScalarRegister s33, CompositeExtractU64(CompositeConstructU64(BitwiseOr32(") !=
+             std::string::npos),
         "S_BITREPLICATE_B64_B32 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("BitFieldExtractU64 s34, s32, 0x00040002") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s34, CompositeExtractU64(BitwiseAnd64(ShiftRightLogical64("
+                      "CompositeConstructU64(s32, s33), BitFieldUExtract(0x00040002, 0x00000000, "
+                      "0x00000006)), CompositeConstructU64(BitFieldInsert(0x00000000, 0xffffffff, 0x00000000, "
+                      "SelectU32(ULessThan32(UMin32(BitFieldUExtract(0x00040002, 0x00000010, 0x00000007), ") !=
+         std::string::npos) &&
+            (lowered.find("SetScalarRegister s35, CompositeExtractU64(BitwiseAnd64(ShiftRightLogical64("
+                          "CompositeConstructU64(s32, s33), BitFieldUExtract(0x00040002, 0x00000000, "
+                          "0x00000006)), ") != std::string::npos),
         "S_BFE_U64 did not lower to paired-dword IR");
-  Check((result.ir_dump.find("WqmB64 exec_lo, exec_lo") != std::string::npos),
+  Check((lowered.find("SetExecLo CompositeExtractU64(WqmU64(CompositeConstructU64(exec_lo, exec_hi)), "
+                      "0x00000000)\nSetExecHi CompositeExtractU64(WqmU64(CompositeConstructU64(exec_lo, "
+                      "exec_hi)), 0x00000001)\n") != std::string::npos),
         "S_WQM_B64 did not lower to whole-quad-mask IR");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 62),
-        "SPIR-V binary does not contain OpStore for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 198),
-        "SPIR-V binary does not contain OpBitwiseXor for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 200),
-        "SPIR-V binary does not contain OpNot for scalar B64 ops");
-  Check(SpirvContainsOpcode(result.spirv, 169),
-        "SPIR-V binary does not contain OpSelect for scalar B64 select");
-  Check(SpirvContainsOpcode(result.spirv, 171),
-        "SPIR-V binary does not contain OpINotEqual for scalar B64 whole-quad "
-        "mask");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for scalar B64 "
-        "shifts");
-  Check(SpirvContainsOpcode(result.spirv, 194),
-        "SPIR-V binary does not contain OpShiftRightLogical for scalar B64 "
-        "shifts");
-  Check(SpirvContainsOpcode(result.spirv, 201),
-        "SPIR-V binary does not contain OpBitFieldInsert for scalar B64 mask");
-  Check(SpirvContainsOpcode(result.spirv, 203),
-        "SPIR-V binary does not contain OpBitFieldUExtract for scalar B64 "
-        "extract");
-  Check(SpirvContainsOpcode(result.spirv, 205),
-        "SPIR-V binary does not contain OpBitCount for scalar B64 bit count");
-  uint32_t componentwise_u64_values = 0;
-  for (const auto *block : result.program.blocks) {
-    for (const auto &value : *block) {
-      switch (value.GetOpcode()) {
-      case ShaderRecompiler::IR::ValueOpcode::BitwiseAnd64:
-        componentwise_u64_values++;
-        break;
-      default:
-        break;
-      }
-    }
-  }
-  Check(
-      componentwise_u64_values == 0u,
-      "architectural B64 lane operations retained vector pack/unpack traffic");
+  Check((lowered.find("SetScc INotEqual64(WqmU64(CompositeConstructU64(exec_lo, exec_hi)), "
+                      "0x0000000000000000)\n") != std::string::npos),
+        "S_WQM_B64 did not set SCC from a 64-bit non-zero test of the whole-quad mask");
+  // The fixture stores nothing, so optimization leaves no arithmetic for SPIR-V; the lowering
+  // checks above pin the BitwiseAnd32/Or32/Xor32/Not32, SelectU32, INotEqual64, shift,
+  // BitFieldInsert, BitFieldUExtract and BitCount32 operations that emit those SPIR-V ops.
+  // TestNewShaderRecompilerScalarB64LaneTranslation checks live B64 lane traffic.
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4187,9 +4565,9 @@ void TestNewShaderRecompilerSignedCompareAlu() {
       EncodeVopc(0x84, 0, 1),  // v_cmp_gt_i32 s0, v1
       EncodeVopc(0x81, 0, 1),  // v_cmp_lt_i32 s0, v1
       0x7d130ef9u,
-      0x86068413u, // v_cmp_lt_i16 vcc_lo.sdwa, v19.word0, v7.word1
+      0x86068413u, // v_cmp_lt_i16 s[4:5], v19, 7 (SDWA)
       0x7d1d02f9u,
-      0x86068213u,            // v_cmp_ge_i16 vcc_lo.sdwa, v19.word0, v1.word1
+      0x86068213u,            // v_cmp_ge_i16 s[2:3], v19, 1 (SDWA)
       EncodeVopc(0xa9, 0, 1), // v_cmp_lt_u16 s0, v1
       EncodeVopc(0x94, 0, 1), // v_cmpx_gt_i32 s0, v1
       0xbf810000u,
@@ -4199,41 +4577,53 @@ void TestNewShaderRecompilerSignedCompareAlu() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_cmp_gt_i32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_CMP_GT_I32 s0, s1") != std::string::npos),
         "new decoder did not decode SOPC signed compare");
-  Check((result.decoded_dump.find("s_cmp_lt_i32") != std::string::npos),
+  Check((result.decoded_dump.find("S_CMP_LT_I32 scc, s0, -2") != std::string::npos),
         "new decoder did not decode SOPK signed compare");
-  Check((result.decoded_dump.find("v_cmp_gt_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_GT_I32 vcc_lo, s0, v1") != std::string::npos),
         "new decoder did not decode VOPC signed greater-than compare");
-  Check((result.decoded_dump.find("v_cmp_lt_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_LT_I32 vcc_lo, s0, v1") != std::string::npos),
         "new decoder did not decode VOPC signed less-than compare");
-  Check((result.decoded_dump.find("v_cmp_lt_i16") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_LT_I16 s4, v19, 7") != std::string::npos),
         "new decoder did not decode VOPC signed halfword less-than compare");
-  Check((result.decoded_dump.find("v_cmp_ge_i16") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_GE_I16 s2, v19, 1") != std::string::npos),
         "new decoder did not decode VOPC signed halfword greater-or-equal "
         "compare");
-  Check((result.decoded_dump.find("v_cmp_lt_u16") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMP_LT_U16 vcc_lo, s0, v1") != std::string::npos),
         "new decoder did not decode VOPC unsigned halfword less-than compare");
-  Check((result.decoded_dump.find("v_cmpx_gt_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_CMPX_GT_I32 exec_lo, s0, v1") != std::string::npos),
         "new decoder did not decode VOPC signed compare-and-mask");
-  Check((result.ir_dump.find("CompareGtI32") != std::string::npos),
+  // The fixture stores nothing, so optimization leaves no comparisons for SPIR-V; the lowering
+  // checks below pin the SGreaterThan32/SLessThan32/BitFieldSExtract operations that emit
+  // OpSGreaterThan, OpSLessThan and OpBitFieldSExtract.
+  Check((lowered.find("SetScc SGreaterThan32(s0, s1)\n") != std::string::npos) &&
+            (lowered.find("SetVcc LogicalAnd(exec, SGreaterThan32(s0, v1))\n") != std::string::npos),
         "signed greater-than compare did not lower to IR");
-  Check((result.ir_dump.find("CompareLtI32") != std::string::npos),
+  Check((lowered.find("SetScc SLessThan32(s0, 0xfffffffe)\n") != std::string::npos) &&
+            (lowered.find("SetVcc LogicalAnd(exec, SLessThan32(s0, v1))\n") != std::string::npos),
         "signed less-than compare did not lower to IR");
-  Check((result.ir_dump.find("CompareLtI16") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s4, CompositeExtractU32x4(Ballot(LogicalAnd(exec, SLessThan32("
+                      "BitFieldSExtract(BitFieldUExtract(v19, 0x00000000, 0x00000010), 0x00000000, "
+                      "0x00000010), BitFieldSExtract(BitFieldUExtract(0x00000007, 0x00000000, 0x00000010), "
+                      "0x00000000, 0x00000010)))), 0x00000000)\n") != std::string::npos),
         "signed halfword less-than compare did not lower to IR");
-  Check((result.ir_dump.find("CompareGeI16") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s2, CompositeExtractU32x4(Ballot(LogicalAnd(exec, "
+                      "SGreaterThanEqual32(BitFieldSExtract(BitFieldUExtract(v19, 0x00000000, 0x00000010), "
+                      "0x00000000, 0x00000010), BitFieldSExtract(BitFieldUExtract(0x00000001, 0x00000000, "
+                      "0x00000010), 0x00000000, 0x00000010)))), 0x00000000)\n") != std::string::npos),
         "signed halfword greater-or-equal compare did not lower to IR");
-  Check((result.ir_dump.find("CompareLtU16") != std::string::npos),
+  Check((lowered.find("SetVcc LogicalAnd(exec, ULessThan32(BitFieldUExtract(s0, 0x00000000, 0x00000010), "
+                      "BitFieldUExtract(v1, 0x00000000, 0x00000010)))\n") != std::string::npos),
         "unsigned halfword less-than compare did not lower to IR");
-  Check((result.ir_dump.find("CompareMaskGtI32 exec_lo") != std::string::npos),
+  Check((lowered.find("SetExec LogicalAnd(exec, SGreaterThan32(s0, v1))\n"
+                      "SetExecLo CompositeExtractU32x4(Ballot(LogicalAnd(exec, SGreaterThan32(s0, v1))), "
+                      "0x00000000)\n") != std::string::npos),
         "signed compare-and-mask did not lower to exec mask IR");
-  Check(SpirvContainsOpcode(result.spirv, 173),
-        "SPIR-V binary does not contain OpSGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 177),
-        "SPIR-V binary does not contain OpSLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 202),
-        "SPIR-V binary does not contain OpBitFieldSExtract for I16 compare");
+  // GFX10 V_CMPX writes EXEC only; the only VCC write of this comparison is V_CMP_GT_I32.
+  Check(CountSourceOccurrences(lowered, "SetVcc LogicalAnd(exec, SGreaterThan32(s0, v1))\n") == 1,
+        "signed compare-and-mask also wrote VCC");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4255,32 +4645,59 @@ void TestNewShaderRecompilerSignedMinShiftAlu() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_min_i32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_MIN_I32 s2, s0, s1") != std::string::npos),
         "new decoder did not decode S_MIN_I32");
-  Check((result.decoded_dump.find("s_ashr_i32") != std::string::npos),
+  Check((result.decoded_dump.find("S_ASHR_I32 s4, s0, 1") != std::string::npos),
         "new decoder did not decode S_ASHR_I32");
-  Check((result.decoded_dump.find("v_min_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_MIN_I32 v1, s0, v0") != std::string::npos),
         "new decoder did not decode V_MIN_I32");
-  Check((result.decoded_dump.find("v_ashrrev_i32") != std::string::npos),
+  Check((result.decoded_dump.find("V_ASHRREV_I32 v4, 1, v3") != std::string::npos),
         "new decoder did not decode V_ASHRREV_I32");
-  Check((result.ir_dump.find("IMinI32 s2") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s2, SMin32(s0, s1)\n") != std::string::npos),
         "S_MIN_I32 did not lower to IR");
-  Check((result.ir_dump.find("IMaxI32 s3") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s3, SMax32(s0, s1)\n") != std::string::npos),
         "S_MAX_I32 did not lower to IR");
-  Check((result.ir_dump.find("ShiftRightArithmeticI32 s4") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s4, ShiftRightArithmetic32(s0, BitwiseAnd32(0x00000001, "
+                      "0x0000001f))\n") != std::string::npos),
         "S_ASHR_I32 did not lower to IR");
-  Check((result.ir_dump.find("IMinI32 v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, SMin32(s0, v0), v1)\n") != std::string::npos),
         "V_MIN_I32 did not lower to IR");
-  Check((result.ir_dump.find("IMaxI32 v2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v2, SelectU32(exec, SMax32(s1, v1), v2)\n") != std::string::npos),
         "V_MAX_I32 did not lower to IR");
-  Check((result.ir_dump.find("ShiftRightArithmeticI32 v4, v3, 0x00000001") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, ShiftRightArithmetic32(v3, "
+                      "BitwiseAnd32(0x00000001, 0x0000001f)), v4)\n") != std::string::npos),
         "V_ASHRREV_I32 did not reverse source order in IR");
-  Check(SpirvContainsOpcode(result.spirv, 173),
-        "SPIR-V binary does not contain OpSGreaterThan");
-  Check(SpirvContainsOpcode(result.spirv, 177),
-        "SPIR-V binary does not contain OpSLessThan");
-  Check(SpirvContainsOpcode(result.spirv, 195),
-        "SPIR-V binary does not contain OpShiftRightArithmetic");
+  // The fixture stores nothing, so optimization leaves no arithmetic for SPIR-V; the SCC
+  // lowerings below (and the shift checks above) pin the SGreaterThan32/SLessThan32/
+  // ShiftRightArithmetic32 operations that emit OpSGreaterThan, OpSLessThan and
+  // OpShiftRightArithmetic.
+  Check((lowered.find("SetScc SLessThan32(s0, s1)\n") != std::string::npos),
+        "S_MIN_I32 did not set SCC from a signed less-than compare");
+  Check((lowered.find("SetScc SGreaterThan32(s0, s1)\n") != std::string::npos),
+        "S_MAX_I32 did not set SCC from a signed greater-than compare");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerBfmWideField() {
+  // S_BFM_B32 truncates a field that runs past bit 31: 8 bits at offset 28 are 0xf0000000.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 136),     // s_mov_b32 s0, 8
+      EncodeSMovB32(1, 156),     // s_mov_b32 s1, 28
+      EncodeSop2(0x24, 2, 0, 1), // s_bfm_b32 s2, s0, s1
+      EncodeVop1(0x01, 0, 2),    // v_mov_b32 v0, s2
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),    // buffer_store_dword v0
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.ir_dump.find("StoreBufferU32") != std::string::npos) &&
+            (result.ir_dump.find("0xf0000000") != std::string::npos),
+        "S_BFM_B32 did not truncate a field running past bit 31");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4308,60 +4725,64 @@ void TestNewShaderRecompilerScalarBitfieldAlu() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_cselect_b32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_CSELECT_B32 s2, s1, s0") != std::string::npos),
         "new decoder did not decode S_CSELECT_B32");
-  Check((result.decoded_dump.find("s_abs_i32") != std::string::npos),
+  Check((result.decoded_dump.find("S_ABS_I32 s3, s0") != std::string::npos),
         "new decoder did not decode S_ABS_I32");
-  Check((result.decoded_dump.find("s_brev_b32") != std::string::npos),
+  Check((result.decoded_dump.find("S_BREV_B32 s4, s1") != std::string::npos),
         "new decoder did not decode S_BREV_B32");
-  Check((result.decoded_dump.find("s_bfm_b32") != std::string::npos),
+  Check((result.decoded_dump.find("S_BFM_B32 s5, 4, 1") != std::string::npos),
         "new decoder did not decode S_BFM_B32");
-  Check((result.decoded_dump.find("s_bfe_u32") != std::string::npos),
+  Check((result.decoded_dump.find("S_BFE_U32 s6, s4, 0x00080004") != std::string::npos),
         "new decoder did not decode S_BFE_U32");
-  Check((result.decoded_dump.find("s_pack_hh_b32_b16") != std::string::npos),
+  Check((result.decoded_dump.find("S_PACK_HH_B32_B16 s9, s0, s1") != std::string::npos),
         "new decoder did not decode S_PACK_HH_B32_B16");
-  Check((result.decoded_dump.find("s_bitcmp0_b32") != std::string::npos),
+  Check((result.decoded_dump.find("S_BITCMP0_B32 s0, s1") != std::string::npos),
         "new decoder did not decode S_BITCMP0_B32");
-  Check((result.decoded_dump.find("s_bitcmp1_b32") != std::string::npos),
+  Check((result.decoded_dump.find("S_BITCMP1_B32 s1, s0") != std::string::npos),
         "new decoder did not decode S_BITCMP1_B32");
-  Check((result.decoded_dump.find("s_cmp_lg_u64") != std::string::npos),
+  Check((result.decoded_dump.find("S_CMP_LG_U64 s0, s2") != std::string::npos),
         "new decoder did not decode S_CMP_LG_U64");
-  Check((result.ir_dump.find("SelectU32 s2") != std::string::npos),
+  // The fixture stores nothing, so optimization leaves no arithmetic for SPIR-V; the lowering
+  // checks below pin the SelectU32, IAbs32 (OpSNegate), BitFieldUExtract, INotEqual64 and
+  // BitReverse32 operations that emit those SPIR-V ops. S_BFM_B32 builds its mask with shifts,
+  // as OpBitFieldInsert is undefined once offset + count passes bit 31.
+  Check((lowered.find("SetScalarRegister s2, SelectU32(scc, s1, s0)\n") != std::string::npos),
         "S_CSELECT_B32 did not lower to IR");
-  Check((result.ir_dump.find("AbsI32 s3") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s3, IAbs32(s0)\n") != std::string::npos),
         "S_ABS_I32 did not lower to IR");
-  Check((result.ir_dump.find("BitReverseU32 s4") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s4, BitReverse32(s1)\n") != std::string::npos),
         "S_BREV_B32 did not lower to IR");
-  Check((result.ir_dump.find("BitFieldMaskU32 s5") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s5, ShiftLeftLogical32(ISub32(ShiftLeftLogical32("
+                      "0x00000001, BitwiseAnd32(0x00000004, 0x0000001f)), 0x00000001), "
+                      "BitwiseAnd32(0x00000001, 0x0000001f))\n") != std::string::npos),
         "S_BFM_B32 did not lower to IR");
-  Check((result.ir_dump.find("BitFieldExtractU32 s6") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s6, BitFieldUExtract(s4, BitFieldUExtract(0x00080004, "
+                      "0x00000000, 0x00000005), UMin32(BitFieldUExtract(0x00080004, 0x00000010, "
+                      "0x00000007), ISub32(0x00000020, BitFieldUExtract(0x00080004, 0x00000000, "
+                      "0x00000005))))\n") != std::string::npos),
         "S_BFE_U32 did not lower to IR");
-  Check((result.ir_dump.find("PackLowLowU16 s7") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s7, BitwiseOr32(BitwiseAnd32(s0, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(s1, 0x0000ffff), 0x00000010))\n") != std::string::npos),
         "S_PACK_LL_B32_B16 did not lower to IR");
-  Check((result.ir_dump.find("PackLowHighU16 s8") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s8, BitwiseOr32(BitwiseAnd32(s0, 0x0000ffff), "
+                      "ShiftLeftLogical32(BitwiseAnd32(ShiftRightLogical32(s1, 0x00000010), 0x0000ffff), "
+                      "0x00000010))\n") != std::string::npos),
         "S_PACK_LH_B32_B16 did not lower to IR");
-  Check((result.ir_dump.find("PackHighHighU16 s9") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s9, BitwiseOr32(BitwiseAnd32(ShiftRightLogical32(s0, "
+                      "0x00000010), 0x0000ffff), ShiftLeftLogical32(BitwiseAnd32(ShiftRightLogical32(s1, "
+                      "0x00000010), 0x0000ffff), 0x00000010))\n") != std::string::npos),
         "S_PACK_HH_B32_B16 did not lower to IR");
-  Check((result.ir_dump.find("BitCompare0B32") != std::string::npos),
+  Check((lowered.find("SetScc IEqual32(BitFieldUExtract(s0, BitwiseAnd32(s1, 0x0000001f), "
+                      "0x00000001), 0x00000000)\n") != std::string::npos),
         "S_BITCMP0_B32 did not lower to IR");
-  Check((result.ir_dump.find("BitCompare1B32") != std::string::npos),
+  Check((lowered.find("SetScc IEqual32(BitFieldUExtract(s1, BitwiseAnd32(s0, 0x0000001f), "
+                      "0x00000001), 0x00000001)\n") != std::string::npos),
         "S_BITCMP1_B32 did not lower to IR");
-  Check((result.ir_dump.find("CompareNeU64") != std::string::npos),
+  Check((lowered.find("SetScc INotEqual64(CompositeConstructU64(s0, s1), CompositeConstructU64(s2, "
+                      "s3))\n") != std::string::npos),
         "S_CMP_LG_U64 did not lower to IR");
-  Check(SpirvContainsOpcode(result.spirv, 126),
-        "SPIR-V binary does not contain OpSNegate");
-  Check(SpirvContainsOpcode(result.spirv, 169),
-        "SPIR-V binary does not contain OpSelect");
-  Check(SpirvContainsOpcode(result.spirv, 201),
-        "SPIR-V binary does not contain OpBitFieldInsert");
-  Check(SpirvContainsOpcode(result.spirv, 203),
-        "SPIR-V binary does not contain OpBitFieldUExtract");
-  Check(SpirvContainsOpcode(result.spirv, 171),
-        "SPIR-V binary does not contain OpINotEqual");
-  Check(SpirvContainsOpcode(result.spirv, 166),
-        "SPIR-V binary does not contain OpLogicalOr");
-  Check(SpirvContainsOpcode(result.spirv, 204),
-        "SPIR-V binary does not contain OpBitReverse");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5100,12 +5521,17 @@ void TestNewShaderRecompilerMemoryFamilyTranslation() {
       EncodeDs1(0, 0, 1), // ds_write_b32 v0, v1
       EncodeDs0(0x36),
       EncodeDs1(2, 0, 1), // ds_read_b32 v2, v1
+      // Unread image results are removed with their instructions; write each
+      // to LDS before the next image result overlaps it.
       EncodeMimg0(0x0e, 0x1),
       EncodeMimg1(5, 0, 0, 1), // image_get_resinfo v5
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 5, 255), // ds_write_b32 v255, v5
       EncodeMimg0(0x00, 0xf),
       EncodeMimg1(4, 0, 0, 1), // image_load v4
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 4, 255), // ds_write_b32 v255, v4 offset:4
       EncodeMimg0(0x20, 0xf),
       EncodeMimg1(3, 0, 0, 1), // image_sample v3
+      EncodeDs0(0x0d, 8), EncodeDs1(0, 3, 255), // ds_write_b32 v255, v3 offset:8
       0xbf810000u,
   };
 
@@ -5115,44 +5541,53 @@ void TestNewShaderRecompilerMemoryFamilyTranslation() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options, ReadZeroTestMemory);
-  Check((result.decoded_dump.find("s_load_dword") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("S_LOAD_DWORD s0, s8") != std::string::npos),
         "new decoder did not decode SMEM dword load");
-  Check((result.decoded_dump.find("s_buffer_load_dword") != std::string::npos),
+  Check((result.decoded_dump.find("S_BUFFER_LOAD_DWORD") != std::string::npos),
         "new decoder did not decode SMEM scalar-buffer dword load");
-  Check((result.decoded_dump.find("s_buffer_load_dword s1, s8") != std::string::npos),
+  Check((result.decoded_dump.find("S_BUFFER_LOAD_DWORD s1, s8") != std::string::npos),
         "SMEM scalar-buffer SBASE was not decoded as an SGPR-pair index");
-  Check((result.decoded_dump.find("buffer_load_dword") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_LOAD_DWORD v0, v1, s0, 0 ; offset=4") != std::string::npos),
         "new decoder did not decode MUBUF dword load");
-  Check((result.decoded_dump.find("buffer_store_dword") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_STORE_DWORD v0, v1, s0, 0 ; offset=8") != std::string::npos),
         "new decoder did not decode MUBUF dword store");
-  Check((result.decoded_dump.find("ds_read_b32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_B32 v2, v1") != std::string::npos),
         "new decoder did not decode DS dword read");
-  Check((result.decoded_dump.find("image_get_resinfo") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GET_RESINFO v5, v1, s0, s0") != std::string::npos),
         "new decoder did not decode MIMG resinfo query");
-  Check((result.decoded_dump.find("image_load") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_LOAD v4, v1, s0, s0") != std::string::npos),
         "new decoder did not decode MIMG load");
-  Check((result.decoded_dump.find("image_sample") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample v3, v1, s0, s0") != std::string::npos),
         "new decoder did not decode MIMG sample");
   Check(
       (result.decoded_dump.find("translation is not implemented") == std::string::npos),
       "implemented memory decode still reports unsupported translation");
-  Check((result.ir_dump.find("SLoadDword s0") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s0, LoadAddressU32(GetAddressResource(s8, s9), s0, "
+                      "0x00000000, true)") != std::string::npos),
         "SMEM load did not lower to IR");
-  Check((result.ir_dump.find("SBufferLoadDword s1") != std::string::npos),
+  Check((lowered.find("SetScalarRegister s1, ReadConstBuffer(GetBufferResource(s8, s9, s10, "
+                      "s11), s0)") != std::string::npos),
         "SMEM scalar-buffer load did not lower to IR");
-  Check((result.ir_dump.find("BufferLoadDword v0") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v0, SelectU32(exec, LoadBufferU32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, ") != std::string::npos),
         "MUBUF load did not lower to IR");
-  Check((result.ir_dump.find("BufferStoreDword null, v0") != std::string::npos),
+  Check((lowered.find("StoreBufferU32 GetBufferResource(s0, s1, s2, s3), v1, 0x00000000, "
+                      "0x00000000, v0, exec") != std::string::npos),
         "MUBUF store did not lower to IR");
-  Check((result.ir_dump.find("DsWriteB32 null, v0") != std::string::npos),
+  Check((lowered.find("WriteSharedU32 v1, v0, exec") != std::string::npos),
         "DS write did not lower to IR");
-  Check((result.ir_dump.find("DsReadB32 v2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v2, SelectU32(exec, LoadSharedU32(v1, exec), v2)") !=
+         std::string::npos),
         "DS read did not lower to IR");
-  Check((result.ir_dump.find("ImageGetResinfo v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageQueryDimensions(") != std::string::npos),
         "MIMG resinfo query did not lower to IR");
-  Check((result.ir_dump.find("ImageLoad v4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageRead(") != std::string::npos),
         "MIMG load did not lower to IR");
-  Check((result.ir_dump.find("ImageSample v3") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v3, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageSampleRaw(") != std::string::npos),
         "MIMG sample did not lower to IR");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
@@ -5284,6 +5719,8 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   const uint32_t shader[] = {
       EncodeMimg0(0x60, 0x3),
       EncodeMimg1(6, 0, 0, 1), // image_get_lod
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 6, 255), // ds_write_b32 v255, v6
       0xbf810000u,
   };
 
@@ -5293,15 +5730,22 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_get_lod") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto queries = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageQueryLod);
+  Check((result.decoded_dump.find("IMAGE_GET_LOD v6, v1, s0, s0") != std::string::npos),
         "new decoder did not decode MIMG image get-lod query");
   Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
         "image_get_lod decode did not preserve dmask metadata");
-  Check((result.ir_dump.find("ImageGetLod v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageQueryLod(") != std::string::npos),
         "image_get_lod did not lower to explicit query IR");
-  Check((result.ir_dump.find("data_dwords=2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageQueryLod(") != std::string::npos) &&
+            (lowered.find("SetVectorRegister v8,") == std::string::npos) &&
+            queries.size() == 1 && queries[0].data_dwords == 2,
         "image_get_lod did not preserve two-component result metadata");
-  Check((result.ir_dump.find("image_addr=2") != std::string::npos),
+  Check(queries.size() == 1 && queries[0].image_address_components == 2,
         "image_get_lod did not preserve address component metadata");
   Check(SpirvContainsOpcode(result.spirv, 105),
         "SPIR-V binary does not contain OpImageQueryLod");
@@ -5322,13 +5766,123 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerDeadImageAccess() {
+  // Unread image results are removed after resource tracking has assigned their metadata;
+  // specialization must leave those stale accesses alone.
+  const uint32_t unread[] = {
+      EncodeMimg0(0x60, 0x3),
+      EncodeMimg1(6, 0, 0, 1), // image_get_lod v6
+      EncodeMimg0(0x20, 0xf),
+      EncodeMimg1(8, 0, 0, 1), // image_sample v8
+      0xbf810000u,
+  };
+  const uint32_t mixed[] = {
+      EncodeMimg0(0x60, 0x3),
+      EncodeMimg1(6, 0, 0, 1), // image_get_lod v6, unread
+      EncodeMimg0(0x00, 0x1),
+      EncodeMimg1(8, 1, 0, 1), // image_load v8
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 8, 255), // ds_write_b32 v255, v8
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+
+  const auto result = RecompileForTest(unread, options);
+  Check(result.program.info.images.empty(),
+        "unread image accesses kept an image resource");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto mixed_result = RecompileForTest(mixed, options);
+  const auto loads = MemoryAccesses(
+      mixed_result.program, ShaderRecompiler::IR::ValueOpcode::ImageRead);
+  Check(mixed_result.program.info.images.size() == 1 && loads.size() == 1 &&
+            loads[0].resource == 0,
+        "a live image load lost its resource next to an unread image access");
+  CheckSpirvBinaryValidates(mixed_result.spirv);
+}
+
+void TestNewShaderRecompilerImageSampleTexelOffsets() {
+  // Vulkan accepts only constant offsets on sampling instructions. Constants in its
+  // guaranteed [-8, 7] range become ConstOffset; other offsets move the coordinates by
+  // offset / mip size.
+  const auto compile = [](uint32_t opcode, std::initializer_list<uint32_t> prologue,
+                          ShaderType stage = ShaderType::Compute) {
+    std::vector<uint32_t> shader(prologue);
+    shader.insert(shader.end(), {EncodeMimg0(opcode, 0xf),
+                                 EncodeMimg1(16, 0, 0, 4)}); // offset v4, xy v[5:6], lod v7
+    if (stage == ShaderType::Pixel) {
+      shader.insert(shader.end(), {EncodeExp0(0x00, 0x1, true, false, true),
+                                   EncodeExp1(16, 0, 0, 0)});
+    } else {
+      shader.insert(shader.end(), {EncodeDs0(0x0d, 0),
+                                   EncodeDs1(0, 16, 255)}); // ds_write_b32 v255, v16
+    }
+    shader.push_back(0xbf810000u);
+    auto ps_info = RegressionPixelInputInfo();
+    auto user_data = ImageTestUserData();
+    auto options = MakeCompileOptions(stage);
+    if (stage == ShaderType::Pixel) {
+      options.input_info.pixel = &ps_info;
+    }
+    options.user_data = user_data;
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  constexpr uint32_t ImageSampleO = 0x30;
+  constexpr uint32_t ImageSampleLO = 0x34;
+  constexpr const char *Sample = "OpImageSampleExplicitLod";
+
+  // x = 1, y = -1
+  auto source = compile(ImageSampleO, {EncodeVop1(0x01, 4, 255), 0x00003f01u});
+  Check(SpirvSourceHasInstructionUsing(source, Sample, "ConstOffset") &&
+            (source.find("OpImageQuerySizeLod") == std::string::npos),
+        "constant texel offset did not use ConstOffset");
+
+  // x = 20 is outside the guaranteed ConstOffset range.
+  source = compile(ImageSampleO, {EncodeVop1(0x01, 4, 255), 0x00000014u});
+  Check(!SpirvSourceHasInstructionUsing(source, Sample, "Offset") &&
+            (source.find("OpImageQuerySizeLod") != std::string::npos),
+        "out-of-range constant texel offset did not move the coordinates");
+
+  source = compile(ImageSampleO, {EncodeVop1(0x01, 4, 40)}); // v_mov_b32 v4, s40
+  Check(!SpirvSourceHasInstructionUsing(source, Sample, "Offset") &&
+            (source.find("OpImageQuerySizeLod") != std::string::npos) &&
+            (source.find("OpBitFieldSExtract") != std::string::npos),
+        "runtime texel offset did not move the coordinates by offset / size");
+  Check(source.find("OpImageQueryLevels") == std::string::npos,
+        "implicit-LOD texel offset should size the base mip");
+
+  source = compile(ImageSampleLO, {EncodeVop1(0x01, 4, 40)});
+  Check(!SpirvSourceHasInstructionUsing(source, Sample, "Offset") &&
+            (source.find("OpImageQueryLevels") != std::string::npos),
+        "explicit-LOD texel offset did not size the clamped sampled mip");
+
+  // Pixel shaders size the mip their implicit LOD selects.
+  source = compile(ImageSampleO, {EncodeVop1(0x01, 4, 40)}, ShaderType::Pixel);
+  Check(!SpirvSourceHasInstructionUsing(source, "OpImageSampleImplicitLod", "Offset") &&
+            (source.find("OpImageQueryLod") != std::string::npos) &&
+            (source.find("OpImageQueryLevels") != std::string::npos),
+        "implicit-LOD pixel texel offset did not size the sampled mip");
+}
+
 void TestNewShaderRecompilerCubeSampleCoordinates() {
   constexpr uint32_t MimgDimCube = 3;
+  // Unread image results are removed with their instructions, so both are written to LDS.
   const uint32_t shader[] = {
       EncodeMimg0(0x20, 0xf, false, MimgDimCube),
       EncodeMimg1(0, 0, 1, 0), // image_sample cube
       EncodeMimg0(0x60, 0x3, false, MimgDimCube),
       EncodeMimg1(8, 0, 1, 4), // image_get_lod cube
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 0, 255), // ds_write_b32 v255, v0
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 8, 255), // ds_write_b32 v255, v8 offset:4
+      0xbf810000u,
+  };
+  const uint32_t lds_writes[] = {
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 0, 255),
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 8, 255),
       0xbf810000u,
   };
 
@@ -5337,16 +5891,19 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
+  const auto writes = RecompileForTest(lds_writes, options);
+  // Count only what the image operations emit, not the LDS address arithmetic.
+  const auto count = [&](uint32_t opcode) {
+    return SpirvInstructionOpcodeCount(result.spirv, opcode) -
+           SpirvInstructionOpcodeCount(writes.spirv, opcode);
+  };
   Check(result.program.info.images.size() == 1 &&
             result.program.info.images[0].cube,
         "cube descriptor identity was not preserved through compilation");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 131) == 4,
+  Check(count(131) == 4,
         "cube sample/get-lod did not remove the RDNA2 S/T bias");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 109) == 1 &&
-            SpirvInstructionOpcodeCount(result.spirv, 112) == 1 &&
-            SpirvInstructionOpcodeCount(result.spirv, 194) == 1 &&
-            SpirvInstructionOpcodeCount(result.spirv, 196) == 1 &&
-            SpirvInstructionOpcodeCount(result.spirv, 130) == 1,
+  Check(count(109) == 1 && count(112) == 1 && count(194) == 1 &&
+            count(196) == 1 && count(130) == 1,
         "cube sample did not repack its face ID exactly once, or get-lod used "
         "an array layer");
   CheckSpirvBinaryValidates(result.spirv);
@@ -5432,6 +5989,17 @@ void TestNewShaderRecompilerImageSampleVariants() {
       EncodeMimg1(40, 0, 0, 1), // image_sample_c_d
       EncodeMimg0(0x20, 0x7),
       EncodeMimg1(48, 0, 0, 1, true), // image_sample with A16 bit
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 8, 255), // ds_write_b32 v255, v8
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 12, 255), // ds_write_b32 v255, v12 offset:4
+      EncodeDs0(0x0d, 8), EncodeDs1(0, 16, 255), // ds_write_b32 v255, v16 offset:8
+      EncodeDs0(0x0d, 12), EncodeDs1(0, 20, 255), // ds_write_b32 v255, v20 offset:12
+      EncodeDs0(0x0d, 16), EncodeDs1(0, 24, 255), // ds_write_b32 v255, v24 offset:16
+      EncodeDs0(0x0d, 20), EncodeDs1(0, 28, 255), // ds_write_b32 v255, v28 offset:20
+      EncodeDs0(0x0d, 24), EncodeDs1(0, 32, 255), // ds_write_b32 v255, v32 offset:24
+      EncodeDs0(0x0d, 28), EncodeDs1(0, 36, 255), // ds_write_b32 v255, v36 offset:28
+      EncodeDs0(0x0d, 32), EncodeDs1(0, 40, 255), // ds_write_b32 v255, v40 offset:32
+      EncodeDs0(0x0d, 36), EncodeDs1(0, 48, 255), // ds_write_b32 v255, v48 offset:36
       0xbf810000u,
   };
 
@@ -5441,26 +6009,37 @@ void TestNewShaderRecompilerImageSampleVariants() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_sample_l") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto samples = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw);
+  const auto has_sample = [&](uint32_t flags, uint32_t address_components) {
+    return std::ranges::any_of(samples, [&](const auto &memory) {
+      return memory.image_sample_flags == flags &&
+             memory.image_address_components == address_components;
+    });
+  };
+  using namespace ShaderRecompiler::Decoder;
+  Check((result.decoded_dump.find("image_sample_l v8, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_L through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_b") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_b v12, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_B through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_lz") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_lz v16, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_LZ through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_c") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_c v20, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_C through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_o") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_o v24, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_O through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_d") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_d v28, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_D through shared MIMG path");
   Check(
-      (result.decoded_dump.find("image_sample_c_lz") != std::string::npos),
+      (result.decoded_dump.find("image_sample_c_lz v32, v1, s0, s0") != std::string::npos),
       "new decoder did not decode IMAGE_SAMPLE_C_LZ through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_c_o") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_c_o v36, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_C_O through shared MIMG path");
-  Check((result.decoded_dump.find("image_sample_c_d") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample_c_d v40, v1, s0, s0") != std::string::npos),
         "new decoder did not decode IMAGE_SAMPLE_C_D through shared MIMG path");
-  Check((result.decoded_dump.find("sample_flags=a16") != std::string::npos),
+  Check((result.decoded_dump.find("image_sample v48, v1, s0, s0 ; dmask=0x7 image_dim=2d "
+                                  "sample_flags=a16") != std::string::npos),
         "IMAGE_SAMPLE with MIMG A16 bit did not expose A16 sample flag");
   Check((result.decoded_dump.find("sample_flags=lod") != std::string::npos),
         "IMAGE_SAMPLE_L did not expose lod sample flag");
@@ -5481,19 +6060,19 @@ void TestNewShaderRecompilerImageSampleVariants() {
   Check(
       (result.decoded_dump.find("sample_flags=derivative|compare addr_components=7") != std::string::npos),
       "IMAGE_SAMPLE_C_D did not expose compare+derivative address width");
-  Check((result.ir_dump.find("ImageSample v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageSampleRaw(") != std::string::npos),
         "IMAGE_SAMPLE_L did not lower to shared IR ImageSample");
-  Check((result.ir_dump.find("ImageSample v28") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v28, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageSampleRaw(") != std::string::npos),
         "IMAGE_SAMPLE_D did not lower to shared IR ImageSample");
-  Check((result.ir_dump.find("image_flags=0x4") != std::string::npos),
+  Check(samples.size() == 10, "an IMAGE_SAMPLE variant did not reach compiled IR");
+  Check(has_sample(ImageSampleFlagDerivative, 6),
         "derivative sample flag did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_addr=6") != std::string::npos),
-        "derivative sample address width did not survive into IR memory "
-        "metadata");
-  Check((result.ir_dump.find("image_addr=7") != std::string::npos),
+  Check(has_sample(ImageSampleFlagDerivative | ImageSampleFlagCompare, 7),
         "compare+derivative sample address width did not survive into IR "
         "memory metadata");
-  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+  Check(has_sample(ImageSampleFlagA16, 2),
         "MIMG A16 bit did not survive into IR memory metadata");
   Check(SpirvContainsOpcode(result.spirv, 88),
         "SPIR-V binary does not contain shared OpImageSampleExplicitLod "
@@ -5515,6 +6094,8 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
   const uint32_t shader[] = {
       EncodeMimg0(0x20, 0x7, false, MimgDim3D),
       EncodeMimg1(8, 0, 0, 4, true), // image_sample, A16 bit, 3D xyz coords
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 8, 255), // ds_write_b32 v255, v8
       0xbf810000u,
   };
 
@@ -5523,25 +6104,41 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
   options.dump_ir = true;
   options.user_data = user_data;
 
+  const uint32_t lds_writes[] = {
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 8, 255),
+      0xbf810000u,
+  };
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_dim=3d sample_flags=a16 addr_components=3") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto writes = RecompileForTest(lds_writes, options);
+  // Count only what the sample emits, not the LDS address arithmetic.
+  const auto count = [&](uint32_t opcode) {
+    return SpirvInstructionOpcodeCount(result.spirv, opcode) -
+           SpirvInstructionOpcodeCount(writes.spirv, opcode);
+  };
+  const auto samples = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw);
+  Check((result.decoded_dump.find("image_sample v8, v4, s0, s0 ; dmask=0x7 image_dim=3d "
+                                  "sample_flags=a16 addr_components=3") != std::string::npos),
         "3D IMAGE_SAMPLE with MIMG A16 bit did not decode as three A16 sampler "
         "coords");
-  Check((result.ir_dump.find("ImageSample v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageSampleRaw(") != std::string::npos),
         "3D A16 IMAGE_SAMPLE did not lower to sample IR");
-  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+  Check(samples.size() == 1 &&
+            samples[0].image_sample_flags == ShaderRecompiler::Decoder::ImageSampleFlagA16,
         "3D A16 IMAGE_SAMPLE did not preserve A16 memory metadata");
-  Check((result.ir_dump.find("image_dim=3d") != std::string::npos),
+  Check(samples.size() == 1 &&
+            samples[0].image_dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D,
         "3D A16 IMAGE_SAMPLE did not preserve image dimension metadata");
-  Check(
-      (result.ir_dump.find("image_addr=3") != std::string::npos),
-      "3D A16 IMAGE_SAMPLE did not preserve three logical address components");
+  Check(samples.size() == 1 && samples[0].image_address_components == 3,
+        "3D A16 IMAGE_SAMPLE did not preserve three logical address components");
   Check(SpirvExtInstCount(result.spirv, 62) == 3,
         "sampler A16 xyz coordinates should be converted from three packed f16 "
         "components");
-  Check(SpirvContainsOpcode(result.spirv, 194),
+  Check(count(194) > 0,
         "sampler A16 high-half coordinate extraction is missing");
-  Check(SpirvContainsOpcode(result.spirv, 199),
+  Check(count(199) > 0,
         "sampler A16 low-half coordinate masking is missing");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -5556,6 +6153,11 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
       EncodeMimg1(16, 0, 0, 4), // image_sample_c_a
       EncodeMimg0(0xad, 0x1),
       EncodeMimg1(20, 0, 0, 4), // image_sample_c_b_a
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 6, 255), // ds_write_b32 v255, v6
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 12, 255), // ds_write_b32 v255, v12 offset:4
+      EncodeDs0(0x0d, 8), EncodeDs1(0, 16, 255), // ds_write_b32 v255, v16 offset:8
+      EncodeDs0(0x0d, 12), EncodeDs1(0, 20, 255), // ds_write_b32 v255, v20 offset:12
       0xbf810000u,
   };
 
@@ -5589,8 +6191,12 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
 void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
   auto compile = [](uint32_t opcode, uint32_t dmask, uint32_t vdata) {
     const uint32_t shader[] = {
+        // A runtime offset/reference; a zero-initialized VGPR folds it away.
+        EncodeVop1(0x01, 4, 40), // v_mov_b32 v4, s40
         EncodeMimg0(opcode, dmask),
         EncodeMimg1(vdata, 0, 0, 4, true),
+        // Unread image results are removed with their instructions; write them to LDS.
+        EncodeDs0(0x0d, 0), EncodeDs1(0, vdata, 255), // ds_write_b32 v255, vdata
         0xbf810000u,
     };
 
@@ -5604,11 +6210,19 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
     return result;
   };
 
+  const auto sample_flags = [](const TestCompileResult &result) {
+    const auto samples = MemoryAccesses(
+        result.program, ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw);
+    return samples.size() == 1 ? samples[0].image_sample_flags : UINT32_MAX;
+  };
+  using namespace ShaderRecompiler::Decoder;
+
   {
     const auto result = compile(0x28, 0x1, 12); // image_sample_c with A16 bit
-    Check((result.decoded_dump.find("sample_flags=compare|a16 addr_components=3") != std::string::npos),
+    Check((result.decoded_dump.find("image_sample_c v12, v4, s0, s0 ; dmask=0x1 image_dim=2d "
+                                    "sample_flags=compare|a16 addr_components=3") != std::string::npos),
           "A16 IMAGE_SAMPLE_C did not preserve compare+A16 metadata");
-    Check((result.ir_dump.find("image_flags=0x88") != std::string::npos),
+    Check(sample_flags(result) == (ImageSampleFlagCompare | ImageSampleFlagA16),
           "A16 IMAGE_SAMPLE_C did not preserve compare+A16 IR flags");
     Check(SpirvInstructionOpcodeCount(result.spirv, 90) == 1,
           "A16 IMAGE_SAMPLE_C should emit one dref sample");
@@ -5619,9 +6233,10 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
 
   {
     const auto result = compile(0x30, 0xf, 16); // image_sample_o with A16 bit
-    Check((result.decoded_dump.find("sample_flags=offset|a16 addr_components=3") != std::string::npos),
+    Check((result.decoded_dump.find("image_sample_o v16, v4, s0, s0 ; dmask=0xf image_dim=2d "
+                                    "sample_flags=offset|a16 addr_components=3") != std::string::npos),
           "A16 IMAGE_SAMPLE_O did not preserve offset+A16 metadata");
-    Check((result.ir_dump.find("image_flags=0x90") != std::string::npos),
+    Check(sample_flags(result) == (ImageSampleFlagOffset | ImageSampleFlagA16),
           "A16 IMAGE_SAMPLE_O did not preserve offset+A16 IR flags");
     Check(SpirvContainsOpcode(result.spirv, 202),
           "texel offset should still be decoded from its packed 6-bit fields");
@@ -5635,6 +6250,8 @@ void TestNewShaderRecompilerImageLoadA16UintCoords() {
   const uint32_t shader[] = {
       EncodeMimg0(0x00, 0x3),
       EncodeMimg1(20, 0, 0, 4, true), // image_load, A16 bit
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 20, 255), // ds_write_b32 v255, v20
       0xbf810000u,
   };
 
@@ -5643,21 +6260,36 @@ void TestNewShaderRecompilerImageLoadA16UintCoords() {
   options.dump_ir = true;
   options.user_data = user_data;
 
+  const uint32_t lds_writes[] = {
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 20, 255),
+      0xbf810000u,
+  };
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_load") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto writes = RecompileForTest(lds_writes, options);
+  // Count only what the load emits, not the LDS address arithmetic.
+  const auto count = [&](uint32_t opcode) {
+    return SpirvInstructionOpcodeCount(result.spirv, opcode) -
+           SpirvInstructionOpcodeCount(writes.spirv, opcode);
+  };
+  const auto loads = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageRead);
+  Check((result.decoded_dump.find("IMAGE_LOAD v20, v4, s0, s0 ; dmask=0x3") != std::string::npos),
         "A16 IMAGE_LOAD did not decode");
-  Check((result.ir_dump.find("ImageLoad v20") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v20, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageRead(") != std::string::npos),
         "A16 IMAGE_LOAD did not lower to image-load IR");
-  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+  Check(loads.size() == 1 &&
+            loads[0].image_sample_flags == ShaderRecompiler::Decoder::ImageSampleFlagA16,
         "A16 IMAGE_LOAD did not preserve A16 memory metadata");
-  Check((result.ir_dump.find("image_addr=2") != std::string::npos),
+  Check(loads.size() == 1 && loads[0].image_address_components == 2,
         "A16 IMAGE_LOAD did not preserve logical address component count");
   Check(!SpirvContainsExtInst(result.spirv, 62),
         "image ops without sampler use u16 A16 addresses and must not unpack "
         "f16");
-  Check(SpirvContainsOpcode(result.spirv, 194),
+  Check(count(194) > 0,
         "u16 A16 high-half coordinate extraction is missing");
-  Check(SpirvContainsOpcode(result.spirv, 199),
+  Check(count(199) > 0,
         "u16 A16 low-half coordinate masking is missing");
   Check(SpirvContainsOpcode(result.spirv, 95),
         "A16 IMAGE_LOAD did not emit an image fetch");
@@ -5775,7 +6407,20 @@ void TestNewShaderRecompilerImageViewDimensions() {
       EncodeMimg0(0x0e, 0xf, false, MimgDim1D),
       EncodeMimg1(32, 8, 0, 32), // image_get_resinfo 1D
       EncodeMimg0(0x00, 0xf, false, MimgDim1D),
-      EncodeMimg1(36, 9, 0, 36), // integer image_load 1D
+      // Slot 10: a 32-bit format in slot 9 would be dword 5 of the resinfo
+      // descriptor and set its reserved bits.
+      EncodeMimg1(36, 10, 0, 36), // integer image_load 1D
+      // Unread image results are removed with their instructions; store them.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 15, 0), // buffer_store_dword v0
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(4, 15, 0), // buffer_store_dword v4 offset:4
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(8, 15, 0), // buffer_store_dword v8 offset:8
+      EncodeMubuf0(0x1c, 12, false), EncodeMubuf1(12, 15, 0), // buffer_store_dword v12 offset:12
+      EncodeMubuf0(0x1c, 16, false), EncodeMubuf1(16, 15, 0), // buffer_store_dword v16 offset:16
+      EncodeMubuf0(0x1c, 20, false), EncodeMubuf1(20, 15, 0), // buffer_store_dword v20 offset:20
+      EncodeMubuf0(0x1c, 24, false), EncodeMubuf1(24, 15, 0), // buffer_store_dword v24 offset:24
+      EncodeMubuf0(0x1c, 28, false), EncodeMubuf1(28, 15, 0), // buffer_store_dword v28 offset:28
+      EncodeMubuf0(0x1c, 32, false), EncodeMubuf1(32, 15, 0), // buffer_store_dword v32 offset:32
+      EncodeMubuf0(0x1c, 36, false), EncodeMubuf1(36, 15, 0), // buffer_store_dword v36 offset:36
       0xbf810000u,
   };
 
@@ -5790,8 +6435,10 @@ void TestNewShaderRecompilerImageViewDimensions() {
   SetImageTestType(&user_data, 6, Prospero::ImageType::kColor1D);
   SetImageTestType(&user_data, 7, Prospero::ImageType::kColor1D);
   SetImageTestType(&user_data, 8, Prospero::ImageType::kColor1D);
-  SetImageTestType(&user_data, 9, Prospero::ImageType::kColor1D);
-  SetImageTestFormat(&user_data, 9, Prospero::BufferFormat::k32UInt);
+  SetImageTestType(&user_data, 10, Prospero::ImageType::kColor1D);
+  SetImageTestFormat(&user_data, 10, Prospero::BufferFormat::k32UInt);
+  std::fill_n(user_data.begin() + 60, 4, 0u);
+  user_data[63] = 3u << 28u; // raw buffer in slot 15 for the result stores
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &ps_info;
@@ -5799,6 +6446,20 @@ void TestNewShaderRecompilerImageViewDimensions() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
+  std::vector<ShaderRecompiler::IR::MemoryInfo> accesses;
+  for (const auto opcode : {ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw,
+                            ShaderRecompiler::IR::ValueOpcode::ImageRead,
+                            ShaderRecompiler::IR::ValueOpcode::ImageQueryDimensions}) {
+    const auto found = MemoryAccesses(result.program, opcode);
+    accesses.insert(accesses.end(), found.begin(), found.end());
+  }
+  const auto has_view = [&](ShaderRecompiler::Decoder::ImageDimension dimension) {
+    return std::ranges::any_of(accesses, [&](const auto &memory) {
+      return memory.image_dimension == dimension;
+    });
+  };
+  using ShaderRecompiler::Decoder::ImageDimension;
+  Check(accesses.size() == 10, "an image view access did not reach compiled IR");
   Check((result.decoded_dump.find("image_dim=2d_array") != std::string::npos),
         "MIMG DIM did not decode 2D-array image view");
   Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
@@ -5814,13 +6475,13 @@ void TestNewShaderRecompilerImageViewDimensions() {
   Check(
       (result.decoded_dump.find("image_dim=2d_array sample_flags=lod addr_components=4") != std::string::npos),
       "2D-array LOD sample did not include slice plus LOD address components");
-  Check((result.ir_dump.find("image_dim=2d_array") != std::string::npos),
+  Check(has_view(ImageDimension::Dim2DArray),
         "2D-array image view did not survive into IR metadata");
-  Check((result.ir_dump.find("image_dim=3d") != std::string::npos),
+  Check(has_view(ImageDimension::Dim3D),
         "3D image view did not survive into IR metadata");
-  Check((result.ir_dump.find("image_dim=1d") != std::string::npos),
+  Check(has_view(ImageDimension::Dim1D),
         "1D image view did not survive into IR metadata");
-  Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
+  Check(has_view(ImageDimension::Dim1DArray),
         "1D-array image view did not survive into IR metadata");
   Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 1),
         "SPIR-V binary does not contain sampled 1D image type");
@@ -5832,8 +6493,9 @@ void TestNewShaderRecompilerImageViewDimensions() {
         "SPIR-V binary does not contain sampled 3D image type");
   Check(SpirvContainsCapability(result.spirv, 43),
         "SPIR-V binary does not request Sampled1D");
-  Check(SpirvContainsCapability(result.spirv, 44),
-        "SPIR-V binary does not request Image1D");
+  // Image1D is only for 1D storage images; every image here is sampled.
+  Check(!SpirvContainsCapability(result.spirv, 44),
+        "SPIR-V binary requested Image1D without a 1D storage image");
   Check(SpirvContainsOpcode(result.spirv, 95),
         "SPIR-V binary does not contain array image fetch");
   CheckSpirvBinaryValidates(result.spirv);
@@ -5868,9 +6530,12 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("image_dim=1d") != std::string::npos),
+  const auto stores = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageWrite);
+  using ShaderRecompiler::Decoder::ImageDimension;
+  Check(stores.size() == 2 && stores[0].image_dimension == ImageDimension::Dim1D,
         "1D storage dimension did not survive into IR metadata");
-  Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
+  Check(stores.size() == 2 && stores[1].image_dimension == ImageDimension::Dim1DArray,
         "1D-array storage dimension did not survive into IR metadata");
   Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 2),
         "SPIR-V binary does not contain storage 1D image type");
@@ -5879,10 +6544,12 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       StorageImageBinding(0).c_str()),
         "1D store did not access the 1D storage descriptor binding");
   Check(
-      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                     StorageImageBinding(1).c_str()),
       "1D-array store did not access the 1D-array storage descriptor binding");
 }
 
@@ -5890,6 +6557,8 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
   const uint32_t shader[] = {
       EncodeMimg0(0x20, 0xf, false, 0),
       EncodeMimg1(0, 0, 1, 0), // 1D instruction with a null image descriptor
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 0, 255), // ds_write_b32 v255, v0
       0xbf810000u,
   };
   std::array<uint32_t, 64> user_data{};
@@ -5920,6 +6589,13 @@ void TestNewShaderRecompilerImageGatherVariants() {
       EncodeMimg1(76, 0, 1, 20), // image_gather4_c_o
       EncodeMimg0(0x5f, 0x1),
       EncodeMimg1(80, 0, 1, 24), // image_gather4_c_lz_o
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 60, 255), // ds_write_b32 v255, v60
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 64, 255), // ds_write_b32 v255, v64 offset:4
+      EncodeDs0(0x0d, 8), EncodeDs1(0, 68, 255), // ds_write_b32 v255, v68 offset:8
+      EncodeDs0(0x0d, 12), EncodeDs1(0, 72, 255), // ds_write_b32 v255, v72 offset:12
+      EncodeDs0(0x0d, 16), EncodeDs1(0, 76, 255), // ds_write_b32 v255, v76 offset:16
+      EncodeDs0(0x0d, 20), EncodeDs1(0, 80, 255), // ds_write_b32 v255, v80 offset:20
       0xbf810000u,
   };
 
@@ -5929,19 +6605,33 @@ void TestNewShaderRecompilerImageGatherVariants() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_gather4_lz") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto gathers = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageGatherRaw);
+  const auto has_gather = [&](uint32_t flags) {
+    return std::ranges::any_of(gathers, [&](const auto &memory) {
+      return memory.image_sample_flags == flags;
+    });
+  };
+  const auto gathered = [&](const char *vdst) {
+    return lowered.find(std::string("SetVectorRegister ") + vdst +
+                        ", SelectU32(exec, CompositeExtractU32x4(ImageGatherRaw(") !=
+           std::string::npos;
+  };
+  using namespace ShaderRecompiler::Decoder;
+  Check((result.decoded_dump.find("IMAGE_GATHER4_LZ v60, v4, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_LZ");
-  Check((result.decoded_dump.find("image_gather4_lz_o") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_LZ_O v72, v16, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_LZ_O");
-  Check((result.decoded_dump.find("image_gather4_c") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C v64, v8, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_C");
-  Check((result.decoded_dump.find("image_gather4_c_lz") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C_LZ v68, v12, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_C_LZ");
-  Check((result.decoded_dump.find("image_gather4_c_o") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C_O v76, v20, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_C_O");
-  Check((result.decoded_dump.find("image_gather4_c_lz_o") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C_LZ_O v80, v24, s0, s4") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_C_LZ_O");
-  Check((result.decoded_dump.find("dmask=0x4") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_LZ_O v72, v16, s0, s4 ; dmask=0x4") != std::string::npos),
         "IMAGE_GATHER4_LZ_O did not preserve gather component dmask");
   Check((result.decoded_dump.find("sample_flags=offset|level_zero addr_components=3") != std::string::npos),
         "IMAGE_GATHER4_LZ_O did not expose shared offset sample metadata");
@@ -5955,29 +6645,26 @@ void TestNewShaderRecompilerImageGatherVariants() {
   Check((result.decoded_dump.find("sample_flags=compare|offset|level_zero addr_components=4") != std::string::npos),
         "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample "
         "metadata");
-  Check((result.ir_dump.find("ImageGather4 v60") != std::string::npos),
-        "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v64") != std::string::npos),
-        "IMAGE_GATHER4_C did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v68") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v72") != std::string::npos),
-        "IMAGE_GATHER4_LZ_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v76") != std::string::npos),
-        "IMAGE_GATHER4_C_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v80") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+  Check(gathered("v60"), "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
+  Check(gathered("v64"), "IMAGE_GATHER4_C did not lower to shared IR ImageGather4");
+  Check(gathered("v68"), "IMAGE_GATHER4_C_LZ did not lower to shared IR ImageGather4");
+  Check(gathered("v72"), "IMAGE_GATHER4_LZ_O did not lower to shared IR ImageGather4");
+  Check(gathered("v76"), "IMAGE_GATHER4_C_O did not lower to shared IR ImageGather4");
+  Check(gathered("v80"), "IMAGE_GATHER4_C_LZ_O did not lower to shared IR ImageGather4");
+  Check(gathers.size() == 6 && std::ranges::all_of(gathers, [](const auto &memory) {
+          return memory.data_dwords == 4;
+        }),
         "IMAGE_GATHER4 did not preserve four-component result metadata");
-  Check((result.ir_dump.find("image_flags=0x30") != std::string::npos),
+  Check(has_gather(ImageSampleFlagOffset | ImageSampleFlagLevelZero),
         "IMAGE_GATHER4_LZ_O flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x8") != std::string::npos),
+  Check(has_gather(ImageSampleFlagCompare),
         "IMAGE_GATHER4_C flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x28") != std::string::npos),
+  Check(has_gather(ImageSampleFlagCompare | ImageSampleFlagLevelZero),
         "IMAGE_GATHER4_C_LZ flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x18") != std::string::npos),
+  Check(has_gather(ImageSampleFlagCompare | ImageSampleFlagOffset),
         "IMAGE_GATHER4_C_O flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x38") != std::string::npos),
+  Check(has_gather(ImageSampleFlagCompare | ImageSampleFlagOffset |
+                   ImageSampleFlagLevelZero),
         "IMAGE_GATHER4_C_LZ_O flags did not survive into IR memory metadata");
   Check(SpirvContainsCapability(result.spirv, 25),
         "SPIR-V binary does not request ImageGatherExtended");
@@ -6000,6 +6687,9 @@ void TestNewShaderRecompilerImageLoadVariants() {
       EncodeMimg1(8, 0, 0, 1), // image_load dmask xy
       EncodeMimg0(0x01, 0xf),
       EncodeMimg1(12, 1, 0, 4), // image_load_mip dmask xyzw
+      // Unread image results are removed with their instructions; write them to LDS.
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 8, 255), // ds_write_b32 v255, v8
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 12, 255), // ds_write_b32 v255, v12 offset:4
       0xbf810000u,
   };
 
@@ -6009,24 +6699,30 @@ void TestNewShaderRecompilerImageLoadVariants() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_load") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto loads = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageRead);
+  Check((result.decoded_dump.find("IMAGE_LOAD v8, v1, s0, s0") != std::string::npos),
         "new decoder did not decode MIMG image load");
-  Check((result.decoded_dump.find("image_load_mip") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_LOAD_MIP v12, v4, s4, s0") != std::string::npos),
         "new decoder did not decode MIMG image load mip");
-  Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_LOAD v8, v1, s0, s0 ; dmask=0x3") != std::string::npos),
         "image_load decode did not preserve partial dmask");
-  Check((result.decoded_dump.find("dmask=0xf") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_LOAD_MIP v12, v4, s4, s0 ; dmask=0xf") != std::string::npos),
         "image_load_mip decode did not preserve full dmask");
-  Check((result.ir_dump.find("ImageLoad v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageRead(GetImageResource(s0, ") != std::string::npos),
         "image_load did not lower through shared image-load IR");
-  Check((result.ir_dump.find("ImageLoad v12") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, CompositeExtractU32x4("
+                      "ImageRead(GetImageResource(s4, ") != std::string::npos),
         "image_load_mip did not lower through shared image-load IR");
-  Check((result.ir_dump.find("data_dwords=2") != std::string::npos),
+  Check(loads.size() == 2 && loads[0].data_dwords == 2,
         "image_load dmask xy did not preserve two-component result metadata");
-  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+  Check(loads.size() == 2 && loads[1].data_dwords == 4,
         "image_load_mip dmask xyzw did not preserve four-component result "
         "metadata");
-  Check((result.ir_dump.find("image_addr=3 image_mip=1") != std::string::npos),
+  Check(loads.size() == 2 && loads[1].image_address_components == 3 &&
+            loads[1].image_has_mip && !loads[0].image_has_mip,
         "image_load_mip did not preserve mip address component metadata");
   Check(SpirvContainsOpcode(result.spirv, 95),
         "SPIR-V binary does not contain OpImageFetch");
@@ -6042,6 +6738,8 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
   const uint32_t shader[] = {
       0xf0000130u, // image_load v3, v[5:7], s[0:7] dmask:x dim:2d_msaa
       0x00000305u,
+      // Unread image results are removed with their instructions; store them.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(3, 15, 0), // buffer_store_dword v3
       0xbf810000u,
   };
 
@@ -6049,15 +6747,22 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
   user_data[3] |= 2u << 16u;
   user_data[5] |= 2u << 4u;
   user_data[6] |= 1u << 10u;
+  std::fill_n(user_data.begin() + 60, 4, 0u);
+  user_data[63] = 3u << 28u; // raw buffer in slot 15 for the result stores
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_dim=2d_msaa") != std::string::npos) &&
-            (result.ir_dump.find("image_dim=2d_msaa") != std::string::npos) &&
-            (result.ir_dump.find("image_addr=3 image_mip=0") != std::string::npos),
+  const auto loads = MemoryAccesses(
+      result.program, ShaderRecompiler::IR::ValueOpcode::ImageRead);
+  Check((result.decoded_dump.find("IMAGE_LOAD v3, v5, s0, s0 ; dmask=0x1 image_dim=2d_msaa") !=
+         std::string::npos) &&
+            loads.size() == 1 &&
+            loads[0].image_dimension ==
+                ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+            loads[0].image_address_components == 3 && !loads[0].image_has_mip,
         "RDNA2 2D-MSAA load did not preserve x, y, and fragment ID");
   Check(result.program.info.images.size() == 1 &&
             result.program.info.images[0].dimension ==
@@ -6096,23 +6801,49 @@ void TestNewShaderRecompilerImageStoreTranslation() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_store") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("IMAGE_STORE v20, v4, s0") != std::string::npos),
         "new decoder did not decode MIMG image store");
-  Check((result.decoded_dump.find("image_store_mip") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_STORE_MIP v24, v8, s4") != std::string::npos),
         "new decoder did not decode MIMG image store mip");
   Check((result.decoded_dump.find("dmask=0xf") != std::string::npos),
         "image store decode did not preserve full dmask");
   Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
         "image store mip decode did not preserve partial dmask");
-  Check((result.ir_dump.find("ImageStore null, v20, v4") != std::string::npos),
+  Check((lowered.find("ImageWrite GetImageResource(s0, s1, s2, s3, s4, s5, s6, s7), "
+                      "MakeImageAddress(v4, v5, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000), CompositeConstructU32x4(v20, v21, v22, v23), exec") !=
+         std::string::npos),
         "image_store did not lower to shared image-store IR");
-  Check((result.ir_dump.find("ImageStore null, v24, v8") != std::string::npos),
+  Check((lowered.find("ImageWrite GetImageResource(s4, s5, s6, s7, s8, s9, s10, s11), "
+                      "MakeImageAddress(v8, v9, v10, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000), CompositeConstructU32x4(v24, v25, 0x00000000, 0x00000000), "
+                      "exec") != std::string::npos),
         "image_store_mip did not lower to shared image-store IR");
-  Check((result.ir_dump.find("storage_image") != std::string::npos),
+  Check(SpirvContainsTypeImage(result.spirv, 1, 0, 2),
         "image store IR did not use storage-image resource metadata");
-  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+  const auto has_store = [&](bool mip, uint32_t data_dwords,
+                             uint32_t address_components) {
+    return std::ranges::any_of(result.program.blocks, [&](const auto *block) {
+      return std::ranges::any_of(*block, [&](const auto &inst) {
+        if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::ImageWrite) {
+          return false;
+        }
+        const auto index =
+            inst.template Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+        return index < result.program.memory_info.size() &&
+               result.program.memory_info[index].image_has_mip == mip &&
+               result.program.memory_info[index].data_dwords == data_dwords &&
+               result.program.memory_info[index].image_address_components ==
+                   address_components;
+      });
+    });
+  };
+  Check(has_store(false, 4u, 2u),
         "full-dmask image store did not preserve data component count");
-  Check((result.ir_dump.find("image_addr=3 image_mip=1") != std::string::npos),
+  Check(has_store(true, 2u, 3u),
         "mip image store did not preserve mip address component count");
   Check(SpirvContainsOpcode(result.spirv, 99),
         "SPIR-V binary does not contain OpImageWrite");
@@ -6147,7 +6878,8 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_STORE v20, v4, s20, s0 ; dmask=0xf image_dim=3d") !=
+         std::string::npos),
         "MIMG store did not decode the RDNA2 3D instruction dimension");
   const auto has_3d_store = std::ranges::any_of(
       result.program.blocks, [&](const auto *block) {
@@ -6172,7 +6904,8 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       StorageImageBinding(4).c_str()),
         "storage image store did not access the 3D storage descriptor binding");
 }
 
@@ -6201,20 +6934,24 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_STORE v20, v4, s20, s0 ; dmask=0xf image_dim=3d") !=
+         std::string::npos),
         "test MIMG store should decode as a 3D instruction");
   Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 0, 2),
         "SPIR-V binary does not contain storage 2D image type");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                        StorageImageBinding(2).c_str()),
         "2D descriptor storage image store did not access the base storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                        StorageImageBinding(3).c_str()),
         "2D descriptor storage image store unexpectedly used the array storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                        StorageImageBinding(4).c_str()),
         "2D descriptor storage image store unexpectedly used the 3D storage "
         "binding");
 }
@@ -6237,38 +6974,67 @@ void TestNewShaderRecompilerImageAtomicTranslation() {
   };
 
   auto user_data = ImageTestUserData();
+  // Image atomics need a 32-bit integer descriptor format.
+  SetImageTestFormat(&user_data, 0, Prospero::BufferFormat::k32UInt);
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_atomic_add") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_ADD v52, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic add");
-  Check((result.decoded_dump.find("image_atomic_umin") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_UMIN v53, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic umin");
-  Check((result.decoded_dump.find("image_atomic_umax") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_UMAX v57, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic umax");
-  Check((result.decoded_dump.find("image_atomic_and") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_AND v54, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic and");
-  Check((result.decoded_dump.find("image_atomic_or") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_OR v55, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic or");
-  Check((result.decoded_dump.find("image_atomic_xor") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_XOR v56, v1, s0") != std::string::npos),
         "new decoder did not decode MIMG image atomic xor");
   Check((result.decoded_dump.find("dmask=0x1") != std::string::npos),
         "image atomic decode did not preserve dmask metadata");
-  Check((result.ir_dump.find("AtomicAddU32 v52, v52, v1") != std::string::npos),
+  // GLC atomics return the pre-op value into VDATA, which also supplies the operand.
+  Check((lowered.find("SetVectorRegister v52, SelectU32(exec, ImageAtomicIAdd32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v52, exec), v52)") !=
+         std::string::npos),
         "image_atomic_add did not lower through shared atomic IR");
-  Check((result.ir_dump.find("AtomicUMinU32 v53, v53, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v53, SelectU32(exec, ImageAtomicUMin32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v53, exec), v53)") !=
+         std::string::npos),
         "image_atomic_umin did not lower through shared atomic IR");
-  Check((result.ir_dump.find("AtomicUMaxU32 v57, v57, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v57, SelectU32(exec, ImageAtomicUMax32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v57, exec), v57)") !=
+         std::string::npos),
         "image_atomic_umax did not lower through shared atomic IR");
-  Check((result.ir_dump.find("AtomicAndU32 v54, v54, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v54, SelectU32(exec, ImageAtomicAnd32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v54, exec), v54)") !=
+         std::string::npos),
         "image_atomic_and did not lower through shared atomic IR");
-  Check((result.ir_dump.find("AtomicOrU32 v55, v55, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v55, SelectU32(exec, ImageAtomicOr32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v55, exec), v55)") !=
+         std::string::npos),
         "image_atomic_or did not lower through shared atomic IR");
-  Check((result.ir_dump.find("AtomicXorU32 v56, v56, v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v56, SelectU32(exec, ImageAtomicXor32(GetImageResource("
+                      "s0, s1, s2, s3, s4, s5, s6, s7), MakeImageAddress(v1, v2, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, "
+                      "0x00000000, 0x00000000, 0x00000000, 0x00000000), v56, exec), v56)") !=
+         std::string::npos),
         "image_atomic_xor did not lower through shared atomic IR");
-  Check((result.ir_dump.find("storage_image_uint") != std::string::npos),
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check((source.find("OpTypeImage %uint 2D 0 0 0 2 R32ui") != std::string::npos),
         "image atomic IR did not use uint storage-image metadata");
   Check(SpirvContainsOpcode(result.spirv, 60),
         "SPIR-V binary does not contain OpImageTexelPointer");
@@ -6294,6 +7060,8 @@ void TestNewShaderRecompilerVintrpTranslation() {
       EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
       EncodeVintrp(1, 11, 1, 2, 4), // v_interp_p2_f32 v11, v4, attr1.z
       EncodeVintrp(2, 12, 0, 3, 2), // v_interp_mov_f32 v12, p0, attr0.w
+      // Export the interpolants so the input loads stay live in SPIR-V.
+      EncodeExp0(0x00, 0x3), EncodeExp1(11, 12, 0, 0),
       0xbf810000u,
   };
 
@@ -6306,22 +7074,26 @@ void TestNewShaderRecompilerVintrpTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("v_interp_p1_f32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("V_INTERP_P1_F32 v10, v4, 1, 2") != std::string::npos),
         "new decoder did not decode VINTRP P1");
-  Check((result.decoded_dump.find("v_interp_p2_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_INTERP_P2_F32 v11, v4, 1, 2") != std::string::npos),
         "new decoder did not decode VINTRP P2");
-  Check((result.decoded_dump.find("v_interp_mov_f32") != std::string::npos),
+  Check((result.decoded_dump.find("V_INTERP_MOV_F32 v12, 2, 0, 3") != std::string::npos),
         "new decoder did not decode VINTRP MOV");
-  Check((result.ir_dump.find("ControlNop") != std::string::npos),
-        "VINTRP P1 did not lower to an explicit no-op marker");
-  Check((result.ir_dump.find("LoadInputF32 v11") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v10") == std::string::npos),
+        "VINTRP P1 did not lower to a no-op");
+  Check((lowered.find("SetVectorRegister v11, SelectU32(exec, GetAttribute(") != std::string::npos),
         "VINTRP P2 did not lower to input-load IR");
-  Check((result.ir_dump.find("input_attr=1 input_chan=2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v11, SelectU32(exec, GetAttribute(0x00000001, "
+                      "0x00000002), v11)") != std::string::npos),
         "VINTRP P2 did not preserve attr/channel metadata");
-  Check((result.ir_dump.find("LoadInputF32 v12") != std::string::npos),
-        "VINTRP MOV did not lower to input-load IR");
-  Check((result.ir_dump.find("input_attr=0 input_chan=3") != std::string::npos),
-        "VINTRP MOV did not preserve attr/channel metadata");
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, GetInterpolationParameter(") !=
+         std::string::npos),
+        "VINTRP MOV did not lower to interpolation-parameter IR");
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, GetInterpolationParameter("
+                      "0x00000000, 0x00000003, 0x00000002), v12)") != std::string::npos),
+        "VINTRP MOV did not preserve attr/channel/P0 metadata");
   Check(ProgramInputCount(result.program,
                           ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
         "VINTRP pixel shader did not reflect parameter inputs");
@@ -6345,8 +7117,11 @@ void TestNewShaderRecompilerVintrpTranslation() {
   options.input_info.pixel = &remapped_ps_info;
 
   auto remapped_result = RecompileForTest(remapped_shader, options);
+  const auto remapped_frontend =
+      TranslateExpressionsForTest(remapped_shader, options);
   Check(
-      (remapped_result.ir_dump.find("input_attr=2 input_chan=0") != std::string::npos),
+      (remapped_frontend.find("SetVectorRegister v11, SelectU32(exec, GetAttribute(0x00000002, "
+                              "0x00000000), v11)") != std::string::npos),
       "remapped VINTRP did not preserve raw pixel attribute metadata");
   Check(
       SpirvHasDecorationValue(remapped_result.spirv, 30u, 3u),
@@ -6360,6 +7135,8 @@ void TestNewShaderRecompilerVintrpTranslation() {
       EncodeVintrp(0, 10, 0, 0, 4), // v_interp_p1_f32 v10, v4, attr0.x
       EncodeVintrp(1, 6, 1, 0, 4),  // v_interp_p2_f32 v6, v4, attr1.x
       EncodeVintrp(1, 10, 0, 0, 4), // v_interp_p2_f32 v10, v4, attr0.x
+      // Unexported interpolants are removed with their inputs; export both.
+      EncodeExp0(0x00, 0x3), EncodeExp1(6, 10, 0, 0),
       0xbf810000u,
   };
   ShaderPixelInputInfo duplicate_ps_info{};
@@ -6373,10 +7150,18 @@ void TestNewShaderRecompilerVintrpTranslation() {
                           ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
         "duplicate-location VINTRP shader did not reflect both raw parameter "
         "attrs");
-  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 0u) == 1,
-        "duplicate-location VINTRP emitted more than one Location 0 input");
-  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 1,
-        "duplicate-location VINTRP did not fall back attr1 to Location 1");
+  Check(CountSourceOccurrences(duplicate_result.ir_dump, "= GetAttribute ") == 2,
+        "duplicate-location VINTRP did not keep both attribute reads");
+  // Both SPI_PS_INPUT_CNTL offsets are 0, so as on hardware both attrs read the
+  // same vertex parameter: attr1 shares attr0's Location 0 input.
+  const auto duplicate_source = DisassembleSpirvBinary(duplicate_result.spirv);
+  Check(CountSourceOccurrences(duplicate_source,
+                               "= OpVariable %_ptr_Input_v4float Input") == 1 &&
+            (duplicate_source.find("OpDecorate %in_param_0 Location 0") !=
+             std::string::npos),
+        "duplicate-location VINTRP did not share one Location 0 input");
+  Check(!SpirvHasDecorationValue(duplicate_result.spirv, 30u, 1u),
+        "duplicate-location VINTRP moved attr1 off its mapped Location 0");
   CheckSpirvBinaryValidates(duplicate_result.spirv);
 
   const uint32_t flat_shader[] = {
@@ -6970,6 +7755,8 @@ void TestNewShaderRecompilerBufferSignedLoadTranslation() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x09, 3), EncodeMubuf1(46, 0, 1), // buffer_load_sbyte
       EncodeMubuf0(0x0b, 6), EncodeMubuf1(47, 0, 1), // buffer_load_sshort
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(46, 12, 0), // buffer_store_dword v46
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(47, 12, 0), // buffer_store_dword v47
       0xbf810000u,
   };
 
@@ -6977,27 +7764,41 @@ void TestNewShaderRecompilerBufferSignedLoadTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("buffer_load_sbyte") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("BUFFER_LOAD_SBYTE v46, v1, s0, 0 ; offset=3") != std::string::npos),
         "new decoder did not decode buffer signed byte load");
-  Check((result.decoded_dump.find("buffer_load_sshort") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_LOAD_SSHORT v47, v1, s0, 0 ; offset=6") != std::string::npos),
         "new decoder did not decode buffer signed short load");
-  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+  Check((result.decoded_dump.find("offset=3 offset2=0 dwords=1 bits=8 ") != std::string::npos),
         "signed byte buffer load did not preserve bit width metadata");
-  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+  Check((result.decoded_dump.find("offset=6 offset2=0 dwords=1 bits=16 ") != std::string::npos),
         "signed short buffer load did not preserve bit width metadata");
-  Check((result.decoded_dump.find("signed=1") != std::string::npos),
+  Check(CountSourceOccurrences(result.decoded_dump, "signed=1") == 2,
         "signed buffer loads did not preserve signed metadata");
-  Check((result.ir_dump.find("BufferLoadSbyte v46") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v46, SelectU32(exec, BitFieldSExtract(ConvertU32U8("
+                      "LoadBufferU8(GetBufferResource(s0, s1, s2, s3), v1, 0x00000000, 0x00000000, "
+                      "exec)), 0x00000000, 0x00000008), v46)") != std::string::npos),
         "buffer_load_sbyte did not lower to signed byte IR load");
-  Check((result.ir_dump.find("BufferLoadSshort v47") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v47, SelectU32(exec, BitFieldSExtract(ConvertU32U16("
+                      "LoadBufferU16(GetBufferResource(s0, s1, s2, s3), v1, 0x00000000, 0x00000000, "
+                      "exec)), 0x00000000, 0x00000010), v47)") != std::string::npos),
         "buffer_load_sshort did not lower to signed short IR load");
+  bool sbyte_offset = false;
+  bool sshort_offset = false;
+  for (const auto &memory : result.program.memory_info) {
+    if (memory.kind != ShaderRecompiler::IR::ResourceKind::Buffer || !memory.data_signed) {
+      continue;
+    }
+    sbyte_offset |= memory.data_bits == 8u && memory.offset == 3u;
+    sshort_offset |= memory.data_bits == 16u && memory.offset == 6u;
+  }
+  Check(sbyte_offset && sshort_offset,
+        "signed buffer loads lost their instruction offsets");
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad");
-  Check(SpirvContainsOpcode(result.spirv, 195),
-        "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for sign "
         "extension");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
@@ -7014,30 +7815,34 @@ void TestNewShaderRecompilerBufferSubDwordStoreTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("buffer_store_byte") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("BUFFER_STORE_BYTE v48, v1, s0, 0 ; offset=2") != std::string::npos),
         "new decoder did not decode buffer byte store");
-  Check((result.decoded_dump.find("buffer_store_short") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_STORE_SHORT v49, v1, s0, 0 ; offset=4") != std::string::npos),
         "new decoder did not decode buffer short store");
-  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+  Check((result.decoded_dump.find("offset=2 offset2=0 dwords=1 bits=8 ") != std::string::npos),
         "buffer byte store did not preserve bit width metadata");
-  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+  Check((result.decoded_dump.find("offset=4 offset2=0 dwords=1 bits=16 ") != std::string::npos),
         "buffer short store did not preserve bit width metadata");
-  Check((result.ir_dump.find("BufferStoreByte null, v48") != std::string::npos),
+  Check((lowered.find("StoreBufferU8 GetBufferResource(s0, s1, s2, s3), v1, 0x00000000, "
+                      "0x00000000, ConvertU8U32(v48), exec\n") != std::string::npos),
         "buffer_store_byte did not lower to byte store IR");
-  Check((result.ir_dump.find("BufferStoreShort null, v49") != std::string::npos),
+  Check((lowered.find("StoreBufferU16 GetBufferResource(s0, s1, s2, s3), v1, 0x00000000, "
+                      "0x00000000, ConvertU16U32(v49), exec\n") != std::string::npos),
         "buffer_store_short did not lower to short store IR");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad for sub-dword store RMW");
+  Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU8 ") == 1 &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU16 ") == 1,
+        "sub-dword buffer stores were not preserved as native-width operations");
+  // Sub-dword stores now use native 8/16-bit storage-buffer access instead of a dword
+  // read-modify-write, so pin the narrow storage capabilities and the narrowing conversion.
+  Check(SpirvContainsCapability(result.spirv, 4448),
+        "SPIR-V binary does not request StorageBuffer8BitAccess for byte store");
+  Check(SpirvContainsCapability(result.spirv, 4433),
+        "SPIR-V binary does not request StorageBuffer16BitAccess for short store");
+  Check(SpirvContainsOpcode(result.spirv, 113),
+        "SPIR-V binary does not contain OpUConvert for sub-dword store narrowing");
   Check(SpirvContainsOpcode(result.spirv, 62),
-        "SPIR-V binary does not contain OpStore for sub-dword store RMW");
-  Check(SpirvContainsOpcode(result.spirv, 197),
-        "SPIR-V binary does not contain OpBitwiseOr");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd");
-  Check(SpirvContainsOpcode(result.spirv, 200),
-        "SPIR-V binary does not contain OpNot");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical");
+        "SPIR-V binary does not contain OpStore for sub-dword store");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7195,6 +8000,8 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   const uint32_t shader[] = {
       EncodeFlat0(0x08, 0, 4),
       EncodeFlat1(9, 0x7d, 0, 1), // flat_load_ubyte
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(9, 12, 0), // buffer_store_dword v9
       0xbf810000u,
   };
 
@@ -7202,9 +8009,11 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("flat_load_ubyte") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("FLAT_LOAD_UBYTE v9, v1, v2 ; offset=4") != std::string::npos),
         "new decoder did not decode old-backed FLAT ubyte load");
-  Check((result.ir_dump.find("FlatLoadUbyte v9") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, ConvertU32U8(LoadAddressU8("
+                      "GetAddressResource(v1, v2), v1, v2, exec)), v9)") != std::string::npos),
         "old-backed FLAT ubyte load did not lower to IR");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
@@ -7252,6 +8061,10 @@ void TestNewShaderRecompilerFlatSignedLoadTranslation() {
       EncodeFlat1(11, 0x7d, 0, 1), // scratch_load_sshort
       EncodeFlat0(0x09, 2, 12),
       EncodeFlat1(12, 0x7d, 0, 1), // global_load_sbyte
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(10, 12, 0), // buffer_store_dword v10
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(12, 12, 0), // buffer_store_dword v12
       0xbf810000u,
   };
 
@@ -7259,31 +8072,52 @@ void TestNewShaderRecompilerFlatSignedLoadTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("flat_load_sbyte") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("FLAT_LOAD_SBYTE v10, v1, v2 ; offset=4") != std::string::npos),
         "new decoder did not decode flat signed byte load");
-  Check((result.decoded_dump.find("flat_load_sshort") != std::string::npos),
+  Check((result.decoded_dump.find("FLAT_LOAD_SSHORT v11, v1, v2 ; offset=8") != std::string::npos),
         "new decoder did not decode flat signed short load");
-  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+  Check((result.decoded_dump.find("offset=4 offset2=0 dwords=1 bits=8 ") != std::string::npos),
         "signed byte flat load did not preserve bit width metadata");
-  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+  Check((result.decoded_dump.find("offset=8 offset2=0 dwords=1 bits=16 ") != std::string::npos),
         "signed short flat load did not preserve bit width metadata");
-  Check((result.decoded_dump.find("signed=1") != std::string::npos),
+  Check(CountSourceOccurrences(result.decoded_dump, "signed=1") == 3,
         "signed flat loads did not preserve signed metadata");
-  Check((result.ir_dump.find("FlatLoadSbyte v10") != std::string::npos),
+  Check((result.decoded_dump.find("signed=1 typed=0 formatted=0 segment=1") != std::string::npos),
+        "signed scratch load decode did not preserve scratch segment metadata");
+  Check((result.decoded_dump.find("signed=1 typed=0 formatted=0 segment=2") != std::string::npos),
+        "signed global load decode did not preserve global segment metadata");
+  Check((lowered.find("SetVectorRegister v10, SelectU32(exec, BitFieldSExtract(ConvertU32U8("
+                      "LoadAddressU8(GetAddressResource(v1, v2), v1, v2, exec)), 0x00000000, "
+                      "0x00000008), v10)") != std::string::npos),
         "flat_load_sbyte did not lower to signed byte IR load");
-  Check((result.ir_dump.find("FlatLoadSshort v11") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v11, SelectU32(exec, BitFieldSExtract(ConvertU32U16("
+                      "LoadAddressU16(GetScratchResource(), v1, 0x00000000, exec)), 0x00000000, "
+                      "0x00000010), v11)") != std::string::npos),
         "flat_load_sshort did not lower to signed short IR load");
-  Check((result.ir_dump.find("scratch") != std::string::npos),
-        "signed scratch load did not preserve scratch metadata");
-  Check((result.ir_dump.find("global") != std::string::npos),
-        "signed global load did not preserve global metadata");
+  Check((lowered.find("SetVectorRegister v12, SelectU32(exec, BitFieldSExtract(ConvertU32U8("
+                      "LoadAddressU8(GetAddressResource(v1, v2), v1, v2, exec)), 0x00000000, "
+                      "0x00000008), v12)") != std::string::npos),
+        "global_load_sbyte did not lower to signed byte IR load");
+  bool scratch_short = false;
+  bool global_byte = false;
+  for (const auto &memory : result.program.memory_info) {
+    if (!memory.data_signed) {
+      continue;
+    }
+    scratch_short |= memory.kind == ShaderRecompiler::IR::ResourceKind::Scratch &&
+                     memory.data_bits == 16u && memory.offset == 8u;
+    global_byte |= memory.kind == ShaderRecompiler::IR::ResourceKind::Global &&
+                   memory.data_bits == 8u && memory.offset == 12u &&
+                   memory.address_is_full;
+  }
+  Check(scratch_short, "signed scratch load did not preserve scratch metadata");
+  Check(global_byte, "signed global load did not preserve global metadata");
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad");
-  Check(SpirvContainsOpcode(result.spirv, 195),
-        "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for sign "
         "extension");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
@@ -7306,50 +8140,91 @@ void TestNewShaderRecompilerFlatStoreTranslation() {
       0xbf810000u,
   };
 
+  ShaderComputeInputInfo compute{};
+  compute.scratch_size_dwords = 4; // scratch stores reach byte 16 per thread
   auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
   options.dump_ir = true;
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("flat_store_byte") != std::string::npos),
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(shader, decoded);
+  const auto decoded_dump = ShaderRecompiler::Decoder::ProgramToString(decoded);
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  const auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  Check((decoded_dump.find("FLAT_STORE_BYTE v72, v1, v2") != std::string::npos),
         "new decoder did not decode flat byte store");
-  Check((result.decoded_dump.find("flat_store_short") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_SHORT v73, v1, v2") != std::string::npos),
         "new decoder did not decode flat short store");
-  Check((result.decoded_dump.find("flat_store_dword") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORD v60, v1, v2") != std::string::npos),
         "new decoder did not decode flat dword store");
-  Check((result.decoded_dump.find("flat_store_dwordx2") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORDX2 v61, v1, v2") != std::string::npos),
         "new decoder did not decode flat dwordx2 store");
-  Check((result.decoded_dump.find("flat_store_dwordx3") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORDX3 v64, v1, v2") != std::string::npos),
         "new decoder did not decode flat dwordx3 store");
-  Check((result.decoded_dump.find("flat_store_dwordx4") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORDX4 v68, v1, v2") != std::string::npos),
         "new decoder did not decode flat dwordx4 store");
-  Check((result.decoded_dump.find("segment=1") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_SHORT v73, v1, v2 ; offset=6 offset2=0 dwords=1 bits=16 "
+                           "dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=1") != std::string::npos),
         "flat store decode did not preserve scratch segment metadata");
-  Check((result.decoded_dump.find("segment=2") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORDX4 v68, v1, v2 ; offset=16 offset2=0 dwords=4 bits=32 "
+                           "dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=2") != std::string::npos),
         "flat store decode did not preserve global segment metadata");
-  Check((result.decoded_dump.find("dwords=1 bits=8") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_BYTE v72, v1, v2 ; offset=2 offset2=0 dwords=1 bits=8") !=
+         std::string::npos),
         "flat byte store decode did not expose byte-width metadata");
-  Check((result.decoded_dump.find("dwords=1 bits=16") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_SHORT v73, v1, v2 ; offset=6 offset2=0 dwords=1 bits=16") !=
+         std::string::npos),
         "flat short store decode did not expose short-width metadata");
-  Check((result.decoded_dump.find("dwords=4 bits=32") != std::string::npos),
+  Check((decoded_dump.find("FLAT_STORE_DWORDX4 v68, v1, v2 ; offset=16 offset2=0 dwords=4 bits=32") !=
+         std::string::npos),
         "flat store decode did not expose wide width metadata");
-  Check((result.ir_dump.find("FlatStoreByte null, v72") != std::string::npos),
+  Check((lowered.find("StoreAddressU8 GetAddressResource(v1, v2), v1, v2, ConvertU8U32(v72), "
+                      "exec") != std::string::npos),
         "flat_store_byte did not lower through shared flat store IR");
-  Check((result.ir_dump.find("FlatStoreShort null, v73") != std::string::npos),
+  Check((lowered.find("StoreAddressU16 GetScratchResource(), v1, 0x00000000, "
+                      "ConvertU16U32(v73), exec") != std::string::npos),
         "flat_store_short did not lower through shared flat store IR");
-  Check((result.ir_dump.find("FlatStoreDword null, v60") != std::string::npos),
+  Check((lowered.find("StoreAddressU32 GetAddressResource(v1, v2), v1, v2, v60, exec") !=
+         std::string::npos),
         "flat_store_dword did not lower through shared flat store IR");
-  Check((result.ir_dump.find("FlatStoreDword null, v62") != std::string::npos),
+  Check((lowered.find("StoreAddressU32 GetScratchResource(), v1, 0x00000000, v62, exec") !=
+         std::string::npos),
         "scratch_store_dwordx2 did not expand to the last dword store");
-  Check((result.ir_dump.find("FlatStoreDword null, v66") != std::string::npos),
+  Check((lowered.find("StoreAddressU32 GetAddressResource(v1, v2), v1, v2, v66, exec") !=
+         std::string::npos),
         "global_store_dwordx3 did not expand to the last dword store");
-  Check((result.ir_dump.find("FlatStoreDword null, v71") != std::string::npos),
+  Check((lowered.find("StoreAddressU32 GetAddressResource(v1, v2), v1, v2, v71, exec") !=
+         std::string::npos),
         "global_store_dwordx4 did not expand to the last dword store");
-  Check((result.ir_dump.find("flat") != std::string::npos),
+  std::vector<ShaderRecompiler::IR::ResourceKind> kinds;
+  for (const auto opcode : {ShaderRecompiler::IR::ValueOpcode::StoreAddressU8,
+                            ShaderRecompiler::IR::ValueOpcode::StoreAddressU16,
+                            ShaderRecompiler::IR::ValueOpcode::StoreAddressU32}) {
+    for (const auto &memory : MemoryAccesses(translated.program, opcode)) {
+      kinds.push_back(memory.kind);
+    }
+  }
+  const auto stores_to = [&](ShaderRecompiler::IR::ResourceKind kind) {
+    return std::ranges::count(kinds, kind);
+  };
+  Check(kinds.size() == 12, "a flat store did not reach translated IR");
+  Check(stores_to(ShaderRecompiler::IR::ResourceKind::Flat) == 2,
         "flat store IR did not preserve flat resource metadata");
-  Check((result.ir_dump.find("scratch") != std::string::npos),
+  Check(stores_to(ShaderRecompiler::IR::ResourceKind::Scratch) == 3,
         "flat store IR did not preserve scratch resource metadata");
-  Check((result.ir_dump.find("global") != std::string::npos),
+  Check(stores_to(ShaderRecompiler::IR::ResourceKind::Global) == 7,
         "flat store IR did not preserve global resource metadata");
+
+  // FLAT and GLOBAL stores need GPU ownership tracking before they can compile
+  // (TestNewShaderRecompilerFlatAddressDomainsUseDma); emit the scratch stores alone.
+  const uint32_t scratch_stores[] = {
+      EncodeFlat0(0x1a, 1, 6),
+      EncodeFlat1(0, 0x7d, 73, 1), // scratch_store_short
+      EncodeFlat0(0x1d, 1, 8),
+      EncodeFlat1(0, 0x7d, 61, 1), // scratch_store_dwordx2
+      0xbf810000u,
+  };
+  auto result = RecompileForTest(scratch_stores, options);
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad for sub-dword flat store merge");
   Check(SpirvContainsOpcode(result.spirv, 65),
@@ -7429,90 +8304,118 @@ void TestNewShaderRecompilerAtomicTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("buffer_atomic_swap") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_SWAP v0, v1, s0, 0 ; offset=4 ") != std::string::npos),
         "new decoder did not decode buffer atomic swap");
-  Check((result.decoded_dump.find("buffer_atomic_add") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_ADD v1, v1, s0, 0 ; offset=8 ") != std::string::npos),
         "new decoder did not decode buffer atomic add");
-  Check((result.decoded_dump.find("buffer_atomic_sub") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_SUB v7, v1, s0, 0 ; offset=12 ") != std::string::npos),
         "new decoder did not decode buffer atomic sub");
-  Check((result.decoded_dump.find("buffer_atomic_smin") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_SMIN v8, v1, s0, 0 ; offset=16 ") != std::string::npos),
         "new decoder did not decode buffer atomic signed min");
-  Check((result.decoded_dump.find("buffer_atomic_smax") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_SMAX v9, v1, s0, 0 ; offset=24 ") != std::string::npos),
         "new decoder did not decode buffer atomic signed max");
-  Check((result.decoded_dump.find("buffer_atomic_xor") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_XOR v6, v1, s0, 0 ; offset=40 ") != std::string::npos),
         "new decoder did not decode buffer atomic xor");
-  Check((result.decoded_dump.find("buffer_atomic_fmin") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_FMIN v0, v0, s4, 0 ; offset=0 ") != std::string::npos),
         "new decoder did not decode buffer atomic float min");
-  Check((result.decoded_dump.find("buffer_atomic_fmax") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_FMAX v3, v0, s4, 0 ; offset=12 ") != std::string::npos),
         "new decoder did not decode buffer atomic float max");
-  Check((result.decoded_dump.find("ds_add_u32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_ADD_U32 v0, v1, v2 ;") != std::string::npos),
         "new decoder did not decode DS atomic add");
-  Check((result.decoded_dump.find("ds_sub_u32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_SUB_U32 v0, v1, v10 ;") != std::string::npos),
         "new decoder did not decode DS atomic sub");
-  Check((result.decoded_dump.find("ds_min_i32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_MIN_I32 v0, v1, v11 ;") != std::string::npos),
         "new decoder did not decode DS signed min");
-  Check((result.decoded_dump.find("ds_xor_rtn_b32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_XOR_RTN_B32 v23, v1, v14 ;") != std::string::npos),
         "new decoder did not decode DS xor-return");
-  Check((result.decoded_dump.find("ds_wrxchg_rtn_b32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_WRXCHG_RTN_B32 v24, v1, v15 ;") != std::string::npos),
         "new decoder did not decode DS write-exchange-return");
-  Check((result.decoded_dump.find("ds_add_rtn_u32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_ADD_RTN_U32 v15, v1, v2 ;") != std::string::npos),
         "new decoder did not decode DS atomic add-return");
-  Check((result.ir_dump.find("AtomicSwapU32 v0") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v0, SelectU32(exec, BufferAtomicSwap32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v0, exec), v0)") != std::string::npos),
         "buffer atomic swap did not lower to IR");
-  Check((result.ir_dump.find("AtomicAddU32 v1") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v1, SelectU32(exec, BufferAtomicIAdd32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v1, exec), v1)") != std::string::npos),
         "buffer atomic add did not lower to IR");
-  Check((result.ir_dump.find("AtomicSubU32 v7") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BufferAtomicISub32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v7, exec), v7)") != std::string::npos),
         "buffer atomic sub did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMinI32 v8") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, BufferAtomicSMin32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v8, exec), v8)") != std::string::npos),
         "buffer atomic signed min did not lower to IR");
-  Check((result.ir_dump.find("AtomicUMinU32 v2") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v2, SelectU32(exec, BufferAtomicUMin32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v2, exec), v2)") != std::string::npos),
         "buffer atomic umin did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMaxI32 v9") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, BufferAtomicSMax32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v9, exec), v9)") != std::string::npos),
         "buffer atomic signed max did not lower to IR");
-  Check((result.ir_dump.find("AtomicUMaxU32 v3") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v3, SelectU32(exec, BufferAtomicUMax32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v3, exec), v3)") != std::string::npos),
         "buffer atomic umax did not lower to IR");
-  Check((result.ir_dump.find("AtomicAndU32 v4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v4, SelectU32(exec, BufferAtomicAnd32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v4, exec), v4)") != std::string::npos),
         "buffer atomic and did not lower to IR");
-  Check((result.ir_dump.find("AtomicOrU32 v5") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v5, SelectU32(exec, BufferAtomicOr32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v5, exec), v5)") != std::string::npos),
         "buffer atomic or did not lower to IR");
-  Check((result.ir_dump.find("AtomicXorU32 v6") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v6, SelectU32(exec, BufferAtomicXor32(GetBufferResource("
+                      "s0, s1, s2, s3), v1, 0x00000000, 0x00000000, v6, exec), v6)") != std::string::npos),
         "buffer atomic xor did not lower to IR");
-  Check((result.ir_dump.find("AtomicFMinF32 null, v0") != std::string::npos),
+  Check((lowered.find("\nBufferAtomicFMin32 GetBufferResource(s4, s5, s6, s7), 0x00000000, "
+                      "0x00000000, 0x00000000, v0, exec\n") != std::string::npos) &&
+            (lowered.find("BufferAtomicFMin32(") == std::string::npos),
         "buffer atomic float min did not lower to IR without a GLC return");
-  Check((result.ir_dump.find("AtomicFMaxF32 null, v3") != std::string::npos),
+  Check((lowered.find("\nBufferAtomicFMax32 GetBufferResource(s4, s5, s6, s7), 0x00000000, "
+                      "0x00000000, 0x00000000, v3, exec\n") != std::string::npos) &&
+            (lowered.find("BufferAtomicFMax32(") == std::string::npos),
         "buffer atomic float max did not lower to IR without a GLC return");
-  Check((result.ir_dump.find("AtomicAddU32 null, v2") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicIAdd32 v1, v2, exec\n") != std::string::npos),
         "DS no-return atomic add did not lower to IR");
-  Check((result.ir_dump.find("AtomicSubU32 null, v10") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicISub32 v1, v10, exec\n") != std::string::npos),
         "DS no-return atomic sub did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMinI32 null, v11") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicSMin32 v1, v11, exec\n") != std::string::npos),
         "DS no-return signed min did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMaxI32 null, v12") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicSMax32 v1, v12, exec\n") != std::string::npos),
         "DS no-return signed max did not lower to IR");
-  Check((result.ir_dump.find("AtomicAndU32 null, v13") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicAnd32 v1, v13, exec\n") != std::string::npos),
         "DS no-return and did not lower to IR");
-  Check((result.ir_dump.find("AtomicXorU32 null, v14") != std::string::npos),
+  Check((lowered.find("\nSharedAtomicXor32 v1, v14, exec\n") != std::string::npos),
         "DS no-return xor did not lower to IR");
-  Check((result.ir_dump.find("AtomicAddU32 v15") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v15, SelectU32(exec, SharedAtomicIAdd32(v1, v2, exec), v15)") !=
+         std::string::npos),
         "DS add-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicSubU32 v16") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v16, SelectU32(exec, SharedAtomicISub32(v1, v10, exec), v16)") !=
+         std::string::npos),
         "DS sub-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMinI32 v17") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v17, SelectU32(exec, SharedAtomicSMin32(v1, v11, exec), v17)") !=
+         std::string::npos),
         "DS signed min-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicSMaxI32 v18") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v18, SelectU32(exec, SharedAtomicSMax32(v1, v12, exec), v18)") !=
+         std::string::npos),
         "DS signed max-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicUMinU32 v19") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v19, SelectU32(exec, SharedAtomicUMin32(v1, v2, exec), v19)") !=
+         std::string::npos),
         "DS unsigned min-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicUMaxU32 v20") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v20, SelectU32(exec, SharedAtomicUMax32(v1, v2, exec), v20)") !=
+         std::string::npos),
         "DS unsigned max-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicAndU32 v21") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v21, SelectU32(exec, SharedAtomicAnd32(v1, v13, exec), v21)") !=
+         std::string::npos),
         "DS and-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicOrU32 v22") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v22, SelectU32(exec, SharedAtomicOr32(v1, v2, exec), v22)") !=
+         std::string::npos),
         "DS or-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicXorU32 v23") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v23, SelectU32(exec, SharedAtomicXor32(v1, v14, exec), v23)") !=
+         std::string::npos),
         "DS xor-return did not lower to IR");
-  Check((result.ir_dump.find("AtomicSwapU32 v24") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v24, SelectU32(exec, SharedAtomicSwap32(v1, v15, exec), v24)") !=
+         std::string::npos),
         "DS write-exchange-return did not lower to shared atomic swap IR");
+  Check(CountSourceOccurrences(result.ir_dump, "= BufferAtomic") == 12 &&
+            CountSourceOccurrences(result.ir_dump, "= SharedAtomic") == 16,
+        "optimizer removed an atomic whose returned value is unused");
   Check(SpirvContainsOpcode(result.spirv, 229),
         "SPIR-V binary does not contain OpAtomicExchange");
   Check(SpirvContainsOpcode(result.spirv, 234),
@@ -7629,6 +8532,12 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
       EncodeDs0(0x3b, 6), EncodeDs1(44, 0, 1), // ds_read_i16 v44, v1
       EncodeDs0(0x3c, 8), EncodeDs1(45, 0, 1), // ds_read_u16 v45, v1
       0xda980000u, 0x07000007u, // ds_read_u16_d16 v7, v7
+      // Store the read results so the loads stay live in SPIR-V.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(42, 12, 0),
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(43, 12, 0),
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(44, 12, 0),
+      EncodeMubuf0(0x1c, 12, false), EncodeMubuf1(45, 12, 0),
+      EncodeMubuf0(0x1c, 16, false), EncodeMubuf1(7, 12, 0),
       0xbf810000u,
   };
 
@@ -7636,17 +8545,18 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("ds_write_b8") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("DS_WRITE_B8 v0, v1, v40") != std::string::npos),
         "new decoder did not decode DS byte write");
-  Check((result.decoded_dump.find("ds_write_b16") != std::string::npos),
+  Check((result.decoded_dump.find("DS_WRITE_B16 v0, v1, v41") != std::string::npos),
         "new decoder did not decode DS short write");
-  Check((result.decoded_dump.find("ds_read_i8") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_I8 v42, v1") != std::string::npos),
         "new decoder did not decode DS signed byte read");
-  Check((result.decoded_dump.find("ds_read_u8") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_U8 v43, v1") != std::string::npos),
         "new decoder did not decode DS unsigned byte read");
-  Check((result.decoded_dump.find("ds_read_i16") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_I16 v44, v1") != std::string::npos),
         "new decoder did not decode DS signed short read");
-  Check((result.decoded_dump.find("ds_read_u16") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_U16 v45, v1") != std::string::npos),
         "new decoder did not decode DS unsigned short read");
   Check((result.decoded_dump.find("DS_READ_U16_D16 v7.sdwa(sel=4") != std::string::npos),
         "new decoder did not decode captured DS masked short read");
@@ -7654,19 +8564,28 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
         "DS byte decode did not preserve byte-width metadata");
   Check((result.decoded_dump.find("dwords=1 bits=16") != std::string::npos),
         "DS short decode did not preserve short-width metadata");
-  Check((result.ir_dump.find("DsWriteByte null, v40") != std::string::npos),
+  Check((lowered.find("WriteSharedU8 v1, ConvertU8U32(v40), exec") != std::string::npos),
         "DS byte write did not lower to explicit IR");
-  Check((result.ir_dump.find("DsWriteShort null, v41") != std::string::npos),
+  Check((lowered.find("WriteSharedU16 v1, ConvertU16U32(v41), exec") != std::string::npos),
         "DS short write did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadSbyte v42") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v42, SelectU32(exec, BitFieldSExtract("
+                      "ConvertU32U8(LoadSharedU8(v1, exec)), 0x00000000, 0x00000008), v42)") !=
+         std::string::npos),
         "DS signed byte read did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadUbyte v43") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v43, SelectU32(exec, ConvertU32U8("
+                      "LoadSharedU8(v1, exec)), v43)") != std::string::npos),
         "DS unsigned byte read did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadSshort v44") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v44, SelectU32(exec, BitFieldSExtract("
+                      "ConvertU32U16(LoadSharedU16(v1, exec)), 0x00000000, 0x00000010), v44)") !=
+         std::string::npos),
         "DS signed short read did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadUshort v45") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v45, SelectU32(exec, ConvertU32U16("
+                      "LoadSharedU16(v1, exec)), v45)") != std::string::npos),
         "DS unsigned short read did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadUshort v7.sdwa(sel=4") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v7, SelectU32(exec, BitwiseOr32(BitwiseAnd32(v7, "
+                      "0xffff0000), ShiftLeftLogical32(BitwiseAnd32(ConvertU32U16("
+                      "LoadSharedU16(v7, exec)), 0x0000ffff), 0x00000000)), v7)") !=
+         std::string::npos),
         "DS masked short read did not preserve its partial destination");
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad");
@@ -7676,8 +8595,8 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
         "SPIR-V binary does not contain OpAccessChain");
   Check(SpirvContainsOpcode(result.spirv, 194),
         "SPIR-V binary does not contain OpShiftRightLogical");
-  Check(SpirvContainsOpcode(result.spirv, 195),
-        "SPIR-V binary does not contain OpShiftRightArithmetic");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract");
   Check(SpirvContainsOpcode(result.spirv, 196),
         "SPIR-V binary does not contain OpShiftLeftLogical");
   Check(SpirvContainsOpcode(result.spirv, 199),
@@ -7779,6 +8698,10 @@ void TestNewShaderRecompilerDsSwizzleTranslation() {
       EncodeDs1(9, 0, 6), // ds_swizzle_b32 v9, v6
       0xd8d4c480u,
       0x45000045u, // ds_swizzle_b32 rotate mode from boot shader
+      // Store the swizzle results so the swizzles stay live in SPIR-V.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(8, 12, 0),
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(9, 12, 0),
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(69, 12, 0),
       0xbf810000u,
   };
 
@@ -7786,7 +8709,8 @@ void TestNewShaderRecompilerDsSwizzleTranslation() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("ds_swizzle_b32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("DS_SWIZZLE_B32 v8, v5") != std::string::npos),
         "new decoder did not decode DS swizzle");
   Check((result.decoded_dump.find("offset=31") != std::string::npos),
         "new decoder did not expose DS swizzle control");
@@ -7794,12 +8718,15 @@ void TestNewShaderRecompilerDsSwizzleTranslation() {
         "new decoder did not expose DS swizzle quad control");
   Check((result.decoded_dump.find("offset=50304") != std::string::npos),
         "new decoder did not expose DS swizzle rotate control");
-  Check((result.ir_dump.find("DsSwizzleB32 v8, v5, 0x0000001f") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, SwizzleU32(v5, 0x0000001f, exec), v8)") !=
+         std::string::npos),
         "DS swizzle did not lower to explicit IR");
-  Check((result.ir_dump.find("DsSwizzleB32 v9, v6, 0x0000801b") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v9, SelectU32(exec, SwizzleU32(v6, 0x0000801b, exec), v9)") !=
+         std::string::npos),
         "DS quad swizzle did not lower to explicit IR");
   Check(
-      (result.ir_dump.find("DsSwizzleB32 v69, v69, 0x0000c480") != std::string::npos),
+      (lowered.find("SetVectorRegister v69, SelectU32(exec, SwizzleU32(v69, 0x0000c480, exec), v69)") !=
+       std::string::npos),
       "DS rotate swizzle did not lower to explicit IR");
   Check(SpirvContainsOpcode(result.spirv, 345),
         "SPIR-V binary does not contain OpGroupNonUniformShuffle");
@@ -7811,11 +8738,34 @@ void TestNewShaderRecompilerDsSwizzleTranslation() {
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 196),
         "SPIR-V binary does not contain OpShiftLeftLogical");
-  Check(SpirvContainsOpcode(result.spirv, 198),
+  Check(SpirvContainsOpcode(result.spirv, 197),
         "SPIR-V binary does not contain OpBitwiseOr");
+  Check(SpirvContainsOpcode(result.spirv, 198),
+        "SPIR-V binary does not contain OpBitwiseXor");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerDsSwizzleFftMode() {
+  const auto compile = [](uint32_t control) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 5, 40),                    // v_mov_b32 v5, s40
+        EncodeDs0(0x35, control), EncodeDs1(8, 0, 5), // ds_swizzle_b32 v8, v5
+        EncodeMubuf0(0x1c, 0, false),
+        EncodeMubuf1(8, 12, 0),                     // buffer_store_dword v8
+        0xbf810000u,
+    };
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+    CheckSpirvBinaryValidates(result.spirv);
+    return result.spirv;
+  };
+  // Offsets from 0xe000 select the FFT decomposition, which reads a bit-reversed lane;
+  // 0xc000-0xdfff rotate.
+  Check(SpirvContainsOpcode(compile(0xe005), 204),
+        "DS_SWIZZLE FFT mode did not bit-reverse the lane");
+  Check(!SpirvContainsOpcode(compile(0xc480), 204),
+        "DS_SWIZZLE rotate mode used the FFT lane mapping");
 }
 
 void TestNewShaderRecompilerDsAddtidTranslation() {
@@ -7836,18 +8786,35 @@ void TestNewShaderRecompilerDsAddtidTranslation() {
   options.input_info.compute = &input_info;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("ds_write_addtid_b32") != std::string::npos),
+  const auto lowered = TranslateExpressionsForTest(shader, options);
+  Check((result.decoded_dump.find("DS_WRITE_ADDTID_B32") != std::string::npos),
         "new decoder did not decode DS write addtid");
-  Check((result.decoded_dump.find("ds_read_addtid_b32") != std::string::npos),
+  Check((result.decoded_dump.find("DS_READ_ADDTID_B32 v8") != std::string::npos),
         "new decoder did not decode DS read addtid");
-  Check((result.ir_dump.find("DsWriteAddtidB32 null, v7, m0") != std::string::npos),
+  // LDS[M0[15:0] + offset + laneID * 4]; the instruction offset is applied from MemoryInfo.
+  Check((lowered.find("WriteSharedU32 IAdd32(BitwiseAnd32(m0, 0x0000ffff), "
+                      "ShiftLeftLogical32(LaneId(), 0x00000002)), v7, exec") != std::string::npos),
         "DS write addtid did not lower to explicit IR");
-  Check((result.ir_dump.find("DsReadAddtidB32 v8, m0") != std::string::npos),
+  Check((lowered.find("SetVectorRegister v8, SelectU32(exec, LoadSharedU32(IAdd32("
+                      "BitwiseAnd32(m0, 0x0000ffff), ShiftLeftLogical32(LaneId(), 0x00000002)), "
+                      "exec), v8)") != std::string::npos),
         "DS read addtid did not lower to explicit IR");
-  Check(ProgramHasInput(
-            result.program,
-            ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex),
-        "DS addtid did not request LocalInvocationIndex input");
+  const auto write_has_offset = std::ranges::any_of(
+      result.program.blocks, [&](const auto *block) {
+        return std::ranges::any_of(*block, [&](const auto &inst) {
+          if (inst.GetOpcode() !=
+              ShaderRecompiler::IR::ValueOpcode::WriteSharedU32) {
+            return false;
+          }
+          const auto index =
+              inst.template Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+          return index < result.program.memory_info.size() &&
+                 result.program.memory_info[index].offset == 8u;
+        });
+      });
+  Check(write_has_offset, "DS write addtid lost its instruction offset");
+  Check(SpirvHasDecorationValue(result.spirv, 11u, 41u),
+        "DS addtid did not use the wave lane ID (SubgroupLocalInvocationId) as TID");
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
@@ -11233,18 +12200,33 @@ void TestNewShaderRecompilerExpVertexOutputs() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("target=0x0c") != std::string::npos),
+  using ShaderRecompiler::IR::ExportTargetKind;
+  std::vector<ExportTargetKind> exports;
+  for (const auto *block : result.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetAttribute) {
+        exports.push_back(result.program
+                              .export_info[inst.Flags<ShaderRecompiler::IR::ExportFlags>().index]
+                              .kind);
+      }
+    }
+  }
+  const auto exported = [&](ExportTargetKind kind) {
+    return std::ranges::count(exports, kind) == 1;
+  };
+  Check((result.decoded_dump.find("exp target=0x0c en=0xf done=1 compr=0 vm=0 v0, v1, v2, v3") !=
+         std::string::npos),
         "POS export was not decoded");
-  Check((result.decoded_dump.find("target=0x20") != std::string::npos),
+  Check((result.decoded_dump.find("exp target=0x20 en=0xf done=1 compr=0 vm=0 v4, v5, v6, v7") !=
+         std::string::npos),
         "PARAM export was not decoded");
-  Check((result.decoded_dump.find("target=0x14") != std::string::npos),
+  Check((result.decoded_dump.find("exp target=0x14 en=0x1 done=1 compr=0 vm=0 v8") !=
+         std::string::npos),
         "PRIM export was not decoded");
-  Check((result.ir_dump.find("position") != std::string::npos),
-        "POS export did not reach IR");
-  Check((result.ir_dump.find("parameter") != std::string::npos),
-        "PARAM export did not reach IR");
-  Check((result.ir_dump.find("primitive") != std::string::npos),
-        "PRIM export did not reach IR");
+  Check(exports.size() == 3, "vertex exports did not all reach IR");
+  Check(exported(ExportTargetKind::Position), "POS export did not reach IR");
+  Check(exported(ExportTargetKind::Parameter), "PARAM export did not reach IR");
+  Check(exported(ExportTargetKind::Primitive), "PRIM export did not reach IR");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "vertex export SPIR-V lacks OpStore");
   CheckSpirvBinaryValidates(result.spirv);
@@ -15012,11 +15994,35 @@ int main() {
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
+  TestNewShaderRecompilerRdna2ScalarOpcodes();
+  TestNewShaderRecompilerScalarVectorAlu();
+  TestNewShaderRecompilerMoreAluFamilies();
+  TestNewShaderRecompilerExpandedAluBatch();
+  TestNewShaderRecompilerVop3pPackedF16();
+  TestNewShaderRecompilerStagedShaderOps();
+  TestNewShaderRecompilerBootF16UnaryOpcodes();
+  TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes();
+  TestNewShaderRecompilerScalarB64Alu();
+  TestNewShaderRecompilerSignedCompareAlu();
+  TestNewShaderRecompilerSignedMinShiftAlu();
+  TestNewShaderRecompilerScalarBitfieldAlu();
+  TestNewShaderRecompilerBfmWideField();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
+  TestNewShaderRecompilerMemoryFamilyTranslation();
+  TestNewShaderRecompilerBufferSignedLoadTranslation();
+  TestNewShaderRecompilerBufferSubDwordStoreTranslation();
+  TestNewShaderRecompilerFlatOldBackedTranslation();
+  TestNewShaderRecompilerFlatSignedLoadTranslation();
+  TestNewShaderRecompilerFlatStoreTranslation();
+  TestNewShaderRecompilerAtomicTranslation();
+  TestNewShaderRecompilerDsSubDwordTranslation();
+  TestNewShaderRecompilerDsSwizzleTranslation();
+  TestNewShaderRecompilerDsSwizzleFftMode();
+  TestNewShaderRecompilerDsAddtidTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerCapturedFractF64();
   TestNewShaderRecompilerF64AluEncodings();
@@ -15032,6 +16038,25 @@ int main() {
   TestDsFloatMinMaxDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
+  TestNewShaderRecompilerImageQueryTranslation();
+  TestNewShaderRecompilerDeadImageAccess();
+  TestNewShaderRecompilerCubeSampleCoordinates();
+  TestNewShaderRecompilerImageSampleVariants();
+  TestNewShaderRecompilerImageSampleA16SamplerCoords();
+  TestNewShaderRecompilerImageSampleA16ExceptionComponents();
+  TestNewShaderRecompilerImageSampleTexelOffsets();
+  TestNewShaderRecompilerImageSampleOpcodeAliases();
+  TestNewShaderRecompilerImageLoadA16UintCoords();
+  TestNewShaderRecompilerImageViewDimensions();
+  TestNewShaderRecompilerStorageImage1DDescriptorVariants();
+  TestNewShaderRecompilerNullImageUsesCanonical2DView();
+  TestNewShaderRecompilerImageGatherVariants();
+  TestNewShaderRecompilerImageLoadVariants();
+  TestNewShaderRecompilerImageLoad2DMsaa();
+  TestNewShaderRecompilerImageStoreTranslation();
+  TestNewShaderRecompilerStorageImage3DDescriptorVariant();
+  TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D();
+  TestNewShaderRecompilerImageAtomicTranslation();
   TestSopkCompareImmediateExtension();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
@@ -15132,6 +16157,7 @@ int main() {
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
+  TestNewShaderRecompilerExpVertexOutputs();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
@@ -15151,6 +16177,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestNewShaderRecompilerVintrpTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();

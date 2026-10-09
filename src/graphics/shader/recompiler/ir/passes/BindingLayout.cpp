@@ -121,6 +121,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	std::vector<uint32_t> buffers;
 	const auto shared = CollectMemoryResources(program, buffers);
 	CollectShaderData(program, next);
+	if (shared.lds && lds_storage) {
+		next.workgroup_count_dword = next.memory_offset_dword;
+		next.memory_offset_dword += 3u;
+	}
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());

@@ -162,6 +162,53 @@ void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   CHECK(BuildWith(build, element, 0) == url);
 }
 
+constexpr int HttpErrorOutOfMemory = -2143088606; /* 0x80431022 */
+
+// prepare is the pool/buffer size: zero or anything short of the requirement
+// must fail, while a null output still works as a size query.
+void TestRejectsUndersizedBuffers(HttpUriParse parse, HttpUriBuild build) {
+  constexpr char url[] = "http://example.com/path?q=1";
+  size_t required = 0;
+  CHECK(parse(nullptr, url, nullptr, &required, 0) == 0);
+  CHECK(required > 1);
+
+  std::array<char, 64> pool{};
+  pool.fill('!');
+  SceHttpUriElement out{};
+  size_t parsed_required = 0;
+  CHECK(parse(&out, url, pool.data(), &parsed_required, 0) ==
+        HttpErrorOutOfMemory);
+  CHECK(parsed_required == required);
+  CHECK(parse(&out, url, pool.data(), &parsed_required, required - 1) ==
+        HttpErrorOutOfMemory);
+  CHECK(pool[0] == '!');
+
+  std::array<char, 4> empty_pool{};
+  CHECK(parse(&out, "", empty_pool.data(), &parsed_required, 0) ==
+        HttpErrorOutOfMemory);
+  CHECK(parse(&out, "", empty_pool.data(), &parsed_required, 3) ==
+        HttpErrorOutOfMemory);
+
+  std::array<char, 64> element_pool{};
+  SceHttpUriElement element{};
+  CHECK(parse(&element, url, element_pool.data(), &parsed_required, required) ==
+        0);
+
+  size_t build_required = 0;
+  CHECK(build(nullptr, &build_required, 0, &element, 0) == 0);
+  CHECK(build_required == sizeof(url));
+  std::array<char, 64> text{};
+  text.fill('!');
+  size_t filled = 0;
+  CHECK(build(text.data(), &filled, 0, &element, 0) == HttpErrorOutOfMemory);
+  CHECK(filled == build_required);
+  CHECK(build(text.data(), &filled, build_required - 1, &element, 0) ==
+        HttpErrorOutOfMemory);
+  CHECK(text[0] == '!');
+  CHECK(build(text.data(), &filled, build_required, &element, 0) == 0);
+  CHECK(std::string(text.data()) == url);
+}
+
 } // namespace
 
 int main() {
@@ -176,5 +223,6 @@ int main() {
   TestAbsentQuery(parse);
   TestEmptyUri(parse);
   TestPresentQuery(parse);
+  TestRejectsUndersizedBuffers(parse, build);
   return failures == 0 ? 0 : 1;
 }

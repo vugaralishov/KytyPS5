@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -562,8 +563,14 @@ struct NpUniversalDataSystemMemoryStat {
 	size_t current_inuse_size;
 };
 
+struct NpUniversalDataSystemEventPropertyArray;
+
 struct NpUniversalDataSystemEventPropertyObject {
 	std::map<std::string, Common::Trophies::UdsInteger> integers;
+	// Children created by SetObject/SetArray without a value belong to the parent and are freed
+	// with it. They are never released earlier, since the guest may still hold the pointer.
+	std::vector<std::shared_ptr<NpUniversalDataSystemEventPropertyObject>> child_objects;
+	std::vector<std::shared_ptr<NpUniversalDataSystemEventPropertyArray>>  child_arrays;
 
 	void SetInteger(const char* key, std::optional<Common::Trophies::UdsInteger> value) {
 		if (value) {
@@ -586,7 +593,15 @@ struct UdsContext {
 static std::map<int, UdsContext> g_contexts;
 static int                       g_next_context = 1;
 
-struct NpUniversalDataSystemEventPropertyArray {};
+struct NpUniversalDataSystemEventPropertyArray {
+	std::vector<std::shared_ptr<NpUniversalDataSystemEventPropertyObject>> child_objects;
+	std::vector<std::shared_ptr<NpUniversalDataSystemEventPropertyArray>>  child_arrays;
+};
+
+template <typename T>
+static T* AddUdsChild(std::vector<std::shared_ptr<T>>* children) {
+	return children->emplace_back(std::make_shared<T>()).get();
+}
 
 struct NpUniversalDataSystemStorageStat {
 	size_t in_events;
@@ -1004,7 +1019,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetObject(
 	if (value_ptr != nullptr) {
 		*value_ptr =
 		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
+		                      : AddUdsChild(&object->child_objects));
 	}
 
 	LOGF("\t object    = 0x%016" PRIx64 "\n"
@@ -1037,7 +1052,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
 
 	if (value_ptr != nullptr) {
 		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)
-		                               : new NpUniversalDataSystemEventPropertyArray);
+		                               : AddUdsChild(&object->child_arrays));
 	}
 
 	return 0;
@@ -1191,7 +1206,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetObject(
 	if (value_ptr != nullptr) {
 		*value_ptr =
 		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
+		                      : AddUdsChild(&array->child_objects));
 	}
 
 	LOGF("\t array     = 0x%016" PRIx64 "\n"
@@ -1215,7 +1230,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetArray(
 
 	if (value_ptr != nullptr) {
 		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)
-		                               : new NpUniversalDataSystemEventPropertyArray);
+		                               : AddUdsChild(&array->child_arrays));
 	}
 
 	LOGF("\t array     = 0x%016" PRIx64 "\n"

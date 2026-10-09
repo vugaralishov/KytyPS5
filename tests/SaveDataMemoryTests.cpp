@@ -56,6 +56,12 @@ namespace fs = std::filesystem;
 		}                                                                                          \
 	} while (false)
 
+// Bounded copy into the fixed-size character arrays of the guest structures.
+template <size_t N>
+void CopyString(char (&destination)[N], const char* source) {
+	std::snprintf(destination, N, "%s", source);
+}
+
 SaveDataMemorySetup2 SetupParam(int32_t user = 1, uint32_t slot = 0, size_t size = 16) {
 	SaveDataMemorySetup2 setup {};
 	setup.user_id     = user;
@@ -204,9 +210,9 @@ void TestIsolationAndSync() {
 	CHECK(Get()[0] == 11 && Get(16, 2)[0] == 22 && Get(16, 1, 1)[0] == 33);
 	Reset("OTHER");
 	SceSaveDataTitleId title {};
-	std::strcpy(title.data, "ISOLATE");
+	CopyString(title.data, "ISOLATE");
 	SceSaveDataDirName name {};
-	std::strcpy(name.data, "sce_sdmemory");
+	CopyString(name.data, "sce_sdmemory");
 	struct SaveDataTransferringMount mount {};
 	mount.user_id  = 2;
 	mount.title_id = &title;
@@ -255,7 +261,7 @@ void WriteRestartFixture() {
 	setup.init_icon        = &icon;
 	setup.icon_memory_size = icon_bytes.size();
 	SaveDataParam param {};
-	std::strcpy(param.title, "Astro progress");
+	CopyString(param.title, "Astro progress");
 	param.user_param = 17;
 	setup.init_param = &param;
 	CHECK(SaveDataSetupSaveDataMemory2(&setup, nullptr) == OK);
@@ -269,7 +275,7 @@ void WriteRestartFixture() {
 	CHECK(SaveDataSetSaveDataMemory2(&set) == OK);
 	set.data         = nullptr;
 	param.user_param = 18;
-	std::strcpy(param.detail, "Coins, level state, rescued bots");
+	CopyString(param.detail, "Coins, level state, rescued bots");
 	set.param = &param;
 	CHECK(SaveDataSetSaveDataMemory2(&set) == OK);
 	// No Sync or Terminate: Set must survive process exit on its own.
@@ -359,7 +365,7 @@ void TestClassicSavePaths() {
 	}
 	CHECK(Search(1) == names);
 	SceSaveDataTitleId title {};
-	std::strcpy(title.data, "CLASSIC");
+	CopyString(title.data, "CLASSIC");
 	Reset("OTHER");
 	CHECK(Search(1).empty());
 	CHECK(Search(1, &title) == names);
@@ -471,9 +477,9 @@ void TestClassicSaveParams() {
 	SaveDataMountResult mounted {};
 	CHECK(SaveDataMount3(&mount, &mounted) == OK);
 	SaveDataParam param {};
-	std::strcpy(param.title, "First save");
-	std::strcpy(param.sub_title, "Chapter 2");
-	std::strcpy(param.detail, "Progress");
+	CopyString(param.title, "First save");
+	CopyString(param.sub_title, "Chapter 2");
+	CopyString(param.detail, "Progress");
 	param.user_param = 42;
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, nullptr, sizeof(param)) ==
 	      SAVE_DATA_ERROR_PARAMETER);
@@ -496,13 +502,13 @@ void TestClassicSaveParams() {
 	const int64_t nested_mtime = loaded.mtime;
 	CHECK(nested_mtime > static_cast<int64_t>(std::time(nullptr)) + 3600);
 	fs::create_directory(saved / "sce_sys/param.bin.tmp");
-	std::strcpy(param.title, "Failed update");
+	CopyString(param.title, "Failed update");
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) ==
 	      SAVE_DATA_ERROR_INTERNAL);
 	CHECK(fs::remove(saved / "sce_sys/param.bin.tmp"));
 	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
 	CHECK(std::string(loaded.title) == "First save");
-	std::strcpy(param.title, "Updated save");
+	CopyString(param.title, "Updated save");
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) == OK);
 	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
 	CHECK(std::string(loaded.title) == "Updated save");
@@ -512,7 +518,7 @@ void TestClassicSaveParams() {
 
 	Reset("OTHER");
 	SceSaveDataTitleId source_title {};
-	std::strcpy(source_title.data, "PARAMS");
+	CopyString(source_title.data, "PARAMS");
 	struct SaveDataTransferringMount transfer {};
 	transfer.user_id  = 1;
 	transfer.title_id = &source_title;
@@ -525,7 +531,7 @@ void TestClassicSaveParams() {
 	fs::create_directory_symlink("PARAMS", "_SaveData/P_ALIAS", alias_error);
 	if (!alias_error) {
 		SceSaveDataTitleId alias_title {};
-		std::strcpy(alias_title.data, "P_ALIAS");
+		CopyString(alias_title.data, "P_ALIAS");
 		transfer.title_id = &alias_title;
 		SaveDataMountResult duplicate {};
 		CHECK(SaveDataTransferringMount(&transfer, &duplicate) == SAVE_DATA_ERROR_BUSY);
@@ -534,7 +540,7 @@ void TestClassicSaveParams() {
 	}
 #ifdef _WIN32
 	SceSaveDataTitleId lowercase_title {};
-	std::strcpy(lowercase_title.data, "params");
+	CopyString(lowercase_title.data, "params");
 	transfer.title_id = &lowercase_title;
 	SaveDataMountResult duplicate {};
 	CHECK(SaveDataTransferringMount(&transfer, &duplicate) == SAVE_DATA_ERROR_BUSY);
@@ -543,7 +549,7 @@ void TestClassicSaveParams() {
 
 	SaveDataMountResult other {};
 	CHECK(SaveDataMount3(&mount, &other) == OK);
-	std::strcpy(param.title, "Other title");
+	CopyString(param.title, "Other title");
 	CHECK(SaveDataSetParam(&other.mount_point, 0, &param, sizeof(param)) == OK);
 	constexpr char typed_title[] = "Typed title";
 	CHECK(SaveDataSetParam(&other.mount_point, 1, typed_title, sizeof(typed_title)) == OK);
@@ -575,6 +581,43 @@ void TestClassicSaveParams() {
 	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 1);
 	CHECK(std::string(names[0].data) == "slot" && std::string(params[0].title) == "Updated save");
 	CHECK(params[0].mtime == nested_mtime);
+}
+
+void TestDirNameMatchAndGuestInput() {
+	CHECK(dir_name_match("save", "save%"));
+	CHECK(dir_name_match("save", "%save%%"));
+	CHECK(dir_name_match("save12", "save%"));
+	CHECK(dir_name_match("save12", "s_v%2"));
+	CHECK(dir_name_match("save12", "%"));
+	CHECK(dir_name_match("", "%%"));
+	CHECK(!dir_name_match("save", "save_"));
+	CHECK(!dir_name_match("save", "%x%"));
+	CHECK(!dir_name_match("", "_"));
+	// Many '%' against a non-matching tail must finish quickly instead of backtracking
+	// exponentially.
+	const std::string long_name(31, 'a');
+	CHECK(!dir_name_match(long_name.c_str(), "%a%a%a%a%a%a%a%a%a%a%a%a%a%a%b"));
+
+	Reset("GUESTINPUT");
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 8; // DESTRUCT_OFF alone: no open or create bit.
+	mount.blocks     = 48;
+	SaveDataMountResult result {};
+	CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_PARAMETER);
+
+	SaveDataMountPoint unterminated {};
+	std::memset(unterminated.data, 'A', sizeof(unterminated.data));
+	SaveDataPrepareParam prepare {};
+	SaveDataIcon         icon {};
+	CHECK(SaveDataUmount2(0, &unterminated) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataPrepare(&unterminated, &prepare) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataLoadIcon(&unterminated, &icon) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataSaveIconByPath(&unterminated, "icon0.png") == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataSaveIcon(nullptr, &icon) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataSaveIcon(&unterminated, nullptr) == SAVE_DATA_ERROR_PARAMETER);
 }
 
 void RunChild(const fs::path& executable, const char* mode) {
@@ -619,6 +662,7 @@ int main(int argc, char** argv) {
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
+	TestDirNameMatchAndGuestInput();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

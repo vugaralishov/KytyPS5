@@ -437,13 +437,24 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
-		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
-		     descriptor.MinLod(), descriptor.LastLevel());
+	// MIN_LOD is guest data; Vulkan requires the clamp to stay within the view's last level.
+	const uint32_t max_min_lod =
+	    (std::min)(static_cast<uint32_t>(descriptor.LastLevel()) * 256u,
+	               (view.base_level + (std::max)(view_levels, 1u) - 1u) * 256u);
+	uint32_t min_lod = descriptor.MinLod();
+	if (min_lod > max_min_lod) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("warning: texture minimum LOD exceeds last mip level, clamping: min_lod=%u "
+			     "last_level=%u base_level=%u levels=%u\n",
+			     min_lod, static_cast<uint32_t>(descriptor.LastLevel()), view.base_level,
+			     view_levels);
+		}
+		min_lod = max_min_lod;
 	}
 	const auto base_lod = view.base_level * 256u;
-	if (descriptor.MinLod() > base_lod) {
-		view.min_lod = descriptor.MinLod() - base_lod;
+	if (min_lod > base_lod) {
+		view.min_lod = min_lod - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =

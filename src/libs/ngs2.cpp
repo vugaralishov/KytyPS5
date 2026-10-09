@@ -30,6 +30,9 @@ LIB_NAME("Ngs2", "Ngs2");
 
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE      = static_cast<int32_t>(0x804a8011u);
+constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
+constexpr int32_t NGS2_ERROR_INVALID_RACK_HANDLE   = static_cast<int32_t>(0x804a8202u);
 constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA =
     static_cast<int32_t>(0x804a8430u);
 constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT =
@@ -625,17 +628,28 @@ struct Ngs2VoiceInternal {
 		}
 	}
 
-	void SetMatrix(uint32_t index, const float* levels, uint32_t count) {
-		EXIT_NOT_IMPLEMENTED(index >= matrices.size());
+	// Setters reject guest indices outside the rack's configured ports and matrices.
+	[[nodiscard]] bool SetMatrix(uint32_t index, const float* levels, uint32_t count) {
+		if (index >= matrices.size() || (levels == nullptr && count != 0)) {
+			return false;
+		}
 		matrices[index].assign(levels, levels + count);
+		return true;
 	}
-	void SetVolume(uint32_t index, float volume) {
-		EXIT_NOT_IMPLEMENTED(index >= ports.size());
+	[[nodiscard]] bool SetVolume(uint32_t index, float volume) {
+		if (index >= ports.size()) {
+			return false;
+		}
 		ports[index].volume = volume;
+		return true;
 	}
-	void SetPortMatrix(uint32_t index, int32_t matrix) {
-		EXIT_NOT_IMPLEMENTED(index >= ports.size());
+	[[nodiscard]] bool SetPortMatrix(uint32_t index, int32_t matrix) {
+		if (index >= ports.size() ||
+		    (matrix >= 0 && static_cast<uint32_t>(matrix) >= matrices.size())) {
+			return false;
+		}
 		ports[index].matrix = matrix;
+		return true;
 	}
 	void SetEvent(uint32_t id) {
 		switch (id) {
@@ -768,7 +782,18 @@ struct Ngs2CustomSamplerVoiceState {
 static Ngs2Internal*        g_ngs_list     = nullptr;
 static Ngs2RackInternal*    g_racks_list   = nullptr;
 static std::atomic_uint32_t g_next_ngs_uid = 1;
+static Common::Mutex        g_ngs_mutex; // Guards g_ngs_list; never held while locking a system.
 static Common::Mutex        g_racks_mutex;
+
+static bool Ngs2SystemIsLive(const Ngs2Internal* ngs) {
+	Common::LockGuard lock(g_ngs_mutex);
+	for (const auto* current = g_ngs_list; current != nullptr; current = current->next) {
+		if (current == ngs) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static_assert(sizeof(Ngs2UserFxContext) == 72);
 static_assert(sizeof(Ngs2UserFxProcessContext) == 104);
@@ -816,8 +841,10 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      optio
 	ngs->option      = *option;
 	ngs->buffer_info = *buffer_info;
 	ngs->uid         = g_next_ngs_uid.fetch_add(1, std::memory_order_relaxed);
-	ngs->next        = g_ngs_list;
-	g_ngs_list       = ngs;
+
+	Common::LockGuard lock(g_ngs_mutex);
+	ngs->next  = g_ngs_list;
+	g_ngs_list = ngs;
 
 	return ngs;
 }
@@ -1041,24 +1068,16 @@ int KYTY_SYSV_ABI Ngs2SystemCreateWithAllocator(const Ngs2SystemOption*    optio
 
 int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* info,
                                     size_t info_size) {
-	constexpr int32_t ERROR_INVALID_OUT_ADDRESS   = static_cast<int32_t>(0x804a8010u);
-	constexpr int32_t ERROR_INVALID_OUT_SIZE      = static_cast<int32_t>(0x804a8011u);
-	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
-
 	if (info == nullptr) {
-		return ERROR_INVALID_OUT_ADDRESS;
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
 	}
 	if (info_size != sizeof(Ngs2SystemInfo)) {
-		return ERROR_INVALID_OUT_SIZE;
+		return NGS2_ERROR_INVALID_OUT_SIZE;
 	}
 
-	auto* ngs     = reinterpret_cast<Ngs2Internal*>(system_handle);
-	auto* current = g_ngs_list;
-	while (current != nullptr && current != ngs) {
-		current = current->next;
-	}
-	if (current == nullptr) {
-		return ERROR_INVALID_SYSTEM_HANDLE;
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	if (!Ngs2SystemIsLive(ngs)) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
 	}
 
 	Common::LockGuard lock(ngs->mutex);
@@ -1105,6 +1124,50 @@ int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferIn
 
 	if (buffer_info != nullptr) {
 		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+	}
+
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	{
+		Common::LockGuard lock(g_ngs_mutex);
+		auto**            link = &g_ngs_list;
+		while (*link != nullptr && *link != ngs) {
+			link = &(*link)->next;
+		}
+		if (ngs == nullptr || *link == nullptr) {
+			return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+		}
+		*link = ngs->next;
+	}
+
+	// Racks lock and read their system, so they cannot outlive it.
+	for (;;) {
+		Ngs2RackInternal* rack = nullptr;
+		{
+			Common::LockGuard racks_lock(g_racks_mutex);
+			for (rack = g_racks_list; rack != nullptr && rack->ngs != ngs; rack = rack->next) {
+			}
+		}
+		if (rack == nullptr) {
+			break;
+		}
+		(void)Ngs2RackDestroy(reinterpret_cast<uintptr_t>(rack), nullptr);
+	}
+
+	Ngs2ContextBufferInfo context_buffer;
+	Ngs2BufferAllocator   allocator;
+	{
+		// Wait for a render or control call that found the system before it was unlinked.
+		Common::LockGuard lock(ngs->mutex);
+		context_buffer = ngs->buffer_info;
+		allocator      = ngs->allocator;
+	}
+	std::destroy_at(ngs);
+
+	if (allocator.free_handler != nullptr) {
+		return allocator.free_handler(&context_buffer);
+	}
+	if (buffer_info != nullptr) {
+		*buffer_info = context_buffer;
 	}
 
 	return OK;
@@ -1179,7 +1242,16 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 	     reinterpret_cast<uint64_t>(buffer_info->host_buffer),
 	     static_cast<uint64_t>(buffer_info->host_buffer_size));
 
-	auto* ngs    = reinterpret_cast<Ngs2Internal*>(system_handle);
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	if (!Ngs2SystemIsLive(ngs)) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
+	// The voices are constructed in place after the rack header.
+	if (buffer_info->host_buffer_size <
+	    sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal) * uint64_t {option->max_voices}) {
+		return NGS2_ERROR_INVALID_OUT_SIZE;
+	}
+
 	auto* rack   = new (buffer_info->host_buffer) Ngs2RackInternal {};
 	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 
@@ -1225,6 +1297,19 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			rack->type = Ngs2RackType::CustomSampler;
 			break;
 		default: EXIT("unknown rack_id: 0x%" PRIx32 "\n", rack_id);
+	}
+
+	if (Ngs2RackIsCustom(rack->type)) {
+		// Module tables are fixed at 24 entries; a user FX module needs its option block.
+		const auto& custom = rack->option.custom_sampler.custom_rack_option;
+		bool        valid  = custom.num_modules <= std::size(custom.module);
+		for (uint32_t m = 0; valid && m < custom.num_modules; ++m) {
+			valid = custom.module[m].module_id != 0x1f || custom.module[m].option != nullptr;
+		}
+		if (!valid) {
+			std::destroy_at(rack);
+			return NGS2_ERROR_INVALID_OUT_SIZE;
+		}
 	}
 
 	LOGF("\t type                   = %s\n", magic_enum::enum_name(rack->type));
@@ -1304,14 +1389,14 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 	if (result == OK) {
 		auto* rack      = static_cast<Ngs2RackInternal*>(buf.host_buffer);
 		rack->allocator = *allocator;
+	} else {
+		(void)allocator->free_handler(&buf);
 	}
 
 	return result;
 }
 
 int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* buffer_info) {
-	constexpr int32_t ERROR_INVALID_RACK_HANDLE = static_cast<int32_t>(0x804a8202u);
-
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
@@ -1319,7 +1404,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 		*buffer_info = {};
 	}
 	if (rack_handle == 0) {
-		return ERROR_INVALID_RACK_HANDLE;
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 
 	auto*         rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
@@ -1334,7 +1419,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 		}
 	}
 	if (ngs == nullptr) {
-		return ERROR_INVALID_RACK_HANDLE;
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 	Ngs2ContextBufferInfo context_buffer;
 	Ngs2BufferAllocator   allocator;
@@ -1347,7 +1432,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 				link = &(*link)->next;
 			}
 			if (*link == nullptr) {
-				return ERROR_INVALID_RACK_HANDLE;
+				return NGS2_ERROR_INVALID_RACK_HANDLE;
 			}
 			*link = rack->next;
 		}
@@ -1532,7 +1617,19 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			Ngs2FinishBlock(voice);
 			continue;
 		}
-		EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
+		if (result.result != OK || result.input_consumed == 0) {
+			// Corrupt or truncated guest frame: stop this voice instead of retrying it forever.
+			Log::WriteToConsoleAndLog(
+			    fmt::sprintf("warning: NGS2 ATRAC9 decode failed (result=0x%08x); stopping voice\n",
+			                 static_cast<uint32_t>(result.result)));
+			voice.blocks.clear();
+			voice.compressed_input.clear();
+			voice.duration_remaining = 0;
+			voice.skip_remaining     = 0;
+			voice.accepts_blocks     = true;
+			voice.state              = Ngs2VoicePlayState::Stopped;
+			return false;
+		}
 		if (pending) {
 			voice.compressed_input.erase(voice.compressed_input.begin(),
 			                             voice.compressed_input.begin() + result.input_consumed);
@@ -1709,7 +1806,10 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					continue;
 				}
 				EXIT_NOT_IMPLEMENTED(port.input != 0);
-				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
+				const auto* matrix =
+				    port.matrix < 0 || static_cast<size_t>(port.matrix) >= source->matrices.size()
+				        ? nullptr
+				        : &source->matrices[port.matrix];
 				const size_t output_channels =
 				    matrix == nullptr
 				        ? voice.channels
@@ -1773,7 +1873,11 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
 	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	if (!Ngs2SystemIsLive(ngs)) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
 	Common::LockGuard lock(ngs->mutex);
+	int                             result = OK;
 	std::vector<std::vector<float>> output_mix(num_buffer_info);
 	std::vector<Ngs2VoiceInternal*> voices;
 	{
@@ -1800,14 +1904,27 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		if (voice->rack->type != Ngs2RackType::Mastering || !voice->has_samples) {
 			continue;
 		}
-		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
+		// Skip outputs the guest described wrongly; finish the render and report the error.
+		if (voice->output_id >= num_buffer_info) {
+			result = NGS2_ERROR_INVALID_OUT_SIZE;
+			continue;
+		}
 		const auto& output = buffer_info[voice->output_id];
-		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-		EXIT_NOT_IMPLEMENTED((output.waveform_type != 0x12 && output.waveform_type != 0x18) ||
-		                     output.num_channels != voice->channels);
-		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
-		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
-		                                                                             : sizeof(float)));
+		if (output.buffer == nullptr) {
+			result = NGS2_ERROR_INVALID_OUT_ADDRESS;
+			continue;
+		}
+		if ((output.waveform_type != 0x12 && output.waveform_type != 0x18) ||
+		    output.num_channels != voice->channels) {
+			result = NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+			continue;
+		}
+		if (output.buffer_size <
+		    uint64_t {grain} * output.num_channels *
+		        (output.waveform_type == 0x12 ? sizeof(int16_t) : sizeof(float))) {
+			result = NGS2_ERROR_INVALID_OUT_SIZE;
+			continue;
+		}
 		float* pcm = nullptr;
 		if (output.waveform_type == 0x12) {
 			auto& mix = output_mix[voice->output_id];
@@ -1820,9 +1937,12 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level = voice->output_matrix.empty()
-				                        ? (src == dst ? 1.0f : 0.0f)
-				                        : voice->output_matrix.at(src * output.num_channels + dst);
+				// Levels the guest did not supply are silent.
+				const size_t level_index = size_t {src} * output.num_channels + dst;
+				const float  level       = voice->output_matrix.empty() ? (src == dst ? 1.0f : 0.0f)
+				                           : level_index < voice->output_matrix.size()
+				                               ? voice->output_matrix[level_index]
+				                               : 0.0f;
 				for (uint32_t i = 0; i < grain; ++i) {
 					pcm[i * output.num_channels + dst] += voice->samples[src * grain + i] * level;
 				}
@@ -1849,7 +1969,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		voice->state_flags = static_cast<uint32_t>(voice->state);
 	}
 	++ngs->render_count;
-	return OK;
+	return result;
 }
 
 static uint16_t Ngs2ReadLe16(const uint8_t* data) {
@@ -2216,7 +2336,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0001: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceMatrixLevelsParam));
 						const auto* ml = reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
-						voice->SetMatrix(ml->matrix_id, ml->levels, ml->num_levels);
+						if (!voice->SetMatrix(ml->matrix_id, ml->levels, ml->num_levels)) {
+							return NGS2_ERROR_INVALID_OUT_SIZE;
+						}
 						LOGF("\t matrix_id  = %u\n"
 						     "\t num_levels = %u\n"
 						     "\t levels     = 0x%016" PRIx64 "\n",
@@ -2227,7 +2349,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePortVolumeParam));
 						const auto* volume =
 						    reinterpret_cast<const Ngs2VoicePortVolumeParam*>(param);
-						voice->SetVolume(volume->port, volume->level);
+						if (!voice->SetVolume(volume->port, volume->level)) {
+							return NGS2_ERROR_INVALID_OUT_SIZE;
+						}
 						LOGF("\t port  = %u\n"
 						     "\t level = %f\n",
 						     volume->port, volume->level);
@@ -2236,7 +2360,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0003: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePortMatrixParam));
 						const auto* pm = reinterpret_cast<const Ngs2VoicePortMatrixParam*>(param);
-						voice->SetPortMatrix(pm->port, pm->matrix_id);
+						if (!voice->SetPortMatrix(pm->port, pm->matrix_id)) {
+							return NGS2_ERROR_INVALID_OUT_SIZE;
+						}
 						LOGF("\t port      = %u\n"
 						     "\t matrix_id = %d\n",
 						     pm->port, pm->matrix_id);
@@ -2312,13 +2438,18 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 1: {
 						const auto* matrix =
 						    reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
-						EXIT_NOT_IMPLEMENTED(matrix->matrix_id != 5);
+						if (matrix->matrix_id != 5 ||
+						    (matrix->levels == nullptr && matrix->num_levels != 0)) {
+							return NGS2_ERROR_INVALID_OUT_SIZE;
+						}
 						voice->output_matrix.assign(matrix->levels,
 						                            matrix->levels + matrix->num_levels);
 						break;
 					}
 					case 5: voice->output_id = values[0]; break;
-					default: EXIT("unsupported mastering control: 0x%08" PRIx32 "\n", param->id);
+					default:
+						LOGF("\t unsupported mastering control: 0x%08" PRIx32 "\n", param->id);
+						return NGS2_ERROR_INVALID_OUT_SIZE;
 				}
 				break;
 			}
@@ -2495,17 +2626,25 @@ int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* comma
 				break;
 			case 5:
 				EXIT_NOT_IMPLEMENTED(p.type != 0x11);
-				voice->SetMatrix(index, p.value.levels, p.count);
+				if (!voice->SetMatrix(index, p.value.levels, p.count)) {
+					return NGS2_ERROR_INVALID_OUT_SIZE;
+				}
 				break;
 			case 6:
 				EXIT_NOT_IMPLEMENTED(p.type != 1);
-				voice->SetVolume(index, p.value.f);
+				if (!voice->SetVolume(index, p.value.f)) {
+					return NGS2_ERROR_INVALID_OUT_SIZE;
+				}
 				break;
 			case 7:
 				EXIT_NOT_IMPLEMENTED(p.type != 3);
-				voice->SetPortMatrix(index, p.value.i);
+				if (!voice->SetPortMatrix(index, p.value.i)) {
+					return NGS2_ERROR_INVALID_OUT_SIZE;
+				}
 				break;
-			default: EXIT("unknown command: 0x%08" PRIx32 "\n", p.id);
+			default:
+				LOGF("\t unknown command: 0x%08" PRIx32 "\n", p.id);
+				return NGS2_ERROR_INVALID_OUT_SIZE;
 		}
 	}
 	return OK;

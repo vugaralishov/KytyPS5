@@ -124,8 +124,12 @@ public:
 		}
 	}
 
+	// keep_unprotectable: after a read-only upload, pages the host cannot protect stay CPU-dirty.
+	// CPU writes to them never fault, so every later GPU use must upload them again, and no write
+	// watcher is armed for them.
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
+	                          bool keep_unprotectable = false) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		if (bits.FirstRangeFrom(start).first >= end) {
@@ -135,6 +139,18 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				if (keep_unprotectable) {
+					RegionBits unprotectable;
+					m_page_manager.MarkUnprotectablePages(m_cpu_addr, start, end, unprotectable);
+					for (const auto [first, last]: unprotectable) {
+						for (auto page = first; page < last; page++) {
+							// GPU-owned pages are written back by their owner instead.
+							if (!m_gpu_dirty.Get(page)) {
+								bits.Set(page);
+							}
+						}
+					}
+				}
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -143,6 +159,14 @@ public:
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
+	}
+
+	// Drops all dirty state and returns every page watcher this region still holds.
+	void ReleaseWatchers() {
+		m_gpu_dirty.Clear();
+		m_cpu_dirty.Fill();
+		UpdateProtection<false, true>();
+		UpdateProtection<false, false>();
 	}
 
 	TrackingSpinLock lock;

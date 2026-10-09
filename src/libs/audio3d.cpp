@@ -80,8 +80,7 @@ static void playback_simulate(void* arg) {
 		}
 		port->data_mutex->Unlock();
 
-		EXIT_IF(play_data == nullptr);
-
+		// A wake without a pushed buffer is spurious; keep waiting instead of aborting.
 		if (play_data != nullptr) {
 			// TODO(): Audio output is not yet implemented, so simulate audio delay
 			Common::Thread::SleepMicro(port->data_delay);

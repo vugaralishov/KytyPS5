@@ -4,8 +4,14 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
+#include <utility>
+#include <vector>
+
+// Only the zlib decoder declarations; the implementation is compiled in window.cpp.
+#include "stb_image.h"
 
 namespace Loader {
 
@@ -99,15 +105,22 @@ static void SaveShdr64(Common::File& f, uint64_t offset, Elf64_Half num, const E
 	EXIT_IF(bytes_written == 0);
 }
 
-static std::unique_ptr<uint8_t[]> LoadDynamic64(Elf64* f, uint64_t offset, uint64_t size) {
+bool Elf64::LoadDynamic(uint64_t offset, uint64_t size, std::unique_ptr<uint8_t[]>* out,
+                        uint64_t* out_size) {
+	// Bound the allocation by the file size before trusting p_filesz.
+	if (size > m_f->Size()) {
+		return false;
+	}
+
 	auto dynamic_data = std::make_unique<uint8_t[]>(size);
 
-	// f.Seek(offset);
-	// f.Read(dynamic_data, size);
+	if (!LoadSegment(reinterpret_cast<uint64_t>(dynamic_data.get()), offset, size)) {
+		return false;
+	}
 
-	f->LoadSegment(reinterpret_cast<uint64_t>(dynamic_data.get()), offset, size);
-
-	return dynamic_data;
+	*out      = std::move(dynamic_data);
+	*out_size = size;
+	return true;
 }
 
 static std::unique_ptr<char[]> LoadStrTable(Common::File& f, uint64_t offset, uint32_t size) {
@@ -239,54 +252,154 @@ Elf64::~Elf64() {
 	Clear();
 }
 
-void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+bool Elf64::IsFileRange(uint64_t offset, uint64_t size) const {
+	const auto file_size = m_f->Size();
+	return offset <= file_size && size <= file_size - offset;
+}
+
+bool Elf64::ReadFile(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+	// File::Read takes a 32-bit size.
+	if (size > UINT32_MAX || !IsFileRange(file_offset, size)) {
+		LOGF("ELF: segment [0x%016" PRIx64 ", +0x%016" PRIx64 "] is outside the file\n",
+		     file_offset, size);
+		return false;
+	}
+	m_f->Seek(file_offset);
+	m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), static_cast<uint32_t>(size));
+	return true;
+}
+
+// Inflates a deflate-compressed SELF segment once and caches it. Encrypted segments (retail
+// SELFs) cannot be loaded: they must be decrypted to an ELF or fake SELF first.
+const std::vector<uint8_t>* Elf64::GetInflatedSelfSegment(uint16_t index) {
+	const auto& seg = m_self_segments[index];
+
+	if (m_self_inflated.size() != m_self->segments_num) {
+		m_self_inflated.resize(m_self->segments_num);
+	}
+	auto& data = m_self_inflated[index];
+	if (!data.empty()) {
+		return &data;
+	}
+
+	if ((seg.type & SELF_SEGMENT_ENCRYPTED) != 0) {
+		LOGF("SELF: segment %u is encrypted and compressed; decrypt the SELF first\n",
+		     static_cast<unsigned>(index));
+		return nullptr;
+	}
+	// stb's inflater takes int sizes.
+	if (seg.compressed_size == 0 || seg.compressed_size > INT32_MAX ||
+	    seg.decompressed_size > INT32_MAX || !IsFileRange(seg.offset, seg.compressed_size)) {
+		LOGF("SELF: compressed segment %u has an invalid size\n", static_cast<unsigned>(index));
+		return nullptr;
+	}
+
+	std::vector<char> compressed(seg.compressed_size);
+	m_f->Seek(seg.offset);
+	m_f->Read(compressed.data(), static_cast<uint32_t>(seg.compressed_size));
+
+	std::vector<uint8_t> inflated(seg.decompressed_size);
+	const int            out_size = static_cast<int>(seg.decompressed_size);
+	const int            in_size  = static_cast<int>(seg.compressed_size);
+	auto*                out      = reinterpret_cast<char*>(inflated.data());
+	// SELF segments are zlib streams; also accept raw deflate.
+	int written = stbi_zlib_decode_buffer(out, out_size, compressed.data(), in_size);
+	if (written != out_size) {
+		written = stbi_zlib_decode_noheader_buffer(out, out_size, compressed.data(), in_size);
+	}
+	if (written != out_size) {
+		LOGF("SELF: segment %u uses unsupported compression or is encrypted; decrypt the SELF "
+		     "first\n",
+		     static_cast<unsigned>(index));
+		return nullptr;
+	}
+
+	data = std::move(inflated);
+	return &data;
+}
+
+bool Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 	EXIT_IF(m_f == nullptr);
+
+	if (size == 0) {
+		return true;
+	}
 
 	if (m_self != nullptr) {
 		EXIT_IF(m_self_segments == nullptr);
 		EXIT_IF(m_phdr == nullptr);
+		EXIT_IF(m_ehdr == nullptr);
 
 		for (uint16_t i = 0; i < m_self->segments_num; i++) {
 			const auto& seg = m_self_segments[i];
-			if ((seg.type & 0x800u) != 0) {
+			if ((seg.type & SELF_SEGMENT_BLOCKED) != 0) {
 				auto phdr_id = ((seg.type >> 20u) & 0xFFFu);
+
+				if (phdr_id >= m_ehdr->e_phnum) {
+					continue;
+				}
 
 				const auto& phdr = m_phdr[phdr_id];
 
-				if (file_offset >= phdr.p_offset && file_offset < phdr.p_offset + phdr.p_filesz) {
-					EXIT_NOT_IMPLEMENTED(seg.decompressed_size != phdr.p_filesz);
-					EXIT_NOT_IMPLEMENTED(seg.compressed_size != seg.decompressed_size);
+				if (file_offset >= phdr.p_offset && file_offset - phdr.p_offset < phdr.p_filesz) {
+					if (seg.decompressed_size != phdr.p_filesz) {
+						LOGF("SELF: segment %u size does not match its program header\n",
+						     static_cast<unsigned>(i));
+						return false;
+					}
 
 					auto offset = file_offset - phdr.p_offset;
 
-					EXIT_NOT_IMPLEMENTED(offset + size > seg.decompressed_size);
+					if (size > seg.decompressed_size - offset || offset > UINT64_MAX - seg.offset) {
+						LOGF("SELF: segment read past segment %u\n", static_cast<unsigned>(i));
+						return false;
+					}
 
-					m_f->Seek(offset + seg.offset);
-					m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+					const bool compressed = (seg.type & SELF_SEGMENT_DEFLATED) != 0 ||
+					                        seg.compressed_size != seg.decompressed_size;
+					if (!compressed) {
+						return ReadFile(vaddr, offset + seg.offset, size);
+					}
 
-					return;
+					const auto* data = GetInflatedSelfSegment(i);
+					if (data == nullptr) {
+						return false;
+					}
+					std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)),
+					            data->data() + offset, size);
+					return true;
 				}
 			}
 		}
 
-		if (m_f->Size() - m_self->file_size == size) {
-			m_f->Seek(m_self->file_size);
-			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
-
-			return;
+		if (m_f->Size() >= m_self->file_size && m_f->Size() - m_self->file_size == size) {
+			return ReadFile(vaddr, m_self->file_size, size);
 		}
 
-		EXIT("missing self segment\n");
-	} else {
-		m_f->Seek(file_offset);
-		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		LOGF("missing self segment\n");
+		return false;
 	}
+
+	return ReadFile(vaddr, file_offset, size);
 }
 
+bool Elf64::IsDynamicDataRange(const void* ptr, uint64_t size) const {
+	if (m_dynamic_data == nullptr || ptr == nullptr) {
+		return false;
+	}
+	const auto addr = reinterpret_cast<uintptr_t>(ptr);
+	const auto base = reinterpret_cast<uintptr_t>(m_dynamic_data.get());
+	return addr >= base && addr - base <= m_dynamic_data_size &&
+	       size <= m_dynamic_data_size - (addr - base);
+}
+
+// PT_DYNAMIC need not contain a DT_NULL terminator, so every scan is bounded by its size.
 const Elf64_Dyn* Elf64::GetDynValue(Elf64_Sxword tag) const {
-	for (const auto* dyn = GetDynamic(); dyn->d_tag != DT_NULL; dyn++) {
-		if (dyn->d_tag == tag) {
-			return dyn;
+	const auto* dyn   = GetDynamic();
+	const auto  count = (dyn == nullptr ? 0 : m_dynamic_size / sizeof(Elf64_Dyn));
+	for (uint64_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+		if (dyn[i].d_tag == tag) {
+			return dyn + i;
 		}
 	}
 	return nullptr;
@@ -294,16 +407,18 @@ const Elf64_Dyn* Elf64::GetDynValue(Elf64_Sxword tag) const {
 
 std::vector<const Elf64_Dyn*> Elf64::GetDynList(Elf64_Sxword tag) const {
 	std::vector<const Elf64_Dyn*> ret;
-	for (const auto* dyn = GetDynamic(); dyn->d_tag != DT_NULL; dyn++) {
-		if (dyn->d_tag == tag) {
-			ret.push_back(dyn);
+	const auto*                   dyn   = GetDynamic();
+	const auto                    count = (dyn == nullptr ? 0 : m_dynamic_size / sizeof(Elf64_Dyn));
+	for (uint64_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+		if (dyn[i].d_tag == tag) {
+			ret.push_back(dyn + i);
 		}
 	}
 	return ret;
 }
 
 bool Elf64::IsShared() const {
-	return (m_ehdr->e_type == ET_DYNAMIC);
+	return (m_ehdr != nullptr && m_ehdr->e_type == ET_DYNAMIC);
 }
 
 bool Elf64::IsNextGen() const {
@@ -338,12 +453,15 @@ void Elf64::Clear() {
 	m_self.reset();
 	m_ehdr.reset();
 	m_self_segments.reset();
+	m_self_inflated.clear();
 	m_phdr.reset();
 	m_shdr.reset();
 	m_str_table.reset();
 	m_str_table_size = 0;
 	m_dynamic.reset();
+	m_dynamic_size = 0;
 	m_dynamic_data.reset();
+	m_dynamic_data_size = 0;
 }
 
 void Elf64::DbgDump(const std::string& folder) {
@@ -375,7 +493,7 @@ void Elf64::DbgDump(const std::string& folder) {
 		fout.Close();
 	}
 
-	for (uint16_t i = 0; i < m_ehdr->e_shnum; i++) {
+	for (uint16_t i = 0; m_shdr != nullptr && i < m_ehdr->e_shnum; i++) {
 		if (m_shdr[i].sh_size == 0u) {
 			continue;
 		}
@@ -410,7 +528,7 @@ void Elf64::DbgDump(const std::string& folder) {
 	fout.Close();
 
 	fout.Create(folder_str + "shdr.txt");
-	for (uint16_t i = 0; i < m_ehdr->e_shnum; i++) {
+	for (uint16_t i = 0; m_shdr != nullptr && i < m_ehdr->e_shnum; i++) {
 		const char* section_name = GetSectionName(i);
 		fout.Printf("--- shdr [%d] %s ---\n", i, section_name != nullptr ? section_name : "");
 		DbgPrintShdr64(m_shdr.get() + i, fout);
@@ -418,8 +536,10 @@ void Elf64::DbgDump(const std::string& folder) {
 	fout.Close();
 
 	fout.Create(folder_str + "dynamic.txt");
-	for (const auto* dyn = GetDynamic(); dyn->d_tag != DT_NULL; dyn++) {
-		DbgPrintDynamic64(dyn, fout);
+	for (uint64_t i = 0; GetDynamic() != nullptr && i < m_dynamic_size / sizeof(Elf64_Dyn) &&
+	                     GetDynamic()[i].d_tag != DT_NULL;
+	     i++) {
+		DbgPrintDynamic64(GetDynamic() + i, fout);
 	}
 	fout.Close();
 }
@@ -536,7 +656,10 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	m_f->Open(file_name, Common::File::Mode::Read);
 
 	if (m_f->IsInvalid()) {
-		EXIT("Can't open %s\n", Common::PathToString(file_name).c_str());
+		// Leaves the object invalid; the caller reports the failure.
+		LOGF("Can't open %s\n", Common::PathToString(file_name).c_str());
+		Clear();
+		return;
 	}
 
 	m_self = LoadSelf(*m_f);
@@ -545,6 +668,11 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 		m_self.reset();
 		m_f->Seek(0);
 	} else {
+		if (m_f->Remaining() < sizeof(SelfSegment) * static_cast<uint64_t>(m_self->segments_num)) {
+			LOGF("SELF: segment table is outside the file\n");
+			Clear();
+			return;
+		}
 		m_self_segments = LoadSelfSegments(*m_f, m_self->segments_num);
 	}
 
@@ -557,15 +685,37 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	}
 
 	if (m_ehdr != nullptr /*&& m_self == nullptr*/) {
+		// A malformed header table makes the whole file invalid: Clear() resets m_f, so
+		// IsValid() reports false and the loader rejects the file.
+		if (ehdr_pos > UINT64_MAX - m_ehdr->e_phoff ||
+		    !IsFileRange(ehdr_pos + m_ehdr->e_phoff,
+		                 sizeof(Elf64_Phdr) * static_cast<uint64_t>(m_ehdr->e_phnum))) {
+			LOGF("ELF: program header table is outside the file\n");
+			Clear();
+			return;
+		}
 		m_phdr = LoadPhdr64(*m_f, ehdr_pos + m_ehdr->e_phoff, m_ehdr->e_phnum);
 		if (m_self == nullptr) {
-			m_shdr = LoadShdr64(*m_f, ehdr_pos + m_ehdr->e_shoff, m_ehdr->e_shnum);
+			// Section headers are only used for debugging, so skip a table that is not in the file.
+			if (m_ehdr->e_shnum != 0 &&
+			    (ehdr_pos > UINT64_MAX - m_ehdr->e_shoff ||
+			     !IsFileRange(ehdr_pos + m_ehdr->e_shoff,
+			                  sizeof(Elf64_Shdr) * static_cast<uint64_t>(m_ehdr->e_shnum)))) {
+				LOGF("ELF: skipping section table outside the file: shoff=0x%016" PRIx64
+				     ", shnum=%" PRIu16 "\n",
+				     m_ehdr->e_shoff, m_ehdr->e_shnum);
+			} else {
+				m_shdr = LoadShdr64(*m_f, ehdr_pos + m_ehdr->e_shoff, m_ehdr->e_shnum);
+			}
 
 			if (m_shdr != nullptr) {
 				if (m_ehdr->e_shstrndx < m_ehdr->e_shnum) {
-					m_str_table_size = static_cast<uint32_t>(m_shdr[m_ehdr->e_shstrndx].sh_size);
-					m_str_table =
-					    LoadStrTable(*m_f, m_shdr[m_ehdr->e_shstrndx].sh_offset, m_str_table_size);
+					const auto& str_shdr = m_shdr[m_ehdr->e_shstrndx];
+					if (str_shdr.sh_size <= UINT32_MAX &&
+					    IsFileRange(str_shdr.sh_offset, str_shdr.sh_size)) {
+						m_str_table_size = static_cast<uint32_t>(str_shdr.sh_size);
+						m_str_table      = LoadStrTable(*m_f, str_shdr.sh_offset, m_str_table_size);
+					}
 				}
 			}
 		} else if (m_ehdr->e_shnum != 0) {
@@ -574,14 +724,22 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 		}
 
 		for (Elf64_Half i = 0; i < m_ehdr->e_phnum; i++) {
+			bool ok = true;
 			switch (m_phdr[i].p_type) {
 				case PT_DYNAMIC:
-					m_dynamic = LoadDynamic64(this, m_phdr[i].p_offset, m_phdr[i].p_filesz);
+					ok = LoadDynamic(m_phdr[i].p_offset, m_phdr[i].p_filesz, &m_dynamic,
+					                 &m_dynamic_size);
 					break;
 				case PT_OS_DYNLIBDATA:
-					m_dynamic_data = LoadDynamic64(this, m_phdr[i].p_offset, m_phdr[i].p_filesz);
+					ok = LoadDynamic(m_phdr[i].p_offset, m_phdr[i].p_filesz, &m_dynamic_data,
+					                 &m_dynamic_data_size);
 					break;
 				default: break;
+			}
+			if (!ok) {
+				LOGF("ELF: dynamic segment %u is outside the file\n", static_cast<unsigned>(i));
+				Clear();
+				return;
 			}
 		}
 	}
@@ -601,7 +759,9 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 		SaveEhdr64(f, m_ehdr.get());
 
 		SavePhdr64(f, m_ehdr->e_phoff, m_ehdr->e_phnum, m_phdr.get());
-		SaveShdr64(f, m_ehdr->e_shoff, m_ehdr->e_shnum, m_shdr.get());
+		// SELF files and out-of-file section tables leave m_shdr empty.
+		const Elf64_Half shnum = (m_shdr != nullptr ? m_ehdr->e_shnum : 0);
+		SaveShdr64(f, m_ehdr->e_shoff, shnum, m_shdr.get());
 
 		for (uint16_t i = 0; i < m_ehdr->e_phnum; i++) {
 			if (m_phdr[i].p_filesz == 0u) {
@@ -621,7 +781,7 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 			EXIT_IF(bytes_written == 0);
 		}
 
-		for (uint16_t i = 0; i < m_ehdr->e_shnum; i++) {
+		for (uint16_t i = 0; i < shnum; i++) {
 			if (m_shdr[i].sh_size == 0u) {
 				continue;
 			}

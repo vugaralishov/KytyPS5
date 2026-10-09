@@ -434,6 +434,9 @@ struct DescriptorBinding {
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
+	// Total guest workgroup counts for storage-buffer LDS indexing; gl_NumWorkGroups only sees
+	// one chunk of a dispatch split by vkCmdDispatchBase.
+	uint32_t                       workgroup_count_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
@@ -621,6 +624,10 @@ struct Program: ResourcePlan {
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
+	// MODE register bits [9:0] (round, denorm, DX10_CLAMP, IEEE): the pipeline default, and the
+	// value after constant S_SETREG_B32 writes at shader entry.
+	uint32_t                      base_float_mode      = 0x1c0u;
+	uint32_t                      float_mode           = 0x1c0u;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

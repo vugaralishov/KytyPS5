@@ -118,6 +118,8 @@ public:
 private:
 	struct PortOut {
 		bool        used        = false;
+		bool        closing     = false;
+		uint32_t    busy        = 0; // In-flight outputs; close waits for them under m_mutex.
 		int         type        = 0;
 		uint32_t    samples_num = 0;
 		uint32_t    freq        = 0;
@@ -145,9 +147,10 @@ private:
 
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
 
-	Common::Mutex m_mutex;
-	PortOut       m_out_ports[OUT_PORTS_MAX];
-	PortIn        m_in_ports[IN_PORTS_MAX];
+	Common::Mutex   m_mutex;
+	Common::CondVar m_out_idle; // Signalled when an output releases its ports.
+	PortOut         m_out_ports[OUT_PORTS_MAX];
+	PortIn          m_in_ports[IN_PORTS_MAX];
 
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
@@ -480,6 +483,12 @@ bool Audio::AudioOutClose(Id handle) {
 	if (AudioOutValid(handle)) {
 		auto& port = m_out_ports[handle.GetId()];
 
+		// Reject new outputs, then wait for in-flight ones before freeing the stream.
+		port.closing = true;
+		while (port.busy != 0) {
+			m_out_idle.Wait(&m_mutex);
+		}
+
 		CloseSdlDevice(&port);
 		port = {};
 
@@ -493,7 +502,7 @@ bool Audio::AudioOutValid(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
-	        m_out_ports[handle.GetId()].used);
+	        m_out_ports[handle.GetId()].used && !m_out_ports[handle.GetId()].closing);
 }
 
 bool Audio::AudioOutHasDevice(Id handle) {
@@ -542,9 +551,21 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
-	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
-	const auto&                     first_port = m_out_ports[params[0].handle.GetId()];
+	// Pin every port for the whole call so a concurrent close waits instead of freeing it.
+	{
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < num; i++) {
+			if (!AudioOutValid(params[i].handle)) {
+				return 0;
+			}
+		}
+		for (uint32_t i = 0; i < num; i++) {
+			m_out_ports[params[i].handle.GetId()].busy++;
+		}
+	}
+
+	const auto                      samples_num = m_out_ports[params[0].handle.GetId()].samples_num;
 	std::array<bool, OUT_PORTS_MAX> paced {};
 	bool                            any_device = false;
 	uint64_t                        deadline   = 0;
@@ -612,7 +633,15 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		Common::Thread::SleepMicro(deadline - now);
 	}
 
-	return first_port.samples_num;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < num; i++) {
+			m_out_ports[params[i].handle.GetId()].busy--;
+		}
+		m_out_idle.SignalAll();
+	}
+
+	return samples_num;
 }
 
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
@@ -860,7 +889,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	if (freq == 0) {
 		return AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
 	}
-	EXIT_NOT_IMPLEMENTED(index != 0);
+	if (index != 0) {
+		return AUDIO_OUT_ERROR_INVALID_PARAM;
+	}
 
 	Audio::Format format       = Audio::Format::Unknown;
 	const auto    format_param = param & AUDIO_OUT_PARAM_FORMAT_MASK;
@@ -879,7 +910,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 
 	LOGF("\t param   = %u (format=%u, %s)\n", param, format_param, magic_enum::enum_name(format));
 
-	EXIT_NOT_IMPLEMENTED(format == Audio::Format::Unknown);
+	if (format == Audio::Format::Unknown) {
+		return AUDIO_OUT_ERROR_INVALID_FORMAT;
+	}
 
 	EXIT_IF(g_audio == nullptr);
 
@@ -912,7 +945,9 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 		return AUDIO_OUT_ERROR_INVALID_PORT;
 	}
 
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
+	if (state == nullptr) {
+		return AUDIO_OUT_ERROR_INVALID_POINTER;
+	}
 
 	state->reroute_counter = 0;
 	state->volume          = 127;
@@ -938,7 +973,7 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 			state->output  = 0x80;
 			state->channel = 0;
 			break;
-		default: EXIT("unknown port type: %d\n", type);
+		default: return AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
 	}
 
 	LOGF("\t output  = %" PRIu16 "\n"
@@ -956,7 +991,9 @@ int KYTY_SYSV_ABI AudioOutSetVolume(int handle, uint32_t flag, int* vol) {
 	     handle, flag);
 
 	EXIT_IF(g_audio == nullptr);
-	EXIT_NOT_IMPLEMENTED(vol == nullptr);
+	if (vol == nullptr) {
+		return AUDIO_OUT_ERROR_INVALID_POINTER;
+	}
 
 	if (!g_audio->AudioOutSetVolume(Audio::Id(handle), flag, vol)) {
 		return AUDIO_OUT_ERROR_INVALID_PORT;
@@ -968,7 +1005,9 @@ int KYTY_SYSV_ABI AudioOutSetVolume(int handle, uint32_t flag, int* vol) {
 int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(param == nullptr);
+	if (param == nullptr) {
+		return AUDIO_OUT_ERROR_INVALID_POINTER;
+	}
 	if (num == 0 || num > Audio::OUT_PORTS_MAX) {
 		return AUDIO_OUT_ERROR_INVALID_SIZE;
 	}

@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -14,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -295,6 +298,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
+	m_unprotected_gpu_images.erase(id);
+	m_unprotected_written_back.erase(id);
 	if (image->info.HasMetadata()) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
 		if (metadata != m_surface_metas.end() &&
@@ -306,7 +311,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		// Fault handlers walk the slots under m_lock from guest threads.
+		m_scheduler.DeferOperation([this, id] {
+			std::scoped_lock lock {m_lock};
+			m_slot_images.erase(id);
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -318,6 +327,17 @@ void TextureCache::FreeImage(ImageId id) {
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
+}
+
+void TextureCache::DownloadAndFreeImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	// Without a download (CPU-dirty or depth contents) the GPU data is dropped as before.
+	if (image.IsGpuModified() && DownloadImageMemory(id)) {
+		// The caller's replacement reads guest memory without faulting, so the contents must
+		// be there first.
+		WaitForWriteBack(PendingWriteBackTick(image.info.data.address, image.info.data.size));
+	}
+	FreeImage(id);
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -439,6 +459,53 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
+}
+
+bool TextureCache::IsUnprotectableImage(const Image& image) {
+	const auto range = image.info.data;
+	return !range.Empty() && !image.depth_id && image.info.samples == 1 &&
+	       image.info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       LibKernel::Memory::IsUnprotectableGuestRange(range.address, range.size);
+}
+
+// The host never protects guest-stack pages on Windows, so a CPU write there does not fault and
+// cannot invalidate the image. Before every GPU use the image is re-uploaded from guest memory,
+// unless the GPU owns newer contents; those are written back before the next end-of-pipe
+// label (FlushUnprotectedGpuWrites), after which guest memory is authoritative again.
+void TextureCache::RevalidateUnprotectableImage(ImageId id, Image& image) {
+	if (!IsUnprotectableImage(image)) {
+		return;
+	}
+	const auto range = image.info.data;
+	if (m_unprotected_written_back.erase(id) != 0 || !image.IsGpuModified()) {
+		// Let the image's own queued write-back land before reading guest memory.
+		WaitForWriteBack(PendingWriteBackTick(range.address, range.size));
+		image.InvalidateCpuWrite(range.address, range.size);
+	}
+	// The use may write the image; the next flush checks whether it did.
+	m_unprotected_gpu_images.insert(id);
+}
+
+bool TextureCache::FlushUnprotectedGpuWrites() {
+	std::scoped_lock lock {m_lock};
+	return FlushUnprotectedGpuWritesLocked();
+}
+
+bool TextureCache::FlushUnprotectedGpuWritesLocked() {
+	bool downloaded = false;
+	for (const auto id: m_unprotected_gpu_images) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || !image->SafeToDownload() ||
+		    !DownloadImageMemory(id)) {
+			continue;
+		}
+		// The queued write-back makes guest memory current; the next use re-uploads from it.
+		image->ClearGpuModified();
+		m_unprotected_written_back.insert(id);
+		downloaded = true;
+	}
+	m_unprotected_gpu_images.clear();
+	return downloaded;
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
@@ -624,6 +691,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	RevalidateUnprotectableImage(destination_id, destination);
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
@@ -665,6 +733,11 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	RevalidateUnprotectableImage(destination_id, destination);
+	if (destination.IsCpuDirty()) {
+		// A partial write: bring the other mips up to date first.
+		InitializeImage(destination_id);
+	}
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
@@ -803,7 +876,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				DownloadAndFreeImage(cached_id);
 			}
 			return {merged_id};
 		}
@@ -888,7 +961,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+		DownloadAndFreeImage(cached_id);
 	}
 	return {merged_id};
 }
@@ -1210,6 +1283,9 @@ void TextureCache::RefreshImage(ImageId id) {
 	     m_slot_images[image.depth_id].info.samples != 1)) {
 		return;
 	}
+	if (image.registered) {
+		RevalidateUnprotectableImage(id, image);
+	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
@@ -1308,7 +1384,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
+				DownloadAndFreeImage(result);
 				result = {};
 			}
 		}
@@ -1609,6 +1685,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;
 	const bool full_image = range.aspectMask == aspects && full_subresources;
 	TrackImage(id);
+	RevalidateUnprotectableImage(id, image);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
 		InitializeImage(id);
 		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
@@ -1677,6 +1754,13 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// The CPU write that triggered this must land after any queued write-back of the same
+	// pages, which would otherwise overwrite it with older GPU data. The write-back keeps the
+	// pages watched until it lands, so the write cannot proceed before this wait returns.
+	if (const auto tick = PendingWriteBackTick(address, size);
+	    tick != 0 && !CommandScheduler::InDeferredOperation()) {
+		m_scheduler.Context().GetGpu().SendCommandSync([this, tick] { WaitForWriteBack(tick); });
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
@@ -1846,14 +1930,21 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto range  = image.info.data;
+	auto&      stream = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    stream.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		// The image does not fit the download ring; the write-back owns a dedicated buffer.
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped    = temporary->Mapped().data();
+		offset    = 0;
+	} else {
+		stream.Commit();
 	}
-	download.Commit();
+	Buffer& download = temporary ? *temporary : static_cast<Buffer&>(stream);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -1873,11 +1964,52 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	uint64_t serial = 0;
+	{
+		std::scoped_lock lock {m_write_back_mutex};
+		serial = ++m_write_back_serial;
+		m_pending_write_backs.push_back(
+		    {range.address, range.size, m_scheduler.CurrentTick(), serial});
+	}
+	// The write-back holds its own write watcher until it lands. The image may be freed (and
+	// untracked) first, yet a guest write in between still faults, and InvalidateMemory then
+	// waits for this write-back instead of letting it overwrite the newer data.
+	m_page_manager.UpdatePageWatchers<true>(range.address, range.size);
+	// The temporary buffer object lives on the heap, so &download survives moving its owner.
+	m_scheduler.DeferPriorityOperation(
+	    [this, &download, range, mapped, offset, serial, owner = std::move(temporary)] {
+		    download.Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		    m_page_manager.UpdatePageWatchers<false>(range.address, range.size);
+		    std::scoped_lock lock {m_write_back_mutex};
+		    std::erase_if(m_pending_write_backs, [serial](const PendingWriteBack& pending) {
+			    return pending.serial == serial;
+		    });
+	    });
 	return true;
+}
+
+uint64_t TextureCache::PendingWriteBackTick(uint64_t address, uint64_t size) {
+	// Protection changes are page granular, so any write-back sharing a tracker page counts.
+	const auto       begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto       end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	std::scoped_lock lock {m_write_back_mutex};
+	uint64_t         tick = 0;
+	for (const auto& pending: m_pending_write_backs) {
+		if (pending.address < end && begin < pending.address + pending.size) {
+			tick = std::max(tick, pending.tick);
+		}
+	}
+	return tick;
+}
+
+void TextureCache::WaitForWriteBack(uint64_t tick) {
+	// Write-backs are only queued while the scheduler is active, and shutdown drains them.
+	if (tick == 0 || !m_scheduler.Active() || CommandScheduler::InDeferredOperation()) {
+		return;
+	}
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -1991,7 +2123,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	(void)FlushUnprotectedGpuWritesLocked();
+	const uint64_t tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -2028,6 +2161,8 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !pressured) {
 					continue;
 				}
+				// The queued write-back keeps its pages watched until it lands, so the image
+				// can go now without waiting for the GPU.
 				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}

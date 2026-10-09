@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <bit>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -531,6 +533,20 @@ uint32_t EmitDsFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
+	if (control >= 0xe000u) {
+		// FFT decomposition: the 5-bit-reversed lane shifted right by popcount(mask), with the
+		// mask bits kept from the lane itself.
+		const uint32_t mask = control & 0x1fu;
+		const auto     lane = EmitAndConstant(state, subid, 31);
+		const auto     reversed =
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		           Unary(state, spv::OpBitReverse, TypeU32(state), lane), ConstantU32(state, 27));
+		const auto shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), reversed,
+		                            ConstantU32(state, static_cast<uint32_t>(std::popcount(mask))));
+		const auto combined = EmitOrU32(state, shifted, EmitAndConstant(state, lane, mask));
+		const auto base     = EmitAndConstant(state, subid, 0xffffffe0u);
+		return EmitOrU32(state, base, combined);
+	}
 	if ((control & 0xc000u) == 0xc000u) {
 		const uint32_t mask         = control & 0x1fu;
 		const uint32_t rotate       = (control >> 5u) & 0x1fu;

@@ -137,7 +137,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 		return Result::Deleted;
 	}
 
-	if (m_count + signal_count > m_max_count) {
+	// m_count never exceeds m_max_count, so the subtraction cannot overflow.
+	if (signal_count < 1 || signal_count > m_max_count - m_count) {
 		return Result::InvalCount;
 	}
 
@@ -255,9 +256,7 @@ int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t a
                                    int max, void* opt) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(sem == nullptr);
-
-	if (name == nullptr || attr > 2 || init < 0 || max <= 0 || init > max) {
+	if (sem == nullptr || name == nullptr || attr > 2 || init < 0 || max <= 0 || init > max) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -592,7 +591,10 @@ static bool AbsTimespecToMicros(const LibKernel::KernelTimespec* abstime, uint32
 		return false;
 	}
 
-	const int64_t sec_delta  = abstime->tv_sec - now.tv_sec;
+	// Clamp before scaling: the result saturates at UINT32_MAX microseconds anyway, and a
+	// far-future tv_sec would otherwise overflow the multiplication.
+	constexpr int64_t MAX_SEC_DELTA = std::numeric_limits<uint32_t>::max() / 1000000 + 1;
+	const int64_t     sec_delta     = (std::min)(abstime->tv_sec - now.tv_sec, MAX_SEC_DELTA);
 	const int64_t nsec_delta = abstime->tv_nsec - now.tv_nsec;
 	const int64_t usec_delta = sec_delta * 1000000 + nsec_delta / 1000;
 

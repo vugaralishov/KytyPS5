@@ -66,13 +66,16 @@ static KYTY_SYSV_ABI int SysmoduleLoadModuleInternalWithArg(uint16_t id, int arg
 
 	LOGF("\t id = %d\n", static_cast<int>(id));
 
-	EXIT_IF(arg1 != 0);
-	EXIT_IF(arg2 != 0);
-	EXIT_IF(arg3 != 0);
-	EXIT_IF(ret == nullptr);
+	// Modules are HLE stubs with no start routine, so the start arguments have nothing to be
+	// passed to; log them instead of aborting.
+	if (arg1 != 0 || arg2 != 0 || arg3 != 0) {
+		LOGF("\t ignored args = %d, %d, %d\n", arg1, arg2, arg3);
+	}
 
 	LoadModule(id);
-	*ret = 0;
+	if (ret != nullptr) {
+		*ret = 0;
+	}
 
 	return 0;
 }

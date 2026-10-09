@@ -257,7 +257,8 @@ static int KYTY_SYSV_ABI MouseRead(int32_t handle, MouseData* data, int32_t num)
 	if (handle <= 0) {
 		return MOUSE_ERROR_INVALID_HANDLE;
 	}
-	if (data == nullptr || num <= 0) {
+	// The mouse library reads at most 64 samples; larger counts would clear unrelated memory.
+	if (data == nullptr || num <= 0 || num > 64) {
 		return MOUSE_ERROR_INVALID_ARG;
 	}
 

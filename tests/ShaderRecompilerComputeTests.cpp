@@ -10332,10 +10332,17 @@ public:
       auto &host_lds_limit = context.GetGraphics().physical_device_properties.limits.maxComputeSharedMemorySize;
       const auto saved_lds_limit = host_lds_limit;
       host_lds_limit = std::min(host_lds_limit, 48u * 1024u);
-      for (u32 dispatch = 0; dispatch < 4; dispatch++) {
+      // Dispatches 4 and 5 force a 1x1x1 host group limit: the direct dispatch must split into
+      // vkCmdDispatchBase chunks with global group IDs and total LDS slice counts, and the
+      // GPU-authored indirect one is clamped to the first group.
+      auto &host_group_limit =
+          context.GetGraphics().physical_device_properties.limits.maxComputeWorkGroupCount;
+      const auto saved_group_limit = host_group_limit;
+      for (u32 dispatch = 0; dispatch < 6; dispatch++) {
         cache.FillBuffer(lds_output, lds_words * sizeof(u32), sentinel, false);
-        const bool indirect = dispatch == 1 || dispatch == 2;
+        const bool indirect = dispatch == 1 || dispatch == 2 || dispatch == 5;
         const bool empty = dispatch == 2;
+        const bool limited = dispatch >= 4;
         if (indirect) {
           const auto groups = empty ? std::array{4096u, 0u, 1u} : std::array{2u, 2u, 2u};
           shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
@@ -10355,6 +10362,9 @@ public:
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true,
                              .tgid_y_en = true, .tgid_z_en = true, .lds_size = 128});
         set_buffer(0, lds_output, lds_words * sizeof(u32));
+        if (limited) {
+          host_group_limit = std::array{1u, 1u, 1u};
+        }
         if (indirect) {
           const std::array<u32, 3> packet{static_cast<u32>(lds_args),
                                          static_cast<u32>(lds_args >> 32u), 0x41u};
@@ -10364,15 +10374,23 @@ public:
         } else {
           processor.DispatchDirect(2, 2, 2, 0x41u);
         }
+        host_group_limit = saved_group_limit;
         cache.ReadMemory(lds_output, lds_words * sizeof(u32));
         std::array<u32, lds_words> actual{};
         Require(name, "storage LDS readback",
                 LibKernel::Memory::TryReadBacking(lds_output, actual.data(), sizeof(actual)),
                 "LDS result buffer could not be read back");
         for (u32 word = 0; word < actual.size(); word++) {
-          const auto expected = empty ? sentinel : (word ^ 64u) + 1u;
-          Require(name, "storage LDS upper range, isolation and barrier", actual[word] == expected,
-                  "64-KiB LDS lost upper bytes, workgroup isolation, or cross-wave writes");
+          // Group (x, y, z) owns words [(x + 2y + 4z) * 128, +128).
+          const bool clamped_away = dispatch == 5 && word >= 128u;
+          const auto expected = empty || clamped_away ? sentinel : (word ^ 64u) + 1u;
+          Require(name,
+                  dispatch == 4   ? "split direct dispatch group IDs and LDS slices"
+                  : dispatch == 5 ? "clamped indirect dispatch"
+                                  : "storage LDS upper range, isolation and barrier",
+                  actual[word] == expected,
+                  "64-KiB LDS lost upper bytes, workgroup isolation, cross-wave writes, or "
+                  "group-limit splitting/clamping");
         }
       }
       host_lds_limit = saved_lds_limit;
@@ -15260,6 +15278,11 @@ public:
               "runtime thread extents are required by the compiled shader");
       std::copy_n(test.compute_info.dispatch_threads_num, 3,
                   shader_data.begin() + layout.dispatch_thread_dword);
+    }
+    if (layout.workgroup_count_dword != ShaderRecompiler::IR::PushData::NoStart) {
+      // Storage LDS indexes group slices with the total dispatch counts.
+      const std::array<u32, 3> groups{test.dispatch_x, test.dispatch_y, test.dispatch_z};
+      std::ranges::copy(groups, shader_data.begin() + layout.workgroup_count_dword);
     }
     auto Binding = [&](Kind kind) {
       return ShaderRecompiler::IR::FindBinding(layout, kind);
@@ -22630,7 +22653,9 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
-  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  // Each source saturates to the i16 range before packing (98305 -> 0x7fff, -98306 -> 0x8000),
+  // as ACO relies on for nir pack_sint_2x16; plain truncation would give 0x7ffe8001.
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
@@ -23590,7 +23615,8 @@ TestCase VectorLaneAndPackedOps() {
           {},
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
-           0x40000000u, 0xef015678u},
+           // V_CVT_PK_U16_U32 saturates both sources (> 0xffff) instead of truncating.
+           0x40000000u, 0xffffffffu},
           {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32,
            O::V_WRITELANE_B32, O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32,
            O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
@@ -32302,6 +32328,40 @@ TestCase DsSwizzleInvalidSourceLaneZero() {
   return test;
 }
 
+TestCase DsSwizzleFftMode() {
+  using O = ShaderOpcode;
+
+  // FFT decomposition (offset >= 0xe000): lane i reads lane
+  // (reverse5(i) >> popcount(mask)) | (i & mask) of its 32-lane half.
+  constexpr u32 Mask = 0x05u;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 0)); // v1 = lane + 1
+  code.push_back(EncodeDs0(0x35, 0xe000u | Mask));
+  code.push_back(EncodeDs1(2, 0, 1));                   // ds_swizzle_b32 v2, v1
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v3 = lane * 4
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsSwizzleFftMode";
+  test.code = code;
+  for (u32 lane = 0; lane < 32u; lane++) {
+    u32 reversed = 0;
+    for (u32 bit = 0; bit < 5u; bit++) {
+      reversed |= ((lane >> bit) & 1u) << (4u - bit);
+    }
+    test.expected.push_back(((reversed >> 2u) | (lane & Mask)) + 1u);
+  }
+  test.opcodes = {O::V_ADD_NC_U32, O::DS_SWIZZLE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase DsPermuteCapturedExecOffsetAndWrap() {
   using O = ShaderOpcode;
 
@@ -34142,6 +34202,44 @@ TestCase ImageD16GatherPacksHalfPairs() {
   return test;
 }
 
+TestCase ImageSampleTexelOffsetsOnGpu() {
+  using O = ShaderOpcode;
+
+  // Both samples aim at the centre of texel (1, 1) of a 4x4 image. The literal offset is
+  // still selected by the runtime exec mask, so both move the coordinates by offset / size.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x00000101u); // constant offset (+1, +1)
+  AppendVMovLiteral(&code, 21, 0x3ec00000u); // x = 0.375
+  AppendVMovLiteral(&code, 22, 0x3ec00000u); // y = 0.375
+  code.push_back(EncodeMimg0(0x30, 0x1));    // image_sample_o v0, v[20:22]
+  code.push_back(EncodeMimg1(0, 20));
+  AppendVMovU32(&code, 30, 0);
+  code.push_back(EncodeMubuf0(0x0c));
+  code.push_back(EncodeMubuf1(23, 12, 30));  // runtime offset (-1, +2) from dword 0
+  AppendVMovLiteral(&code, 24, 0x3ec00000u);
+  AppendVMovLiteral(&code, 25, 0x3ec00000u);
+  code.push_back(EncodeMimg0(0x30, 0x1));    // image_sample_o v1, v[23:25]
+  code.push_back(EncodeMimg1(1, 23));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image, 4, 2, 2, 0x41000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 0, 3, 0x41100000u, 0, 0, 0);
+
+  TestCase test;
+  test.name = "ImageSampleTexelOffsetsOnGpu";
+  test.code = code;
+  test.initial = {0x0000023fu, 0};
+  test.expected = {0x41000000u, 0x41100000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.required_spirv = {"OpImageQuerySizeLod"};
+  return test;
+}
+
 TestCase ImageSampleA16SamplerCoordsOnGpu() {
   using O = ShaderOpcode;
 
@@ -34197,7 +34295,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
 
   std::vector<u32> code;
   AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+                1); // +1 X offset in a full 32-bit dword ahead of the A16 coords.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -34207,8 +34305,9 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The coordinates select texel (2, 1); the offset moves the sample to (3, 1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -34218,8 +34317,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
-  test.forbidden_spirv = {"OpBitFieldSExtract"};
+  test.required_spirv = {"UnpackHalf2x16", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -36740,6 +36838,7 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });
   AddCase(DsSwizzleInvalidSourceLaneZero);
+  AddCase(DsSwizzleFftMode);
   AddCase(DsPermuteCapturedExecOffsetAndWrap);
   AddCase(DsPermuteWave64UsesIndependentHalves);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
@@ -36789,6 +36888,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGatherLodPerLane<8>);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
+  AddCase(ImageSampleTexelOffsetsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);

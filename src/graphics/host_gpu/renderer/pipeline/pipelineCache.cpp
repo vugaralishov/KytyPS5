@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "gpu_blit_shaders/gpu_dispatch_indirect_clamp_spv.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -26,6 +27,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -177,6 +179,36 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// Device shader capabilities the recompiler may target. Device creation enables
+// shaderResourceMinLod whenever it is supported; float-controls properties need no enabling.
+ShaderHostFeatures QueryShaderHostFeatures(const GraphicContext& graphics) {
+	ShaderHostFeatures features;
+	if (graphics.physical_device == nullptr) {
+		return features;
+	}
+	vk::PhysicalDeviceFeatures supported {};
+	graphics.physical_device.getFeatures(&supported);
+	features.min_lod = supported.shaderResourceMinLod == VK_TRUE;
+
+	vk::PhysicalDeviceFloatControlsProperties float_controls {};
+	vk::PhysicalDeviceProperties2             properties {};
+	properties.pNext = &float_controls;
+	graphics.physical_device.getProperties2(&properties);
+	features.rounding_rte_f32    = float_controls.shaderRoundingModeRTEFloat32 == VK_TRUE;
+	features.rounding_rtz_f32    = float_controls.shaderRoundingModeRTZFloat32 == VK_TRUE;
+	features.rounding_rte_f64    = float_controls.shaderRoundingModeRTEFloat64 == VK_TRUE;
+	features.rounding_rtz_f64    = float_controls.shaderRoundingModeRTZFloat64 == VK_TRUE;
+	features.denorm_preserve_f32 = float_controls.shaderDenormPreserveFloat32 == VK_TRUE;
+	features.denorm_flush_f32    = float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+	features.denorm_preserve_f64 = float_controls.shaderDenormPreserveFloat64 == VK_TRUE;
+	features.denorm_flush_f64    = float_controls.shaderDenormFlushToZeroFloat64 == VK_TRUE;
+	features.independent_rounding =
+	    float_controls.roundingModeIndependence != vk::ShaderFloatControlsIndependence::eNone;
+	features.independent_denorm =
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
+	return features;
+}
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -224,14 +256,13 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// Callers keep &Permutation::program, so growth must not relocate elements.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -356,6 +387,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host_features  = host_features;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -398,7 +430,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, const ShaderHostFeatures& host_features)
+	    : device(device), host_features(host_features) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -413,11 +446,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	// Fixed for the device's lifetime, so ProgramKey does not need to include it.
+	ShaderHostFeatures                                          host_features;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(
+                                graphics.device, QueryShaderHostFeatures(graphics))) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -434,6 +470,12 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	if (m_indirect_clamp_pipeline.pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_indirect_clamp_pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(m_indirect_clamp_pipeline.pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(
+		    m_indirect_clamp_pipeline.descriptor_set_layout, nullptr);
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -924,5 +966,48 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+
+PipelineCache::Pipeline& PipelineCache::GetDispatchIndirectClampPipeline() {
+	auto& clamp = m_indirect_clamp_pipeline;
+	if (clamp.pipeline != nullptr) {
+		return clamp;
+	}
+	const vk::DescriptorSetLayoutBinding bindings[] {
+	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	};
+	vk::DescriptorSetLayoutCreateInfo layout_info {};
+	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	layout_info.bindingCount = static_cast<uint32_t>(std::size(bindings));
+	layout_info.pBindings    = bindings;
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.createDescriptorSetLayout(
+	                         &layout_info, nullptr, &clamp.descriptor_set_layout) !=
+	                     vk::Result::eSuccess);
+	clamp.uses_push_descriptors = true;
+
+	const vk::PushConstantRange  push_constants {vk::ShaderStageFlagBits::eCompute, 0,
+	                                             4 * sizeof(uint32_t)};
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = 1;
+	pipeline_layout_info.pSetLayouts            = &clamp.descriptor_set_layout;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                            &clamp.pipeline_layout) !=
+	                     vk::Result::eSuccess);
+
+	const auto module = CompileSPV(GPU_DISPATCH_INDIRECT_CLAMP_SPV, m_graphics.device);
+	EXIT_IF(module == nullptr);
+	vk::ComputePipelineCreateInfo info {};
+	info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	info.stage.module = module;
+	info.stage.pName  = "main";
+	info.layout       = clamp.pipeline_layout;
+	const auto result =
+	    m_graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &clamp.pipeline);
+	m_graphics.device.destroyShaderModule(module, nullptr);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || clamp.pipeline == nullptr);
+	return clamp;
 }
 } // namespace Libs::Graphics
