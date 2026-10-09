@@ -4,19 +4,8 @@
 #include "loader/symbolDatabase.h"
 
 #include <SDL3/SDL_stdinc.h>
-#include <algorithm>
 #include <array>
 #include <cstring>
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace Libs {
 
@@ -224,18 +213,16 @@ static int KYTY_SYSV_ABI CesMbcsUcsContextInit(CesContext* context, const CesPro
 	return 0;
 }
 
-#if defined(_WIN32)
+#include "libs/cp932Table.inc"
 
+// Decodes CP932 (the SJis1997 profile) with the table generated from the Windows decoder, so every
+// platform accepts and rejects exactly the same bytes; system iconv differs between hosts (macOS
+// maps unassigned codes). Returns the SDL_iconv-style status the caller maps to CES errors.
 static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char** outbuf,
                                  size_t* outbytesleft) {
 	const auto* in = reinterpret_cast<const uint8_t*>(*inbuf);
 	while (*inbytesleft != 0) {
-		const uint8_t lead = in[0];
-		// Win32 accepts 0x80 as U+0080; the SJis1997 profile rejects this byte.
-		if (lead == 0x80) {
-			*inbuf = reinterpret_cast<const char*>(in);
-			return SDL_ICONV_EILSEQ;
-		}
+		const uint8_t lead         = in[0];
 		const bool is_lead_byte = (lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc);
 		const size_t char_len   = is_lead_byte ? 2 : 1;
 		if (*inbytesleft < char_len) {
@@ -243,61 +230,34 @@ static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char**
 			return SDL_ICONV_EINVAL;
 		}
 
-		wchar_t   wide[2];
-		const int wide_len =
-		    MultiByteToWideChar(932, MB_ERR_INVALID_CHARS, reinterpret_cast<const char*>(in),
-		                        static_cast<int>(char_len), wide, 2);
-		if (wide_len <= 0) {
+		uint32_t code = 0;
+		if (!is_lead_byte) {
+			code = CP932_SINGLE[lead];
+		} else if (const uint8_t trail = in[1]; trail >= 0x40 && trail <= 0xfc) {
+			const uint32_t lead_index = lead <= 0x9f ? lead - 0x81u : lead - 0xe0u + 31u;
+			code                      = CP932_DOUBLE[lead_index * 189u + (trail - 0x40u)];
+		}
+		if (code == 0) {
 			*inbuf = reinterpret_cast<const char*>(in);
 			return SDL_ICONV_EILSEQ;
 		}
 
-		char      utf8[8];
-		const int utf8_len =
-		    WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, utf8, sizeof(utf8), nullptr, nullptr);
-		if (utf8_len <= 0 || static_cast<size_t>(utf8_len) > *outbytesleft) {
+		uint8_t        utf8[4];
+		const uint32_t utf8_len = CesEncodeUtf8(code, utf8, sizeof(utf8));
+		if (utf8_len == 0 || utf8_len > *outbytesleft) {
 			*inbuf = reinterpret_cast<const char*>(in);
 			return SDL_ICONV_E2BIG;
 		}
 
-		std::memcpy(*outbuf, utf8, static_cast<size_t>(utf8_len));
+		std::memcpy(*outbuf, utf8, utf8_len);
 		*outbuf += utf8_len;
-		*outbytesleft -= static_cast<size_t>(utf8_len);
+		*outbytesleft -= utf8_len;
 		in += char_len;
 		*inbytesleft -= char_len;
 	}
 	*inbuf = reinterpret_cast<const char*>(in);
 	return 0;
 }
-
-#else
-
-// System iconv (for example on macOS) maps a lone 0x80 to U+0080; the SJis1997 profile rejects
-// that byte, as the Windows path does. Convert up to it and report it as an invalid sequence.
-static size_t ConvertCp932ToUtf8(SDL_iconv_t converter, const char** inbuf, size_t* inbytesleft,
-                                 char** outbuf, size_t* outbytesleft) {
-	const auto* in    = reinterpret_cast<const uint8_t*>(*inbuf);
-	size_t      valid = 0;
-	while (valid < *inbytesleft && in[valid] != 0x80) {
-		const uint8_t lead      = in[valid];
-		const bool is_lead_byte = (lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc);
-		valid += is_lead_byte ? 2 : 1;
-	}
-	// A lead byte without its trail stays in the prefix so iconv reports EINVAL for it.
-	valid = (std::min)(valid, *inbytesleft);
-
-	const size_t rest        = *inbytesleft - valid;
-	size_t       prefix_left = valid;
-	const size_t status      = SDL_iconv(converter, inbuf, &prefix_left, outbuf, outbytesleft);
-	*inbytesleft             = prefix_left + rest;
-	if (status == SDL_ICONV_E2BIG || status == SDL_ICONV_EILSEQ || status == SDL_ICONV_EINVAL ||
-	    status == SDL_ICONV_ERROR) {
-		return status;
-	}
-	return rest != 0 ? SDL_ICONV_EILSEQ : status;
-}
-
-#endif
 
 static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_t source_max,
                              uint32_t* source_len, uint8_t* destination, uint32_t destination_max,
@@ -332,10 +292,6 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		++source_size;
 	}
 	const bool bounded_end = source_max != 0 && source_size == source_max;
-#if !defined(_WIN32)
-	const auto converter = SDL_iconv_open("UTF-8", context->profile->encoding);
-	EXIT_IF(converter == reinterpret_cast<SDL_iconv_t>(-1));
-#endif
 
 	const char*           input      = reinterpret_cast<const char*>(source);
 	size_t                input_left = source_size;
@@ -346,12 +302,7 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		char* output = measure ? scratch.data() : reinterpret_cast<char*>(destination) + produced;
 		const size_t capacity    = measure ? scratch.size() : destination_max - 1 - produced;
 		size_t       output_left = capacity;
-#if defined(_WIN32)
-		const auto status = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
-#else
-		const auto status =
-		    ConvertCp932ToUtf8(converter, &input, &input_left, &output, &output_left);
-#endif
+		const auto   status      = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
 		produced += capacity - output_left;
 		if (status == SDL_ICONV_E2BIG) {
 			if (measure) {
@@ -370,9 +321,6 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		}
 		break;
 	} while (input_left != 0);
-#if !defined(_WIN32)
-	SDL_iconv_close(converter);
-#endif
 
 	if (!measure) {
 		destination[produced] = 0;
