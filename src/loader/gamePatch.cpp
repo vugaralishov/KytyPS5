@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <exception>
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -149,13 +148,10 @@ bool LoadPlanUnchecked(const std::filesystem::path& path, Plan* plan, std::strin
 	return true;
 }
 
-// The plan is loaded on the guest thread; never let a malformed file escape as an exception.
+// The build disables exceptions on some platforms, so LoadPlanUnchecked parses without exceptions
+// and type-checks every field before reading it instead of relying on a catch here.
 bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
-	try {
-		return LoadPlanUnchecked(path, plan, error);
-	} catch (const std::exception& e) {
-		return Fail(error, std::string("invalid cheat file: ") + e.what());
-	}
+	return LoadPlanUnchecked(path, plan, error);
 }
 
 bool ValidateGame(const Plan& plan, const Program* main_program, std::string* error) {
