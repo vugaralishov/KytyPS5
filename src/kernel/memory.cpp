@@ -3977,11 +3977,15 @@ static bool ProtectTransientWithinGuest(uint64_t vaddr, uint64_t size, VirtualMe
 		if (start >= stop) {
 			continue;
 		}
-		uint32_t guest = 0;
-		guest |= (range.protection & PROT_CPU_READ) != 0 ? read : 0;
-		guest |= (range.protection & PROT_CPU_WRITE) != 0 ? write : 0;
-		guest |= (range.protection & PROT_CPU_EXEC) != 0 ? exec : 0;
-		uint32_t effective = static_cast<uint32_t>(mode) & guest & (read | write);
+		// Decode like the guest mapping itself: CPU_RW is the write bit alone, write implies read,
+		// and GPU access bits also need host access.
+		VirtualMemory::Mode guest_mode {};
+		GpuAccessMode       gpu_mode {};
+		if (!DecodeMemoryProtection(range.protection, &guest_mode, &gpu_mode)) {
+			guest_mode = mode;
+		}
+		const auto guest     = static_cast<uint32_t>(guest_mode);
+		uint32_t   effective = static_cast<uint32_t>(mode) & guest & (read | write);
 		if ((effective & write) != 0) {
 			effective |= read;
 		}

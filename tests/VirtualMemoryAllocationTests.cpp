@@ -1530,6 +1530,26 @@ void TestPartialUnmapPreservesHostPermissions() {
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// GPU tracking narrows host access to the guest's own protection. CPU_RW is encoded as the write
+// bit alone, so a read-only request on such memory must stay readable, not become no-access.
+void TestGpuProtectKeepsGuestReadAccess() {
+	const char* test = "GpuProtectKeepsGuestReadAccess";
+	const auto  base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+	                                    "gpu_protect_read_access");
+	using Common::VirtualMemory::Mode;
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
+	      "could not protect the page for GPU tracking");
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test, VirtualQuery(reinterpret_cast<void*>(base), &info, sizeof(info)) == sizeof(info),
+	      "VirtualQuery failed");
+	Check(test, info.Protect == PAGE_READONLY, "read-only GPU tracking removed read access");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::ReadWrite),
+	      "could not restore write access");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
@@ -4717,6 +4737,7 @@ int main(int argc, char** argv) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
+	RunTest(TestGpuProtectKeepsGuestReadAccess);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
