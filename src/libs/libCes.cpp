@@ -4,6 +4,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <SDL3/SDL_stdinc.h>
+#include <algorithm>
 #include <array>
 #include <cstring>
 
@@ -269,6 +270,33 @@ static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char**
 	return 0;
 }
 
+#else
+
+// System iconv (for example on macOS) maps a lone 0x80 to U+0080; the SJis1997 profile rejects
+// that byte, as the Windows path does. Convert up to it and report it as an invalid sequence.
+static size_t ConvertCp932ToUtf8(SDL_iconv_t converter, const char** inbuf, size_t* inbytesleft,
+                                 char** outbuf, size_t* outbytesleft) {
+	const auto* in    = reinterpret_cast<const uint8_t*>(*inbuf);
+	size_t      valid = 0;
+	while (valid < *inbytesleft && in[valid] != 0x80) {
+		const uint8_t lead      = in[valid];
+		const bool is_lead_byte = (lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc);
+		valid += is_lead_byte ? 2 : 1;
+	}
+	// A lead byte without its trail stays in the prefix so iconv reports EINVAL for it.
+	valid = (std::min)(valid, *inbytesleft);
+
+	const size_t rest        = *inbytesleft - valid;
+	size_t       prefix_left = valid;
+	const size_t status      = SDL_iconv(converter, inbuf, &prefix_left, outbuf, outbytesleft);
+	*inbytesleft             = prefix_left + rest;
+	if (status == SDL_ICONV_E2BIG || status == SDL_ICONV_EILSEQ || status == SDL_ICONV_EINVAL ||
+	    status == SDL_ICONV_ERROR) {
+		return status;
+	}
+	return rest != 0 ? SDL_ICONV_EILSEQ : status;
+}
+
 #endif
 
 static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_t source_max,
@@ -321,7 +349,8 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 #if defined(_WIN32)
 		const auto status = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
 #else
-		const auto status = SDL_iconv(converter, &input, &input_left, &output, &output_left);
+		const auto status =
+		    ConvertCp932ToUtf8(converter, &input, &input_left, &output, &output_left);
 #endif
 		produced += capacity - output_left;
 		if (status == SDL_ICONV_E2BIG) {
