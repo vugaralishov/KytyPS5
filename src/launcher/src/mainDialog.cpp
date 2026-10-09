@@ -1,10 +1,10 @@
 #include "mainDialog.h"
 
-#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
+#include "emulatorArgs.h"
 #include "gameContent.h"
 #include "updateChecker.h"
 
@@ -17,24 +17,35 @@
 #include <QFileInfo>
 #include <QIODevice>
 #include <QLabel>
+#include <QLayout>
 #include <QMessageBox>
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QSettings>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QTextStream>
+#include <QTimer>
 #include <QVariant>
 #include <QtCore>
 
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 
 #include "ui_main_dialog.h"
 
 #if defined(_WIN32)
 #include <windows.h> // IWYU pragma: keep
+#endif
+#ifdef __linux__
+#include <cerrno>
+#include <signal.h>
+#include <sys/types.h>
 #endif
 
 // IWYU pragma: no_include <minwindef.h>
@@ -44,16 +55,15 @@
 class QWidget;
 
 #if defined(_WIN32)
-constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
-#else
-constexpr char EMULATOR_EXE[] = "kyty_emulator";
-#endif
-
-#if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
 #elif defined(__linux__)
-constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
+constexpr char KYTY_BASH_FILE[]   = "kyty_run.sh";
+constexpr char KYTY_STATUS_FILE[] = "status";
+// Some terminals hand the command to a server and exit before the script starts.
+constexpr qint64 SCRIPT_START_TIMEOUT_MS = 15000;
 #endif
+constexpr int PROBE_TIMEOUT_MS        = 5000;
+constexpr int STATUS_POLL_INTERVAL_MS = 500;
 #if defined(_WIN32)
 constexpr DWORD CMD_X_CHARS = 175;
 constexpr DWORD CMD_Y_CHARS = 1000;
@@ -74,15 +84,33 @@ public:
 	/*slots:*/
 
 	void Update();
+	void FitToGameList();
 	void FindInterpreter();
 	void Run();
+	// Returns false when the launcher must stay open because a game is still running.
+	bool ConfirmClose();
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
+	[[nodiscard]] bool           IsGameRunning() const {
+		return m_process.state() != QProcess::NotRunning || m_running_outside_process;
+	}
+#ifdef __linux__
+	// Directory for this launch's script and status file; replaced on every launch.
+	QString               CreateRunDirectory();
+	[[nodiscard]] QString RunStatusFile() const;
+#endif
 
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
 private:
+	void ProbeFinished(const QString& output, const QString& error);
+	void ProcessFinished();
+	void GameFinished();
+#ifdef __linux__
+	[[nodiscard]] bool ScriptRunning() const;
+#endif
+
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
 
@@ -93,6 +121,14 @@ private:
 	QString         m_interpreter;
 
 	QProcess m_process;
+	// The game outlives m_process when a terminal hands the script to a server process.
+	bool   m_running_outside_process = false;
+	bool   m_quit_when_finished      = false;
+	QTimer m_status_timer;
+#ifdef __linux__
+	std::unique_ptr<QTemporaryDir> m_run_dir;
+	qint64                         m_status_deadline = 0;
+#endif
 
 	QPointer<ConfigurationItem> m_running_item;
 };
@@ -126,7 +162,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
-		        if (m_process.state() == QProcess::NotRunning) {
+		        if (!IsGameRunning()) {
 			        m_lightbar.SetColor(color);
 		        }
 	        });
@@ -146,56 +182,104 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
 		if (state == QProcess::NotRunning) {
-			if (m_running_item != nullptr) {
-				m_running_item->SetRunning(false);
-			}
-			Update();
+			ProcessFinished();
 		}
 	});
+	m_status_timer.setInterval(STATUS_POLL_INTERVAL_MS);
+#ifdef __linux__
+	connect(&m_status_timer, &QTimer::timeout, this, [this]() {
+		if (!ScriptRunning()) {
+			GameFinished();
+		}
+	});
+#endif
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
+	// The settings path, emulator path and build string are only useful for debugging; they stay
+	// up to date on the labels but are not shown.
+	m_ui->label_settings_file->setVisible(false);
+	m_ui->label_Interpreter->setVisible(false);
+	m_ui->label_Version->setVisible(false);
+
 	m_main_dialog->restoreGeometry(g_last_geometry);
+	FitToGameList();
 
 	Update();
 }
 
-void MainDialogPrivate::FindInterpreter() {
-	QDir search_dir(QApplication::applicationDirPath());
-	m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
-
-	if (!QFile::exists(m_interpreter)) {
-		search_dir.cdUp();
-		m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
+void MainDialogPrivate::FitToGameList() {
+	// Open wide enough to show the game list columns up to Path, but never larger than the screen.
+	const auto margins = m_main_dialog->layout()->contentsMargins();
+	int        width   = m_ui->widget->PreferredWidth() + margins.left() + margins.right();
+	int        height  = (std::max)(m_main_dialog->height(), 560);
+	auto       pos     = m_main_dialog->pos();
+	if (const auto* screen = m_main_dialog->screen(); screen != nullptr) {
+		// Leave room for the window frame and title bar.
+		const auto available = screen->availableGeometry().adjusted(8, 8, -8, -48);
+		width                = (std::min)(width, available.width());
+		height               = (std::min)(height, available.height());
+		if (g_last_geometry.isEmpty()) {
+			// First start: center instead of keeping the default top-left position.
+			pos = available.center() - QPoint(width / 2, height / 2);
+		}
+		pos.setX((std::max)(available.left(),
+		                    (std::min)(pos.x(), available.left() + available.width() - width)));
+		pos.setY((std::max)(available.top(),
+		                    (std::min)(pos.y(), available.top() + available.height() - height)));
 	}
+	if (width > m_main_dialog->width() || height > m_main_dialog->height()) {
+		m_main_dialog->resize((std::max)(width, m_main_dialog->width()), height);
+		m_main_dialog->move(pos);
+	}
+}
 
-	bool found = QFile::exists(m_interpreter);
+void MainDialogPrivate::FindInterpreter() {
+	m_interpreter = EmulatorArgs::FindEmulator();
+
 	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
 
-	if (found) {
-		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
-
-		QProcess test;
-		test.setProgram(m_interpreter);
-		test.start();
-		test.waitForFinished();
-
-		auto output = QString(test.readAllStandardOutput());
-		auto lines  = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
-
-		if (lines.count() >= 2) {
-			m_ui->label_Version->setText(
-			    tr("Version: ") + (lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0)));
-		} else {
-			found = false;
-		}
+	if (!QFile::exists(m_interpreter)) {
+		ProbeFinished({}, tr("Can't find emulator"));
+		return;
 	}
+	m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
 
-	if (!found) {
-		QMessageBox::critical(m_main_dialog, tr("Error"), tr("Can't find emulator"));
+	// Probe the version without blocking the UI; a hung emulator is killed after a short timeout.
+	auto* probe = new QProcess(this);
+	probe->setProgram(m_interpreter);
+	auto* timeout = new QTimer(probe);
+	timeout->setSingleShot(true);
+	connect(timeout, &QTimer::timeout, probe, [probe]() { probe->kill(); });
+	connect(probe, &QProcess::finished, this, [this, probe, timeout](int, QProcess::ExitStatus) {
+		const bool timed_out = !timeout->isActive();
+		timeout->stop();
+		probe->deleteLater();
+		ProbeFinished(QString::fromLocal8Bit(probe->readAllStandardOutput()),
+		              timed_out ? tr("The emulator did not respond:\n%1").arg(m_interpreter)
+		                        : QString());
+	});
+	connect(probe, &QProcess::errorOccurred, this, [this, probe](QProcess::ProcessError error) {
+		// finished() is not emitted when the process never started.
+		if (error == QProcess::FailedToStart) {
+			probe->deleteLater();
+			ProbeFinished({}, tr("Can't start emulator:\n%1").arg(probe->errorString()));
+		}
+	});
+	timeout->start(PROBE_TIMEOUT_MS);
+	probe->start();
+}
+
+void MainDialogPrivate::ProbeFinished(const QString& output, const QString& error) {
+	const auto lines = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
+	if (!error.isEmpty() || lines.count() < 2) {
+		QMessageBox::critical(m_main_dialog, tr("Error"),
+		                      error.isEmpty() ? tr("Can't find emulator") : error);
 		QApplication::quit();
 		return;
 	}
+	m_ui->label_Version->setText(tr("Version: ") +
+	                             (lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0)));
 
 	// Prompt for a game folder when none are configured, but keep the launcher
 	// open if the user dismisses the dialog (quitting here can segfault during
@@ -210,116 +294,37 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 }
 
-static QString BoolArg(bool value) {
-	return value ? QStringLiteral("true") : QStringLiteral("false");
-}
-
-static QStringList CreateEmulatorArgs(const Configuration& info) {
-	QStringList args;
-	auto        r = EnumToText(info.screen_resolution).split('x');
-
-	if (r.size() != 2) {
-		return {};
-	}
-
-	args << "--screen-width" << r.at(0);
-	args << "--screen-height" << r.at(1);
-	args << "--user-name" << info.user_name;
-	args << "--user-id" << QString::number(info.user_id);
-	if (!info.audio_input_device.isEmpty()) {
-		args << "--mic" << info.audio_input_device;
-	}
-	if (!info.controller.color.isEmpty()) {
-		args << "--controller-color" << info.controller.color;
-	}
-	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
-	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
-	args << "--present-mode" << EnumToText(info.present_mode);
-	if (info.gpu_index >= 0) {
-		args << "--gpu" << QString::number(info.gpu_index);
-	}
-	if (info.fullscreen_enabled) {
-		args << "--fullscreen";
-	}
-	if (info.hide_cursor_enabled) {
-		args << "--hide-cursor";
-	}
-	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
-	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
-	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
-	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
-	args << "--console-language" << QString::number(info.console_language);
-	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
-	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
-	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
-	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
-	args << "--shader-log-folder" << info.shader_log_folder;
-	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
-	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
-	args << "--printf-direction" << EnumToText(info.printf_direction);
-	args << "--printf-output-file" << info.printf_output_file;
-	if (info.profiler_enabled) {
-		args << "--profile";
-	}
-	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
-		args << "--amd-cpu";
-	}
-#if defined(_WIN32)
-	if (info.red_zone_protection_enabled) {
-		args << "--redzone";
-	}
-#endif
-	for (const auto& binding: info.host_input_mapping) {
-		args << "--keymap" << binding;
-	}
-	if (info.renderdoc_enabled) {
-		args << "--rd";
-	}
-
-	QString game = info.basedir;
-	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
-		game = QDir(info.basedir).filePath(info.elf);
-	}
-	args << "--game" << game;
-
-	const auto patch_plan = Cheats::PlanPath(info.title_id);
-	if (QFileInfo::exists(patch_plan)) {
-		args << "--game-patch" << patch_plan;
-	}
-
-	return args;
-}
-
 #ifdef __linux__
 static QString BashQuote(QString value) {
 	value.replace('\'', "'\\''");
 	return QStringLiteral("'") + value + QStringLiteral("'");
 }
 
+// The script reports its PID in status_file while the emulator runs and "done" afterwards, so the
+// launcher can track the game even when the terminal process exits immediately.
 static bool CreateBashScript(const QString& interpreter, const QStringList& args,
-                             const QString& file_name) {
+                             const QString& file_name, const QString& status_file) {
 	QFile file(file_name);
 	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
 		QTextStream s(&file);
 
 		s << "#!/bin/bash\n";
+		s << "kyty_status=" << BashQuote(status_file) << "\n";
+		s << "trap 'echo done > \"$kyty_status\"' EXIT\n";
+		s << "echo $$ > \"$kyty_status\"\n";
 		s << BashQuote(interpreter);
 		for (const auto& arg: args) {
 			s << " " << BashQuote(arg);
 		}
 		s << "\n";
+		s << "echo done > \"$kyty_status\"\n";
 		s << "echo Press any key...\n";
 		s << "read -n1\n";
 
 		file.close();
 
-		return file.setPermissions(file.permissions() | QFile::ExeUser | QFile::ExeOwner |
-		                           QFile::ExeGroup);
+		return file.error() == QFile::NoError &&
+		       file.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
 	}
 	return false;
 }
@@ -385,41 +390,82 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 #endif
 
 #if defined(_WIN32)
-// Quote one token for cmd.exe so paths with spaces survive /K parsing.
-static QString WinCmdQuote(QString value) {
-	value.replace(QLatin1Char('"'), QStringLiteral("\\\""));
-	return QLatin1Char('"') + value + QLatin1Char('"');
+// Quote one token so it survives cmd.exe /K parsing and then the C runtime's argv splitting in
+// kyty_emulator. cmd expands %VAR% (and !VAR! with delayed expansion) even inside quotes, so those
+// characters are escaped with ^ outside the quotes. A double quote cannot be passed through a
+// quoted cmd token at all, so such values are rejected.
+static bool WinCmdQuote(const QString& value, QString* quoted) {
+	if (value.contains(QLatin1Char('"'))) {
+		return false;
+	}
+
+	QString result      = QStringLiteral("\"");
+	int     backslashes = 0;
+	for (const QChar c: value) {
+		if (c == QLatin1Char('\\')) {
+			backslashes++;
+			result += c;
+			continue;
+		}
+		if (c == QLatin1Char('%') || c == QLatin1Char('!')) {
+			// Backslashes in front of a closing quote must be doubled for the argv parser.
+			result += QString(backslashes, QLatin1Char('\\'));
+			result += QStringLiteral("\"^");
+			result += c;
+			result += QLatin1Char('"');
+		} else {
+			result += c;
+		}
+		backslashes = 0;
+	}
+	result += QString(backslashes, QLatin1Char('\\'));
+	result += QLatin1Char('"');
+
+	*quoted = result;
+	return true;
 }
 
-static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList& args) {
-	QString command = WinCmdQuote(QDir::toNativeSeparators(interpreter));
-	for (const auto& arg: args) {
-		command += QLatin1Char(' ');
-		command += WinCmdQuote(arg);
+static bool BuildWinCmdKCommand(const QString& interpreter, const QStringList& args,
+                                QString* command) {
+	QString token;
+	if (!WinCmdQuote(QDir::toNativeSeparators(interpreter), &token)) {
+		return false;
 	}
-	return command;
+	*command = token;
+	for (const auto& arg: args) {
+		if (!WinCmdQuote(arg, &token)) {
+			return false;
+		}
+		*command += QLatin1Char(' ');
+		*command += token;
+	}
+	return true;
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
+bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	QFileInfo f(interpreter);
 	auto      dir = f.absoluteDir();
 
-	auto args = CreateEmulatorArgs(info);
+	auto args = EmulatorArgs::Create(info);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
-		QApplication::quit();
-		return;
+		return false;
 	}
 
 #ifdef __linux__
-	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
+	// Write the script to a private per-user directory: the install directory may be read-only.
+	const auto run_dir = m_p->CreateRunDirectory();
+	if (run_dir.isEmpty()) {
+		QMessageBox::critical(this, tr("Error"), tr("Can't create a temporary directory."));
+		return false;
+	}
+	const auto bash_file_name = QDir(run_dir).filePath(KYTY_BASH_FILE);
+	if (!CreateBashScript(interpreter, args, bash_file_name, m_p->RunStatusFile())) {
 		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
-		QApplication::quit();
-		return;
+		return false;
 	}
 
 	{
@@ -437,11 +483,16 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 #elif defined(_WIN32)
 	{
+		QString command;
+		if (!BuildWinCmdKCommand(interpreter, args, &command)) {
+			QMessageBox::critical(this, tr("Error"),
+			                      tr("Emulator settings must not contain double quotes (\")."));
+			return false;
+		}
 		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
+		process->setNativeArguments(QStringLiteral("/K \"") + command + QLatin1Char('"'));
 	}
 #else
 	process->setProgram(interpreter);
@@ -468,10 +519,17 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
-		return;
+		return false;
 	}
 #endif
 	process->waitForFinished(100);
+	return true;
+}
+
+void MainDialog::reject() {
+	if (m_p->ConfirmClose()) {
+		QDialog::reject();
+	}
 }
 
 void MainDialog::WriteSettings(QSettings& s) {
@@ -517,15 +575,110 @@ void MainDialogPrivate::Run() {
 	m_lightbar.Stop();
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
-	m_main_dialog->RunInterpreter(&m_process, *info);
+	if (!m_main_dialog->RunInterpreter(&m_process, *info)) {
+		// Nothing was started, so clear the running state set above.
+		if (m_running_item != nullptr) {
+			m_running_item->SetRunning(false);
+		}
+		m_running_item = nullptr;
+	}
 
 	Update();
 }
 
+void MainDialogPrivate::ProcessFinished() {
+#ifdef __linux__
+	if (ScriptRunning()) {
+		// The terminal handed the script to another process; follow the script's status file.
+		m_running_outside_process = true;
+		m_status_timer.start();
+		return;
+	}
+#endif
+	GameFinished();
+}
+
+void MainDialogPrivate::GameFinished() {
+	m_status_timer.stop();
+	m_running_outside_process = false;
+	if (m_running_item != nullptr) {
+		m_running_item->SetRunning(false);
+	}
+	Update();
+	if (m_quit_when_finished) {
+		QApplication::quit();
+	}
+}
+
+bool MainDialogPrivate::ConfirmClose() {
+	if (!IsGameRunning()) {
+		return true;
+	}
+	// Destroying m_process would kill the game (or its terminal), so keep the launcher process
+	// alive, hidden, until the game ends. This works the same on every OS: on Windows the game's
+	// console window stays open, on Linux the terminal stays open, and on macOS the emulator keeps
+	// its output pipes.
+	const auto answer = QMessageBox::question(
+	    m_main_dialog, tr("Game running"),
+	    tr("A game is still running.\n\nClose the launcher window and keep the game running? The "
+	       "launcher exits in the background when the game ends."),
+	    QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+	if (answer == QMessageBox::Yes && IsGameRunning()) {
+		m_quit_when_finished = true;
+		m_main_dialog->hide();
+	} else if (answer == QMessageBox::Yes) {
+		// The game ended while the question was open.
+		return true;
+	}
+	return false;
+}
+
+#ifdef __linux__
+QString MainDialogPrivate::CreateRunDirectory() {
+	m_run_dir.reset();
+	auto base = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+	if (base.isEmpty()) {
+		base = QDir::tempPath();
+	}
+	auto run_dir =
+	    std::make_unique<QTemporaryDir>(QDir(base).filePath(QStringLiteral("kyty-XXXXXX")));
+	if (!run_dir->isValid()) {
+		return {};
+	}
+	m_run_dir         = std::move(run_dir);
+	m_status_deadline = QDateTime::currentMSecsSinceEpoch() + SCRIPT_START_TIMEOUT_MS;
+	return m_run_dir->path();
+}
+
+QString MainDialogPrivate::RunStatusFile() const {
+	return m_run_dir != nullptr ? m_run_dir->filePath(KYTY_STATUS_FILE) : QString();
+}
+
+bool MainDialogPrivate::ScriptRunning() const {
+	if (m_run_dir == nullptr) {
+		return false;
+	}
+	QFile file(RunStatusFile());
+	if (!file.open(QIODevice::ReadOnly)) {
+		// The script has not started yet; give terminals that start it asynchronously some time.
+		return QDateTime::currentMSecsSinceEpoch() < m_status_deadline;
+	}
+	const auto text = QString::fromLatin1(file.readAll()).trimmed();
+	if (text.isEmpty()) {
+		// Read between the script truncating and writing the file.
+		return true;
+	}
+	bool       ok  = false;
+	const auto pid = text.toLongLong(&ok);
+	// "done" (not a number) means the emulator exited; a dead PID means the script was killed.
+	return ok && pid > 0 && (::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM);
+}
+#endif
+
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
-	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr);
+	bool run_enabled = (!IsGameRunning() && item != nullptr);
 
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
@@ -534,7 +687,7 @@ void MainDialogPrivate::Update() {
 	}
 
 	m_ui->widget->SetRunEnabled(run_enabled);
-	if (m_process.state() != QProcess::NotRunning) {
+	if (IsGameRunning()) {
 		m_lightbar.Stop();
 		return;
 	}

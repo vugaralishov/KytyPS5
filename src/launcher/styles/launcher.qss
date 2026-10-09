@@ -1,73 +1,472 @@
-GameListTreeWidget#cfgs_list {
-    background: transparent;
-    border: 1px solid palette(mid);
-    color: palette(text);
-    outline: 0;
+/* KytyPS5 launcher theme. Colors come from the palette set in launcherTheme.cpp. */
+
+QWidget {
+    font-size: 10pt;
 }
 
-GameListTreeWidget#cfgs_list::item {
+QDialog,
+QMainWindow {
+    background: palette(window);
+}
+
+QToolTip {
+    background: palette(alternate-base);
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    color: palette(text);
+    padding: 6px 8px;
+}
+
+/* Cards */
+
+QGroupBox {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+    margin-top: 22px;
+    padding: 14px 12px 10px 12px;
+}
+
+QGroupBox::title {
+    color: palette(highlight);
+    font-weight: 600;
+    left: 4px;
+    padding: 0 4px;
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    top: 2px;
+}
+
+/* Buttons */
+
+QPushButton {
+    background: palette(button);
+    border: 1px solid palette(mid);
+    border-radius: 8px;
+    color: palette(button-text);
+    min-height: 20px;
+    padding: 6px 16px;
+}
+
+QPushButton:hover {
+    background: palette(midlight);
+}
+
+QPushButton:pressed {
+    background: palette(mid);
+}
+
+QPushButton:disabled {
+    color: palette(placeholder-text);
+}
+
+QPushButton:default,
+QPushButton#ok_button {
+    background: palette(highlight);
+    border-color: palette(highlight);
+    color: palette(highlighted-text);
+    font-weight: 600;
+}
+
+QPushButton:default:hover,
+QPushButton#ok_button:hover {
+    background: #5a92ff;
+}
+
+/* Keep buttons in dialog button rows apart; the style sheet otherwise lets them touch. */
+QDialogButtonBox QPushButton {
+    margin: 0 4px;
+    min-width: 72px;
+}
+
+QPushButton::menu-indicator {
+    image: url(:/icons/chevron-down.svg);
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 12px;
+}
+
+QToolButton {
     background: transparent;
-    border-bottom: 1px solid palette(mid);
+    border: 1px solid transparent;
+    border-radius: 8px;
     padding: 4px;
 }
 
-GameListTreeWidget#cfgs_list::item:selected {
-    background: palette(highlight);
-    color: palette(highlighted-text);
-}
-
-GameListTreeWidget#cfgs_list QHeaderView::section {
+QToolButton:hover {
     background: palette(button);
-    color: palette(button-text);
-    border: 0;
-    border-right: 1px solid palette(mid);
-    border-bottom: 1px solid palette(mid);
-    padding: 5px 6px;
+    border-color: palette(mid);
 }
 
-QLineEdit#search_line_edit {
-    background: palette(base);
+QToolButton:pressed {
+    background: palette(midlight);
+}
+
+/* Inputs */
+
+QLineEdit,
+QSpinBox,
+QComboBox {
+    background: palette(window);
     border: 1px solid palette(mid);
-    border-radius: 4px;
+    border-radius: 7px;
     color: palette(text);
-    padding: 5px 8px;
+    min-height: 20px;
+    padding: 4px 8px;
     selection-background-color: palette(highlight);
     selection-color: palette(highlighted-text);
 }
 
-QLineEdit#search_line_edit:focus {
+QLineEdit:hover,
+QSpinBox:hover,
+QComboBox:hover {
+    border-color: palette(midlight);
+}
+
+QLineEdit:focus,
+QSpinBox:focus,
+QComboBox:focus,
+QComboBox:on {
     border-color: palette(highlight);
 }
 
+QLineEdit:disabled,
+QSpinBox:disabled,
+QComboBox:disabled {
+    background: palette(base);
+    color: palette(placeholder-text);
+}
+
+QComboBox::drop-down {
+    border: 0;
+    width: 24px;
+}
+
+QComboBox::down-arrow {
+    height: 14px;
+    image: url(:/icons/chevron-down.svg);
+    width: 14px;
+}
+
+QComboBox QAbstractItemView {
+    background: palette(alternate-base);
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    color: palette(text);
+    outline: 0;
+    padding: 4px;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+
+QSpinBox {
+    padding-right: 22px;
+}
+
+QSpinBox::up-button,
+QSpinBox::down-button {
+    background: transparent;
+    border: 0;
+    width: 20px;
+}
+
+QSpinBox::up-button {
+    subcontrol-position: top right;
+}
+
+QSpinBox::down-button {
+    subcontrol-position: bottom right;
+}
+
+QSpinBox::up-arrow {
+    height: 12px;
+    image: url(:/icons/chevron-up.svg);
+    width: 12px;
+}
+
+QSpinBox::down-arrow {
+    height: 12px;
+    image: url(:/icons/chevron-down.svg);
+    width: 12px;
+}
+
+/* Check boxes */
+
+QCheckBox {
+    color: palette(text);
+    spacing: 10px;
+    padding: 2px 0;
+}
+
+QCheckBox:disabled {
+    color: palette(placeholder-text);
+}
+
+QCheckBox::indicator {
+    background: palette(window);
+    border: 1px solid palette(midlight);
+    border-radius: 5px;
+    height: 16px;
+    width: 16px;
+}
+
+QCheckBox::indicator:hover {
+    border-color: palette(highlight);
+}
+
+QCheckBox::indicator:checked {
+    background: palette(highlight);
+    border-color: palette(highlight);
+    image: url(:/icons/check.svg);
+}
+
+/* Sliders */
+
+QSlider::groove:horizontal {
+    background: palette(mid);
+    border-radius: 2px;
+    height: 4px;
+}
+
+QSlider::sub-page:horizontal {
+    background: palette(highlight);
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: palette(highlighted-text);
+    border: 3px solid palette(highlight);
+    border-radius: 8px;
+    height: 10px;
+    margin: -6px 0;
+    width: 10px;
+}
+
+/* Lists, trees and tables */
+
+QListWidget,
+QTreeWidget,
+QTreeView,
+QTableView {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+    color: palette(text);
+    outline: 0;
+}
+
+QListWidget::item,
+QTreeView::item {
+    border-radius: 6px;
+    padding: 5px 6px;
+}
+
+QListWidget::item:hover,
+QTreeView::item:hover {
+    background: palette(alternate-base);
+}
+
+QListWidget::item:selected,
+QTreeView::item:selected {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+}
+
+QHeaderView {
+    background: transparent;
+}
+
+QHeaderView::section {
+    background: palette(base);
+    border: 0;
+    border-bottom: 1px solid palette(mid);
+    color: palette(placeholder-text);
+    font-weight: 600;
+    padding: 8px 8px;
+}
+
+QHeaderView::down-arrow {
+    image: url(:/icons/sort-down.svg);
+    width: 12px;
+}
+
+QHeaderView::up-arrow {
+    image: url(:/icons/sort-up.svg);
+    width: 12px;
+}
+
+/* Scroll bars */
+
+QScrollBar:vertical {
+    background: transparent;
+    margin: 4px 2px;
+    width: 10px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px 4px;
+}
+
+QScrollBar::handle {
+    background: palette(midlight);
+    border-radius: 3px;
+    margin: 2px;
+}
+
+QScrollBar::handle:hover {
+    background: palette(placeholder-text);
+}
+
+QScrollBar::handle:vertical {
+    min-height: 32px;
+}
+
+QScrollBar::handle:horizontal {
+    min-width: 32px;
+}
+
+QScrollBar::add-line,
+QScrollBar::sub-line,
+QScrollBar::add-page,
+QScrollBar::sub-page {
+    background: transparent;
+    border: 0;
+    height: 0;
+    width: 0;
+}
+
+QScrollArea {
+    background: transparent;
+    border: 0;
+}
+
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+/* Menus */
+
+QMenu {
+    background: palette(alternate-base);
+    border: 1px solid palette(mid);
+    border-radius: 8px;
+    padding: 4px;
+}
+
+QMenu::item {
+    border-radius: 5px;
+    padding: 6px 22px 6px 12px;
+}
+
+QMenu::item:selected {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+}
+
+QMenu::separator {
+    background: palette(mid);
+    height: 1px;
+    margin: 4px 6px;
+}
+
+QTabWidget::pane {
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    color: palette(placeholder-text);
+    padding: 8px 14px;
+}
+
+QTabBar::tab:selected {
+    border-bottom-color: palette(highlight);
+    color: palette(text);
+}
+
+QTabBar::tab:hover {
+    color: palette(text);
+}
+
+/* Main window */
+
+GameListTreeWidget#cfgs_list {
+    background: transparent;
+}
+
+GameListTreeWidget#cfgs_list::item {
+    border-radius: 0;
+    border-bottom: 1px solid palette(mid);
+    padding: 7px 6px;
+}
+
+/* Toolbar: labelled buttons with an icon, same height and corner radius as the search box. */
 QToolButton#refresh_button,
 QToolButton#global_settings_button,
 QToolButton#input_mapping_button,
 QToolButton#edit_button,
+QToolButton#delete_button,
 QToolButton#trophy_overview_button,
-QToolButton#delete_button {
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    padding: 3px;
+QToolButton#home_pc_button {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+    color: palette(button-text);
+    padding: 6px 14px 6px 10px;
+    spacing: 8px;
 }
 
 QToolButton#refresh_button:hover,
 QToolButton#global_settings_button:hover,
 QToolButton#input_mapping_button:hover,
 QToolButton#edit_button:hover,
+QToolButton#delete_button:hover,
 QToolButton#trophy_overview_button:hover,
-QToolButton#delete_button:hover {
-    background: palette(button);
-    border-color: palette(mid);
+QToolButton#home_pc_button:hover {
+    background: palette(alternate-base);
+    border-color: palette(midlight);
 }
 
 QToolButton#refresh_button:pressed,
 QToolButton#global_settings_button:pressed,
 QToolButton#input_mapping_button:pressed,
 QToolButton#edit_button:pressed,
+QToolButton#delete_button:pressed,
 QToolButton#trophy_overview_button:pressed,
-QToolButton#delete_button:pressed {
-    background: palette(midlight);
+QToolButton#home_pc_button:pressed {
+    background: palette(mid);
+}
+
+QToolButton#refresh_button:disabled,
+QToolButton#global_settings_button:disabled,
+QToolButton#input_mapping_button:disabled,
+QToolButton#edit_button:disabled,
+QToolButton#delete_button:disabled,
+QToolButton#trophy_overview_button:disabled,
+QToolButton#home_pc_button:disabled {
+    background: transparent;
+    color: palette(placeholder-text);
+}
+
+QLineEdit#search_line_edit {
+    background: palette(base);
+    border-radius: 10px;
+    min-height: 24px;
+    min-width: 220px;
+    padding: 6px 12px;
+}
+
+QLabel#label_settings_file,
+QLabel#label_Interpreter,
+QLabel#label_Version {
+    color: palette(placeholder-text);
+    font-size: 9pt;
 }
 
 QComboBox#game_status_editor {
@@ -79,18 +478,11 @@ QComboBox#game_status_editor {
 
 QComboBox#game_status_editor:focus {
     background: palette(button);
-    border-radius: 3px;
+    border-radius: 5px;
 }
 
 QComboBox#game_status_editor::drop-down {
     border: 0;
-}
-
-QComboBox#game_status_editor QAbstractItemView {
-    background: palette(base);
-    color: palette(text);
-    selection-background-color: palette(highlight);
-    selection-color: palette(highlighted-text);
 }
 
 QLineEdit#game_comment_editor {
@@ -98,17 +490,77 @@ QLineEdit#game_comment_editor {
     border: 0;
     color: palette(text);
     padding-left: 2px;
-    selection-background-color: palette(highlight);
-    selection-color: palette(highlighted-text);
 }
 
 QLineEdit#game_comment_editor:focus {
-    background: palette(base);
-    border: 1px solid palette(mid);
-    border-radius: 3px;
+    background: palette(window);
+    border: 1px solid palette(highlight);
+    border-radius: 5px;
 }
 
 QLabel#game_status_indicator {
     border: 1px solid palette(base);
     border-radius: 6px;
+}
+
+/* Settings dialog */
+
+QListWidget#section_list {
+    background: transparent;
+    border: 0;
+    font-size: 10.5pt;
+    padding: 0;
+}
+
+QListWidget#section_list::item {
+    border-radius: 8px;
+    color: palette(placeholder-text);
+    margin: 1px 0;
+    padding: 9px 12px;
+}
+
+QListWidget#section_list::item:hover {
+    background: palette(base);
+    color: palette(text);
+}
+
+QListWidget#section_list::item:selected {
+    background: palette(base);
+    border-left: 3px solid palette(highlight);
+    color: palette(text);
+    font-weight: 600;
+}
+
+QLabel#section_title {
+    color: palette(text);
+    font-size: 15pt;
+    font-weight: 600;
+    padding: 2px 2px 0 2px;
+}
+
+QLabel#section_hint {
+    color: palette(placeholder-text);
+    padding: 0 2px 6px 2px;
+}
+
+/* Remote play */
+
+QLabel#remote_play_help,
+QLabel#remote_play_status {
+    color: palette(placeholder-text);
+}
+
+QLabel#pair_pin {
+    color: palette(text);
+    font-size: 28pt;
+    font-weight: 600;
+    padding: 8px 0;
+}
+
+/* Trophy viewer cards */
+
+QFrame#card {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
 }

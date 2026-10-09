@@ -6,7 +6,13 @@
   <file alias="refresh.svg">icons/refresh.svg</file>
   <file alias="remove-configuration.svg">icons/remove-configuration.svg</file>
   <file alias="trophy.svg">icons/trophy.svg</file>
+  <file alias="home-pc.svg">icons/home-pc.svg</file>
   <file alias="hidden-trophy.png">../../assets/images/hidden-trophy.png</file>
+  <file alias="check.svg">icons/check.svg</file>
+  <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+  <file alias="chevron-up.svg">icons/chevron-up.svg</file>
+  <file alias="sort-down.svg">icons/sort-down.svg</file>
+  <file alias="sort-up.svg">icons/sort-up.svg</file>
  </qresource>
  <qresource prefix="/styles">
   <file alias="launcher.qss">styles/launcher.qss</file>

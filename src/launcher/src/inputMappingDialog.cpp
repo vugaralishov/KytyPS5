@@ -20,6 +20,9 @@ namespace {
 constexpr int  BINDING_COLUMN            = 1;
 constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
+// Saved (and passed to the emulator) when every binding was cleared, so an empty custom mapping
+// is not mistaken for "use the defaults".
+constexpr char NO_BINDINGS[] = "Custom=None";
 
 struct PadControl {
 	const char* id;
@@ -186,7 +189,8 @@ private:
 QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	QHash<QString, QString> result;
 	for (const auto& entry: mapping) {
-		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY))) {
+		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY)) ||
+		    entry == QLatin1String(NO_BINDINGS)) {
 			continue;
 		}
 		const auto separator = entry.indexOf(QLatin1Char('='));
@@ -228,7 +232,7 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	               this));
 
 	const auto parsed = ParseMapping(mapping);
-	m_custom_bindings = !parsed.isEmpty();
+	m_custom_bindings = !parsed.isEmpty() || mapping.contains(QLatin1String(NO_BINDINGS));
 
 	auto* sensitivity_layout = new QHBoxLayout;
 	sensitivity_layout->addWidget(new QLabel(tr("Mouse sensitivity"), this));
@@ -293,6 +297,9 @@ QStringList InputMappingDialog::Mapping() const {
 			if (!binding.isEmpty()) {
 				result.append(item->data(0, Qt::UserRole).toString() + QLatin1Char('=') + binding);
 			}
+		}
+		if (result.isEmpty()) {
+			result.append(QLatin1String(NO_BINDINGS));
 		}
 	}
 	if (m_sensitivity->value() != DEFAULT_MOUSE_SENSITIVITY) {

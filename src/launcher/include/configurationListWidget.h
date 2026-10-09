@@ -2,6 +2,7 @@
 #define CONFIGURATION_LIST_WIDGET_H
 
 #include "configuration.h"
+#include "remotePlay.h"
 
 #include <QMap>
 #include <QString>
@@ -34,6 +35,8 @@ public:
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
 
 	[[nodiscard]] const QString& GetSettingsFile() const { return m_settings_file; }
+	// Width that shows every game list column up to Path without scrolling.
+	[[nodiscard]] int            PreferredWidth() const;
 	[[nodiscard]] const QString& GetGlobalControllerColor() const {
 		return m_global_info.controller.color;
 	}
@@ -64,6 +67,7 @@ protected slots:
 	void delete_configuartion();
 	void edit_global_settings();
 	void edit_input_mapping();
+	void show_remote_games();
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void show_context_menu(const QPoint& pos);
 	void open_game_folder();
@@ -74,18 +78,23 @@ private:
 	void               SelectItem(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();
+	void               EditGlobalSettings(bool show_remote_play);
+	// Writes the Sunshine apps file for the games in the list.
+	[[nodiscard]] RemotePlay::SyncResult SyncSunshineApps() const;
 	void               ImportGameSettings(QWidget* parent);
 	void               ExportGameSettings(QWidget* parent) const;
 	[[nodiscard]] bool HasValidGameDirectory() const;
 
 	ConfigurationItem*            m_selected_item = nullptr;
 	bool                          m_run_enabled   = true;
+	bool                          m_settings_write_warned = false;
 	Ui::ConfigurationListWidget*  m_ui            = nullptr;
 	QString                       m_settings_file;
 	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
+	RemotePlay::Settings          m_remote_play;
 	CompatibilityDatabase*        m_compatibility = nullptr;
 };
 

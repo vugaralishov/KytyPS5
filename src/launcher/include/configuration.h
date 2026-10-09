@@ -74,6 +74,7 @@ class Configuration: public QObject {
 public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
+	static constexpr char DEFAULT_USER_NAME[]      = "Kyty";
 
 	enum class Resolution {
 		R1280X720,
@@ -111,7 +112,7 @@ public:
 	ControllerSettings controller;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
-	QString                user_name                   = "Kyty";
+	QString                user_name                   = DEFAULT_USER_NAME;
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;

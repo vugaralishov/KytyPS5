@@ -22,12 +22,15 @@ public:
 	explicit MainDialog(QWidget* parent = nullptr);
 	~MainDialog() override = default;
 
-	void RunInterpreter(QProcess* process, const Configuration& info);
+	// Returns false (after telling the user) when the game could not be started.
+	bool RunInterpreter(QProcess* process, const Configuration& info);
 
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
 	void resizeEvent(QResizeEvent* event) override;
+	// Also handles the close button; asks before leaving a running game.
+	void reject() override;
 
 private:
 	MainDialogPrivate* m_p = nullptr;

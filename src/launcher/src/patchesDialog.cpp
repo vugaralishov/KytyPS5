@@ -232,7 +232,7 @@ void PatchesDialog::Save() {
 		enabled.append(m_patches->item(index)->checkState() == Qt::Checked);
 	}
 	const auto document = Cheats::WithSelection(m_local_document, enabled);
-	const auto error = Cheats::SaveDocument(Cheats::PlanPath(m_title_id), document, m_local_data);
+	const auto error    = Cheats::SavePlan(m_title_id, document, m_local_data);
 	if (!error.isEmpty()) {
 		m_status->setText(error);
 		return;
@@ -296,7 +296,7 @@ void PatchesDialog::ImportRemote() {
 	}
 	const auto mods     = m_remote_document.object().value(QStringLiteral("mods")).toArray();
 	const auto document = Cheats::WithSelection(m_remote_document, QList<bool>(mods.size(), false));
-	const auto save_error = Cheats::SaveDocument(path, document, m_local_data);
+	const auto save_error = Cheats::SavePlan(m_title_id, document, m_local_data);
 	if (!save_error.isEmpty()) {
 		m_preview_status->setText(save_error);
 		return;

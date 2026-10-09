@@ -3,6 +3,7 @@
 #include "kytyGitVersion.h"
 
 #include <QByteArray>
+#include <QDate>
 #include <QDebug>
 #include <QDesktopServices>
 #include <QJsonDocument>
@@ -10,6 +11,7 @@
 #include <QMessageBox>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QString>
 #include <QUrl>
 #include <QWidget>
@@ -19,6 +21,31 @@ namespace {
 constexpr char DEFAULT_FEED_URL[]  = "https://kytyps5.github.io/data/updates.json";
 constexpr char FALLBACK_FEED_URL[] =
     "https://api.github.com/repos/KytyPS5/KytyPS5/releases/latest";
+// Both feeds are a few KB; never buffer more than this.
+constexpr qint64 MAX_FEED_SIZE = 1024 * 1024;
+constexpr char   TOO_LARGE[]   = "kyty_too_large";
+
+// Only open release pages on the project's own hosts.
+bool IsTrustedPageUrl(const QUrl& url) {
+	const auto host = url.host().toLower();
+	return url.isValid() && url.scheme() == QStringLiteral("https") && url.userInfo().isEmpty() &&
+	       (url.port() == -1 || url.port() == 443) &&
+	       (host == QStringLiteral("github.com") || host == QStringLiteral("kytyps5.github.io"));
+}
+
+// Release tags are KytyPS5-YYYY-MM-DD-<sha7>; the build date orders them.
+QDate TagDate(const QString& tag) {
+	static const QRegularExpression pattern(
+	    QStringLiteral("\\AKytyPS5-([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]{7,40}\\z"));
+	const auto match = pattern.match(tag);
+	return match.hasMatch() ? QDate::fromString(match.captured(1), Qt::ISODate) : QDate();
+}
+
+bool IsNewerThanCurrent(const QString& tag) {
+	const auto latest  = TagDate(tag);
+	const auto current = TagDate(QString::fromLatin1(KYTY_RELEASE_TAG));
+	return latest.isValid() && current.isValid() && latest > current;
+}
 
 } // namespace
 
@@ -53,6 +80,10 @@ UpdateChecker::UpdateInfo UpdateChecker::ParseUpdateInfo(const QByteArray& data)
 	if (info.tag.isEmpty() || !info.page_url.isValid() ||
 	    info.page_url.scheme() != QStringLiteral("https")) {
 		info.error = tr("Incomplete update feed");
+	} else if (!TagDate(info.tag).isValid()) {
+		info.error = tr("Unrecognized release tag: %1").arg(info.tag);
+	} else if (!IsTrustedPageUrl(info.page_url)) {
+		info.error = tr("Untrusted release page: %1").arg(info.page_url.toDisplayString());
 	}
 	return info;
 }
@@ -75,9 +106,17 @@ void UpdateChecker::FetchUpdateInfo(const char* url, bool fallback, bool manual)
 	request.setTransferTimeout(15000);
 
 	auto* reply = m_network.get(request);
+	connect(reply, &QNetworkReply::downloadProgress, reply, [reply](qint64 received, qint64) {
+		if (received > MAX_FEED_SIZE) {
+			reply->setProperty(TOO_LARGE, true);
+			reply->abort();
+		}
+	});
 	connect(reply, &QNetworkReply::finished, this, [this, reply, fallback, manual]() {
 		UpdateInfo info;
-		if (reply->error() == QNetworkReply::NoError) {
+		if (reply->property(TOO_LARGE).toBool()) {
+			info.error = tr("Update feed is too large");
+		} else if (reply->error() == QNetworkReply::NoError) {
 			info = ParseUpdateInfo(reply->readAll());
 		} else {
 			info.error = reply->errorString();
@@ -85,8 +124,7 @@ void UpdateChecker::FetchUpdateInfo(const char* url, bool fallback, bool manual)
 		reply->deleteLater();
 
 		if (!fallback) {
-			const bool up_to_date =
-			    info.error.isEmpty() && info.tag == QString::fromLatin1(KYTY_RELEASE_TAG);
+			const bool up_to_date = info.error.isEmpty() && !IsNewerThanCurrent(info.tag);
 			if (!up_to_date) {
 				if (info.error.isEmpty()) {
 					// The primary feed is reachable but disagrees with the build tag
@@ -124,11 +162,12 @@ void UpdateChecker::ShowUpdateResult(const UpdateInfo& info, bool manual) {
 		return;
 	}
 
-	const bool current = info.tag == QString::fromLatin1(KYTY_RELEASE_TAG);
-	if (current) {
+	// Only offer releases built after this one; a stale feed must not offer a downgrade.
+	if (!IsNewerThanCurrent(info.tag)) {
 		if (manual) {
 			QMessageBox::information(m_parent, tr("Update Check"),
-			                         tr("You are using the latest version (%1).").arg(info.tag));
+			                         tr("You are using the latest version (%1).")
+			                             .arg(QString::fromLatin1(KYTY_RELEASE_TAG)));
 		}
 		return;
 	}

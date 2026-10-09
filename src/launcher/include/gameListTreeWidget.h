@@ -53,6 +53,20 @@ protected:
 		}
 
 		QTreeWidget::paintEvent(event);
+
+		if (topLevelItemCount() == 0) {
+			// Tell first-time users what to do instead of showing an empty table.
+			QPainter painter(viewport());
+			auto     color = palette().color(QPalette::PlaceholderText);
+			painter.setPen(color);
+			auto font = painter.font();
+			font.setPointSizeF(font.pointSizeF() * 1.15);
+			painter.setFont(font);
+			painter.drawText(
+			    viewport()->rect().adjusted(24, 24, -24, -24), Qt::AlignCenter | Qt::TextWordWrap,
+			    tr("No games found.\n\nClick Settings above, add the folder that contains your "
+			       "game dumps under Game folders, and they will appear here."));
+		}
 	}
 
 private:

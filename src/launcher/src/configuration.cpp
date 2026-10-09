@@ -1,5 +1,23 @@
 #include "configuration.h"
 
+#include <QDir>
+
+namespace {
+
+// Imported configs may come from anyone; keep the emulator's output paths inside its directory.
+// The emulator truncates printf_output_file, so an absolute or "../" path could clobber any file.
+bool IsContainedRelativePath(const QString& path) {
+	if (QDir::isAbsolutePath(path) || path.startsWith(QLatin1Char('/')) ||
+	    path.startsWith(QLatin1Char('\\')) || path.contains(QLatin1Char(':'))) {
+		return false;
+	}
+	const auto parts =
+	    QString(path).replace(QLatin1Char('\\'), QLatin1Char('/')).split(QLatin1Char('/'));
+	return !parts.contains(QStringLiteral(".."));
+}
+
+} // namespace
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -40,9 +58,15 @@ QVariantMap Configuration::GameSettings() const {
 
 template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
-#define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
+	// Keep the current (default) value for keys missing from older settings files.
+#define KYTY_CFG_GET(n)                                                                            \
+	n = s.value(QStringLiteral(#n), QVariant::fromValue(n)).template value<decltype(n)>()
 	KYTY_CFG_GET(screen_resolution);
 	user_name          = s.value("user_name", user_name).toString();
+	if (user_name.trimmed().isEmpty() ||
+	    static_cast<size_t>(user_name.toUtf8().size()) > Config::MAX_USER_NAME_LENGTH) {
+		user_name = QString::fromLatin1(DEFAULT_USER_NAME);
+	}
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);
 	user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)
@@ -143,6 +167,14 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	    (printf_direction == LogDirection::File && printf_output_file.isEmpty()) ||
 	    (command_buffer_dump_enabled && command_buffer_dump_folder.isEmpty())) {
 		return fail(tr("Enabled logging and command buffer dumps require an output path."));
+	}
+	for (const auto* key:
+	     {"shader_log_folder", "command_buffer_dump_folder", "printf_output_file"}) {
+		const auto path = values.value(QString::fromLatin1(key)).toString();
+		if (!IsContainedRelativePath(path)) {
+			return fail(tr("Game setting %1 must be a relative path without \"..\".")
+			                .arg(QString::fromLatin1(key)));
+		}
 	}
 
 	return true;

@@ -6,11 +6,13 @@
 #include "configuration.h"
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
+#include "emulatorArgs.h"
 #include "gameContent.h"
 #include "gameListTreeWidget.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
+#include "remoteGamesDialog.h"
 #include "trophyViewerDialog.h"
 
 #include <QAbstractItemModel>
@@ -43,6 +45,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScrollBar>
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -58,6 +61,7 @@
 #include <QDBusPendingCallWatcher>
 #endif
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -141,6 +145,37 @@ static QStringList SettingsStringList(const QVariant& value) {
 	return text.isEmpty() ? QStringList() : QStringList({text});
 }
 
+static std::unique_ptr<QSettings> OpenSettings() {
+	// Portable mode: a Kyty.ini next to the launcher. The current directory is still checked so
+	// existing portable setups that start the launcher from their folder keep working.
+	for (const auto& dir: {QCoreApplication::applicationDirPath(), QDir::currentPath()}) {
+		const auto path = QDir(dir).absoluteFilePath(QString::fromLatin1(CONF_FILE_NAME));
+		if (QFileInfo::exists(path)) {
+			return std::make_unique<QSettings>(path, QSettings::IniFormat);
+		}
+	}
+
+	// Per-user settings. System scope is shared by all users (and not writable on macOS).
+	auto s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
+	                                     CONF_APP_NAME);
+	// Do not read stale values from the system file once the user file is in use.
+	s->setFallbacksEnabled(false);
+#ifndef __linux__
+	// Earlier versions stored these settings in system scope on Windows and macOS; copy them once.
+	if (!QFileInfo::exists(s->fileName())) {
+		const QSettings legacy(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
+		                       CONF_APP_NAME);
+		if (QFileInfo::exists(legacy.fileName())) {
+			for (const auto& key: legacy.allKeys()) {
+				s->setValue(key, legacy.value(key));
+			}
+			s->sync();
+		}
+	}
+#endif
+	return s;
+}
+
 static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_list->setAlternatingRowColors(false);
 	ui->cfgs_list->setAllColumnsShowFocus(true);
@@ -154,49 +189,55 @@ static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_list->header()->setStretchLastSection(true);
 }
 
+// The title ID comes from the game's param.json and becomes a path component of a directory that
+// "Remove save data" deletes, so accept only the PlayStation title ID shape (PPSA01234, CUSA01234).
+static bool IsSaveDataTitleId(const QString& title_id) {
+	static const QRegularExpression pattern(QStringLiteral("\\A[A-Z]{4}[0-9]{5}\\z"));
+	return pattern.match(title_id).hasMatch();
+}
+
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
                            const QString& title_id) {
-	const auto path = QDir(root).filePath(
-	    QStringLiteral("%1/%2").arg(QString::fromLatin1(SAVE_DATA_DIR), title_id));
-	QDir dir(path);
-	if (!dir.exists()) {
+	const auto save_root =
+	    QFileInfo(QDir(root).filePath(QString::fromLatin1(SAVE_DATA_DIR))).canonicalFilePath();
+	const auto canonical = QFileInfo(QDir(root).filePath(QStringLiteral("%1/%2").arg(
+	                                     QString::fromLatin1(SAVE_DATA_DIR), title_id)))
+	                           .canonicalFilePath();
+	if (save_root.isEmpty() || canonical.isEmpty() || !QFileInfo(canonical).isDir()) {
 		return;
 	}
 
-	const auto absolute  = dir.absolutePath();
-	auto       canonical = QFileInfo(absolute).canonicalFilePath();
-	if (canonical.isEmpty()) {
-		canonical = absolute;
+	// Require the resolved target to be strictly inside <root>/_SaveData, so a symlinked title
+	// directory can never redirect the deletion elsewhere.
+	if (!canonical.startsWith(save_root + QLatin1Char('/'))) {
+		return;
 	}
-	canonical = QDir::cleanPath(canonical);
 
-	if (!seen->contains(canonical)) {
-		seen->insert(canonical);
-		dirs->append(absolute);
+	const auto key = PathKey(canonical);
+	if (!seen->contains(key)) {
+		seen->insert(key);
+		dirs->append(canonical);
 	}
 }
 
-static QStringList GetSaveDataDirs(const Configuration& info) {
+static QStringList GetSaveDataDirs(const Configuration& info, const QString& runtime_directory) {
 	QStringList dirs;
-	if (info.title_id.trimmed().isEmpty()) {
+	const auto  title_id = info.title_id.trimmed();
+	if (!IsSaveDataTitleId(title_id)) {
 		return dirs;
 	}
 
+	// The emulator writes _SaveData relative to its working directory, which the launcher sets to
+	// the emulator's directory (next to the launcher or its parent). Other directories, such as the
+	// launcher's current directory, are unrelated to the emulator's save data.
 	QSet<QString> seen;
-	QStringList   roots({QDir::currentPath(), QCoreApplication::applicationDirPath()});
-
-	QDir current_parent(QDir::currentPath());
-	if (current_parent.cdUp()) {
-		roots.append(current_parent.absolutePath());
-	}
-
-	QDir app_parent(QCoreApplication::applicationDirPath());
-	if (app_parent.cdUp()) {
-		roots.append(app_parent.absolutePath());
+	QStringList   roots({QCoreApplication::applicationDirPath()});
+	if (!runtime_directory.isEmpty()) {
+		roots.prepend(runtime_directory);
 	}
 
 	for (const auto& root: roots) {
-		AddSaveDataDir(&dirs, &seen, root, info.title_id.trimmed());
+		AddSaveDataDir(&dirs, &seen, root, title_id);
 	}
 
 	return dirs;
@@ -213,9 +254,32 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
 	addAction(m_ui->refresh_action);
 
+	// Label every toolbar button so its purpose is clear without hovering.
+	m_ui->refresh_action->setText(tr("Refresh"));
+	const std::pair<QToolButton*, QString> toolbar[] = {
+	    {m_ui->refresh_button, tr("Refresh")},
+	    {m_ui->global_settings_button, tr("Settings")},
+	    {m_ui->input_mapping_button, tr("Controls")},
+	    {m_ui->edit_button, tr("Game config")},
+	    {m_ui->delete_button, tr("Clear config")},
+	    {m_ui->trophy_overview_button, tr("Trophies")},
+	    {m_ui->home_pc_button, tr("Home PC")},
+	};
+	for (const auto& [button, label]: toolbar) {
+		button->setText(label);
+		button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+		button->setIconSize(QSize(26, 18));
+		button->setMinimumSize(0, 38);
+		button->setAutoRaise(false);
+	}
+	m_ui->horizontalLayout->setSpacing(8);
+	// Keep the toolbar row and the search box clear of the game list below.
+	m_ui->verticalLayout->setSpacing(12);
+
 	UpdateToolbarIcons();
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
+	m_ui->home_pc_button->setToolTip(tr("Play the games on your home PC with Moonlight"));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -247,6 +311,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::delete_configuartion);
 	connect(m_ui->trophy_overview_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::ViewTrophyOverview);
+	connect(m_ui->home_pc_button, &QToolButton::clicked, this,
+	        &ConfigurationListWidget::show_remote_games);
 	connect(m_ui->cfgs_list, &QTreeWidget::currentItemChanged, this,
 	        &ConfigurationListWidget::SelectItem);
 	connect(m_ui->cfgs_list, &QTreeWidget::itemDoubleClicked, this,
@@ -282,14 +348,36 @@ void ConfigurationListWidget::changeEvent(QEvent* event) {
 	}
 }
 
+int ConfigurationListWidget::PreferredWidth() const {
+	const auto* list  = m_ui->cfgs_list;
+	int         width = 0;
+	for (int column = GAME_NAME_COLUMN; column <= GAME_PATH_COLUMN; column++) {
+		width += list->columnWidth(column);
+	}
+	width += 2 * list->frameWidth() + list->verticalScrollBar()->sizeHint().width();
+	const auto margins = layout()->contentsMargins();
+	// The toolbar row can be wider than the columns; it cannot shrink below its buttons.
+	return (std::max)(width + margins.left() + margins.right(), layout()->minimumSize().width());
+}
+
 void ConfigurationListWidget::UpdateToolbarIcons() {
-	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
-	                                                                      : QColor(Qt::black);
+	// Draw the icons in the button text color so icon and label match.
+	const auto color    = palette().color(QPalette::ButtonText);
 	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
-		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
-		QPainter painter(&pixmap);
-		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
-		painter.fillRect(pixmap.rect(), color);
+		// The icon is square at the button's icon height; the rest of the icon width is left
+		// transparent as a gap before the label, which style sheets cannot set for tool buttons.
+		const auto size  = button->iconSize();
+		const auto ratio = button->devicePixelRatioF();
+		auto       glyph = QIcon(resource).pixmap(QSize(size.height(), size.height()), ratio);
+		{
+			QPainter painter(&glyph);
+			painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+			painter.fillRect(glyph.rect(), color);
+		}
+		QPixmap pixmap(size * ratio);
+		pixmap.setDevicePixelRatio(ratio);
+		pixmap.fill(Qt::transparent);
+		QPainter(&pixmap).drawPixmap(0, 0, glyph);
 		button->setIcon(QIcon(pixmap));
 	};
 
@@ -300,22 +388,11 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
 	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
+	set_icon(m_ui->home_pc_button, QStringLiteral(":/icons/home-pc.svg"));
 }
 
 void ConfigurationListWidget::WriteSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
-	}
+	const auto s = OpenSettings();
 
 	MainDialog::WriteSettings(*s);
 	ConfigurationEditDialog::WriteSettings(*s);
@@ -325,6 +402,8 @@ void ConfigurationListWidget::WriteSettings() {
 	s->setValue(CONF_GAME_DIRS, m_game_dirs);
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
+
+	m_remote_play.Write(*s);
 
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
@@ -340,21 +419,28 @@ void ConfigurationListWidget::WriteSettings() {
 		it.value()->WriteSettings(s.get());
 	}
 	s->endArray();
+
+	s->sync();
+	if (s->status() == QSettings::NoError) {
+		m_settings_write_warned = false;
+	} else if (!m_settings_write_warned) {
+		// Settings are written on every resize; warn once per failure streak, and outside the
+		// caller's event handling.
+		m_settings_write_warned = true;
+		QMetaObject::invokeMethod(
+		    this,
+		    [this, file = s->fileName()]() {
+			    QMessageBox::warning(this, tr("Settings"),
+			                         tr("Could not save settings to:\n%1").arg(file));
+		    },
+		    Qt::QueuedConnection);
+	}
 }
 
 void ConfigurationListWidget::ReadSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
+	const auto s = OpenSettings();
+	if (s->status() != QSettings::NoError) {
+		qWarning() << "Could not read settings from" << s->fileName();
 	}
 
 	m_settings_file = s->fileName();
@@ -368,6 +454,8 @@ void ConfigurationListWidget::ReadSettings() {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
 	s->endGroup();
+
+	m_remote_play.Read(*s);
 
 	s->beginGroup(CONF_GLOBAL);
 	if (!s->childKeys().isEmpty()) {
@@ -758,6 +846,25 @@ void ConfigurationListWidget::ScanGameDirectory() {
 	}
 	m_ui->cfgs_list->setCurrentItem(selected_item);
 	SelectItem(selected_item);
+
+	if (m_remote_play.share_games) {
+		const auto result = SyncSunshineApps();
+		if (result.ok) {
+			qInfo().noquote() << "Remote play:" << result.message;
+		} else {
+			qWarning().noquote() << "Remote play:" << result.message;
+		}
+	}
+}
+
+RemotePlay::SyncResult ConfigurationListWidget::SyncSunshineApps() const {
+	std::vector<std::unique_ptr<Configuration>> games;
+	games.reserve(static_cast<size_t>(m_ui->cfgs_list->topLevelItemCount()));
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); ++index) {
+		games.push_back(CreateConfiguration(
+		    *static_cast<const ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index))));
+	}
+	return RemotePlay::WriteSunshineApps(EmulatorArgs::FindEmulator(), std::move(games));
 }
 
 void ConfigurationListWidget::edit_configuration() {
@@ -803,6 +910,10 @@ void ConfigurationListWidget::delete_configuartion() {
 }
 
 void ConfigurationListWidget::edit_global_settings() {
+	EditGlobalSettings(false);
+}
+
+void ConfigurationListWidget::EditGlobalSettings(bool show_remote_play) {
 	Configuration info;
 	info.CopyEmulatorSettingsFrom(m_global_info);
 	info.controller = m_global_info.controller;
@@ -810,13 +921,18 @@ void ConfigurationListWidget::edit_global_settings() {
 
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
-	dlg.SetGlobalSettings(m_game_dirs);
+	dlg.SetGlobalSettings(m_game_dirs, m_remote_play);
+	if (show_remote_play) {
+		dlg.ShowRemotePlay();
+	}
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
 	connect(&dlg, &ConfigurationEditDialog::ImportGameSettings, this,
 	        [this, &dlg]() { ImportGameSettings(&dlg); });
 	connect(&dlg, &ConfigurationEditDialog::ExportGameSettings, this,
 	        [this, &dlg]() { ExportGameSettings(&dlg); });
+	connect(&dlg, &ConfigurationEditDialog::SyncRemotePlay, this,
+	        [this, &dlg]() { dlg.SetRemotePlayStatus(SyncSunshineApps().message); });
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
@@ -824,9 +940,18 @@ void ConfigurationListWidget::edit_global_settings() {
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;
+		const auto remote_play       = dlg.GetRemotePlaySettings();
+		const bool sharing_started   = remote_play.share_games && !m_remote_play.share_games;
+		m_remote_play                = remote_play;
 		WriteSettings();
 		if (game_dirs_changed) {
+			// Also syncs the Sunshine apps file.
 			ScanGameDirectory();
+		} else if (sharing_started) {
+			const auto result = SyncSunshineApps();
+			if (!result.ok) {
+				QMessageBox::warning(this, tr("Remote play"), result.message);
+			}
 		}
 	}
 	SelectItem(m_ui->cfgs_list->currentItem());
@@ -870,6 +995,7 @@ void ConfigurationListWidget::ImportGameSettings(QWidget* parent) {
 	struct ImportedGame {
 		ConfigurationItem*             item;
 		std::unique_ptr<Configuration> info;
+		QStringList                    changes;
 	};
 	std::vector<ImportedGame> imported;
 	auto                      unmatched = settings.keys();
@@ -879,21 +1005,35 @@ void ConfigurationListWidget::ImportGameSettings(QWidget* parent) {
 		if (!settings.contains(title_id)) {
 			continue;
 		}
-		auto    info = CreateConfiguration(*item);
-		QString error;
+		auto       info   = CreateConfiguration(*item);
+		const auto before = info->GameSettings();
+		QString    error;
 		if (!info->SetGameSettings(settings.value(title_id).toObject(), error)) {
 			QMessageBox::warning(parent, tr("Import failed"),
 			                     tr("Invalid game config for %1. %2").arg(title_id, error));
 			return;
 		}
 		info->custom_settings = true;
-		imported.push_back({item, std::move(info)});
+		// List every value the import changes, so the user can review it before applying.
+		QStringList changes;
+		const auto  after = info->GameSettings();
+		for (auto setting = after.constBegin(); setting != after.constEnd(); ++setting) {
+			const auto old_value = before.value(setting.key()).toString();
+			const auto new_value = setting.value().toString();
+			if (old_value != new_value) {
+				changes.append(tr("    %1: %2 → %3").arg(setting.key(), old_value, new_value));
+			}
+		}
+		imported.push_back({item, std::move(info), changes});
 		unmatched.removeAll(title_id);
 	}
 	auto message = imported.empty() ? tr("No matching games found in the library.")
 	                                : tr("Configs will be updated for the following games:\n");
 	for (const auto& game: imported) {
 		message += tr("\n%1 — %2").arg(game.info->title_id.trimmed().toUpper(), game.info->name);
+		message += QLatin1Char('\n');
+		message +=
+		    game.changes.isEmpty() ? tr("    (no changes)") : game.changes.join(QLatin1Char('\n'));
 	}
 	if (!unmatched.isEmpty()) {
 		message += tr("\nGames not found: %1").arg(unmatched.join(QStringLiteral(", ")));
@@ -909,7 +1049,7 @@ void ConfigurationListWidget::ImportGameSettings(QWidget* parent) {
 	if (confirmation.exec() != QMessageBox::Apply) {
 		return;
 	}
-	for (auto& [item, info]: imported) {
+	for (auto& [item, info, changes]: imported) {
 		const auto game_path = info->game_path;
 		delete m_custom_infos.take(game_path);
 		m_custom_infos.insert(game_path, info.release());
@@ -963,6 +1103,14 @@ void ConfigurationListWidget::edit_input_mapping() {
 	if (dialog.exec() == QDialog::Accepted) {
 		m_global_info.host_input_mapping = dialog.Mapping();
 		WriteSettings();
+	}
+}
+
+void ConfigurationListWidget::show_remote_games() {
+	RemoteGamesDialog dialog(m_remote_play, this);
+	dialog.exec();
+	if (dialog.OpenSettingsRequested()) {
+		EditGlobalSettings(true);
 	}
 }
 
@@ -1051,7 +1199,7 @@ void ConfigurationListWidget::remove_save_data() {
 		return;
 	}
 
-	const auto save_data_dirs = GetSaveDataDirs(item->GetInfo());
+	const auto save_data_dirs = GetSaveDataDirs(item->GetInfo(), m_runtime_directory);
 	if (save_data_dirs.isEmpty()) {
 		QMessageBox::information(this, tr("Remove save data"),
 		                         tr("No save data folder found for this game."));
@@ -1146,7 +1294,8 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	}
 
 	QMenu      menu;
-	const auto save_data_dirs = item != nullptr ? GetSaveDataDirs(item->GetInfo()) : QStringList();
+	const auto save_data_dirs =
+	    item != nullptr ? GetSaveDataDirs(item->GetInfo(), m_runtime_directory) : QStringList();
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 

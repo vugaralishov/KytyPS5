@@ -18,7 +18,8 @@ public:
 
 	void paintEvent(QPaintEvent* event) override;
 
-	static bool FindEmpty(QObject* p);
+	static bool       FindEmpty(QObject* p);
+	static QLineEdit* FirstEmpty(QObject* p);
 
 protected slots:
 

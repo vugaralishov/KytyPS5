@@ -5,6 +5,7 @@
 #include <QObject>
 #include <QTreeWidgetItem>
 
+#include <atomic>
 #include <memory>
 
 class QComboBox;
@@ -42,6 +43,9 @@ private:
 	QLabel*                        m_status_indicator = nullptr;
 	QWidget*                       m_status_widget    = nullptr;
 	QLineEdit*                     m_comment_edit     = nullptr;
+	// Shared with the background size walk, which may outlive this item.
+	std::shared_ptr<std::atomic_bool> m_size_walk_cancelled =
+	    std::make_shared<std::atomic_bool>(false);
 };
 
 #endif // CONFIGURATION_ITEM_H

@@ -5,6 +5,7 @@
 
 #include <QApplication>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -19,6 +20,7 @@
 #include <QSize>
 #include <QStringList>
 #include <QStyle>
+#include <QThreadPool>
 #include <QTreeWidget>
 #include <QVersionNumber>
 #include <QWheelEvent>
@@ -111,6 +113,18 @@ QString GetSortText(const Configuration& info) {
 	return QStringLiteral("%1\n%2").arg(info.name.toCaseFolded(), info.game_path.toCaseFolded());
 }
 
+// Size walks run on a private pool: they are disk-bound, can take long on large folders, and
+// must not occupy (or be waited for in) the global pool. The pool belongs to the application,
+// so the threads are joined before it exits; each walk stops once its row is deleted.
+QThreadPool* SizeWalkPool() {
+	static auto* pool = [] {
+		auto* thread_pool = new QThreadPool(QCoreApplication::instance());
+		thread_pool->setMaxThreadCount(2);
+		return thread_pool;
+	}();
+	return pool;
+}
+
 void MakeTransparent(QWidget* widget) {
 	widget->setAutoFillBackground(false);
 	widget->setAttribute(Qt::WA_NoSystemBackground);
@@ -171,31 +185,38 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 		}
 		watcher->deleteLater();
 	});
-	watcher->setFuture(QtConcurrent::run([path = m_info->basedir]() -> qint64 {
-		if (path.isEmpty()) {
-			return -1;
-		}
-		const QFileInfo info(path);
-		if (GameContent::IsArchive(path)) {
-			return info.size();
-		}
-		if (!QDir(path).exists()) {
-			return -1;
-		}
-		qint64       bytes = 0;
-		QDirIterator files(path, QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks,
-		                   QDirIterator::Subdirectories);
-		while (files.hasNext()) {
-			files.next();
-			if (files.fileInfo().isFile()) {
-				bytes += files.fileInfo().size();
-			}
-		}
-		return bytes;
-	}));
+	watcher->setFuture(QtConcurrent::run(
+	    SizeWalkPool(), [path = m_info->basedir, cancelled = m_size_walk_cancelled]() -> qint64 {
+		    if (path.isEmpty() || cancelled->load()) {
+			    return -1;
+		    }
+		    const QFileInfo info(path);
+		    if (GameContent::IsArchive(path)) {
+			    return info.size();
+		    }
+		    if (!QDir(path).exists()) {
+			    return -1;
+		    }
+		    qint64       bytes = 0;
+		    QDirIterator files(path, QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks,
+		                       QDirIterator::Subdirectories);
+		    while (files.hasNext()) {
+			    if (cancelled->load(std::memory_order_relaxed)) {
+				    return -1;
+			    }
+			    files.next();
+			    if (files.fileInfo().isFile()) {
+				    bytes += files.fileInfo().size();
+			    }
+		    }
+		    return bytes;
+	    }));
 }
 
-ConfigurationItem::~ConfigurationItem() = default;
+ConfigurationItem::~ConfigurationItem() {
+	// Stop a size walk that is still queued or running for this row.
+	m_size_walk_cancelled->store(true);
+}
 
 void ConfigurationItem::Update(bool reload_icon) {
 	const auto display_text = GetDisplayText(*m_info);

@@ -1,10 +1,10 @@
 #include "compatibilityDatabase.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
-#include <QEventLoop>
 #include <QFile>
-#include <QFutureWatcher>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -12,10 +12,8 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSaveFile>
-#include <QThread>
 #include <QTimer>
 #include <QUrl>
-#include <QtConcurrentRun>
 
 #include <utility>
 
@@ -25,6 +23,10 @@ constexpr char FILE_NAME[]    = "compatibility_db.json";
 constexpr char URL[]          = "https://kytyps5.github.io/data/compatibility.json";
 constexpr int  RETRY_COUNT    = 3;
 constexpr int  RETRY_DELAY_MS = 750;
+constexpr int  TIMEOUT_MS     = 15000;
+// The database is a few hundred KB; refuse anything far larger instead of buffering it.
+constexpr qint64 MAX_DOWNLOAD_SIZE = 16LL * 1024 * 1024;
+constexpr char   TOO_LARGE[]       = "kyty_too_large";
 
 struct LoadResult {
 	QMap<QString, CompatibilityEntry> entries;
@@ -86,38 +88,17 @@ LoadResult Parse(const QByteArray& data) {
 	return ret;
 }
 
-LoadResult DownloadOnce() {
-	QNetworkAccessManager manager;
-	QNetworkRequest       request(QUrl(QString::fromLatin1(URL)));
-	request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-	                     QNetworkRequest::NoLessSafeRedirectPolicy);
-	request.setRawHeader("User-Agent", "Kyty-Launcher");
-
-	auto*      reply = manager.get(request);
-	QEventLoop loop;
-	QTimer     timeout;
-	timeout.setSingleShot(true);
-	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-	QObject::connect(&timeout, &QTimer::timeout, reply, &QNetworkReply::abort);
-	timeout.start(15000);
-	loop.exec();
-
-	if (!timeout.isActive()) {
-		return {{}, QStringLiteral("Compatibility download timed out")};
+QString FilePath() {
+	// Use the same base directory as a portable Kyty.ini: next to the launcher, or the current
+	// directory for existing setups that keep the database there.
+	const auto file_name = QString::fromLatin1(FILE_NAME);
+	for (const auto& dir: {QCoreApplication::applicationDirPath(), QDir::currentPath()}) {
+		const auto path = QDir(dir).absoluteFilePath(file_name);
+		if (QFileInfo::exists(path)) {
+			return path;
+		}
 	}
-	if (reply->error() != QNetworkReply::NoError) {
-		return {{}, reply->errorString()};
-	}
-	return Parse(reply->readAll());
-}
-
-LoadResult Download() {
-	auto result = DownloadOnce();
-	for (int retry = 1; retry <= RETRY_COUNT && !result.error.isEmpty(); retry++) {
-		QThread::msleep(static_cast<unsigned long>(RETRY_DELAY_MS * retry));
-		result = DownloadOnce();
-	}
-	return result;
+	return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(file_name);
 }
 
 } // namespace
@@ -132,7 +113,7 @@ const CompatibilityEntry* CompatibilityDatabase::Find(const QString& title_id) c
 
 void CompatibilityDatabase::Load() {
 	if (m_local) {
-		QFile file(QDir(".").absoluteFilePath(FILE_NAME));
+		QFile file(FilePath());
 		if (!file.exists()) {
 			emit Updated();
 			return;
@@ -151,18 +132,65 @@ void CompatibilityDatabase::Load() {
 		return;
 	}
 
-	auto* watcher = new QFutureWatcher<LoadResult>(this);
-	connect(watcher, &QFutureWatcher<LoadResult>::finished, this, [this, watcher]() {
-		const auto result = watcher->result();
-		watcher->deleteLater();
-		if (!result.error.isEmpty()) {
-			qWarning() << "Could not refresh compatibility database:" << result.error;
+	// Download asynchronously on this thread, so nothing outlives the launcher on shutdown.
+	m_attempt = 0;
+	StartDownload();
+}
+
+void CompatibilityDatabase::StartDownload() {
+	if (m_network == nullptr) {
+		m_network = new QNetworkAccessManager(this);
+	}
+
+	QNetworkRequest request(QUrl(QString::fromLatin1(URL)));
+	request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+	                     QNetworkRequest::NoLessSafeRedirectPolicy);
+	request.setRawHeader("User-Agent", "Kyty-Launcher");
+	request.setTransferTimeout(TIMEOUT_MS);
+
+	auto*      reply              = m_network->get(request);
+	const auto abort_if_too_large = [reply](qint64 size) {
+		if (size > MAX_DOWNLOAD_SIZE) {
+			reply->setProperty(TOO_LARGE, true);
+			reply->abort();
+		}
+	};
+	connect(reply, &QNetworkReply::metaDataChanged, reply, [reply, abort_if_too_large]() {
+		abort_if_too_large(reply->header(QNetworkRequest::ContentLengthHeader).toLongLong());
+	});
+	connect(
+	    reply, &QNetworkReply::downloadProgress, reply,
+	    [abort_if_too_large](qint64 received, qint64 /*total*/) { abort_if_too_large(received); });
+	connect(reply, &QNetworkReply::finished, this, [this, reply]() { DownloadFinished(reply); });
+}
+
+void CompatibilityDatabase::DownloadFinished(QNetworkReply* reply) {
+	reply->deleteLater();
+
+	const bool too_large = reply->property(TOO_LARGE).toBool();
+	QString    error;
+	if (too_large) {
+		error = QStringLiteral("Compatibility database exceeds %1 bytes").arg(MAX_DOWNLOAD_SIZE);
+	} else if (reply->error() != QNetworkReply::NoError) {
+		error = reply->error() == QNetworkReply::OperationCanceledError
+		            ? QStringLiteral("Compatibility download timed out")
+		            : reply->errorString();
+	} else {
+		auto result = Parse(reply->readAll());
+		if (result.error.isEmpty()) {
+			m_entries = std::move(result.entries);
+			emit Updated();
 			return;
 		}
-		m_entries = result.entries;
-		emit Updated();
-	});
-	watcher->setFuture(QtConcurrent::run(Download));
+		error = result.error;
+	}
+
+	if (!too_large && m_attempt < RETRY_COUNT) {
+		m_attempt++;
+		QTimer::singleShot(RETRY_DELAY_MS * m_attempt, this, &CompatibilityDatabase::StartDownload);
+		return;
+	}
+	qWarning() << "Could not refresh compatibility database:" << error;
 }
 
 void CompatibilityDatabase::SetStatus(const QString& title_id, Configuration::GameStatus status) {
@@ -191,7 +219,7 @@ void CompatibilityDatabase::Save() const {
 		                         {QStringLiteral("comment"), it.value().comment}});
 	}
 
-	QSaveFile  file(QDir(".").absoluteFilePath(FILE_NAME));
+	QSaveFile  file(FilePath());
 	const auto data = QJsonDocument(root).toJson(QJsonDocument::Indented);
 	if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit()) {
 		qWarning() << "Could not save compatibility database:" << file.errorString();

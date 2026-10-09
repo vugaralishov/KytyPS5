@@ -47,7 +47,7 @@
         </item>
         <item row="0" column="1">
          <widget class="MandatoryLineEdit" name="lineEdit_user_name">
-          <property name="toolTip"><string>Local user name exposed to games</string></property>
+          <property name="toolTip"><string>Name that games show for the signed-in user (1-16 characters).</string></property>
           <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
@@ -58,7 +58,7 @@
         </item>
         <item row="1" column="1">
          <widget class="QSpinBox" name="spinBox_user_id">
-          <property name="toolTip"><string>Local user ID exposed to games</string></property>
+          <property name="toolTip"><string>ID of the signed-in user. Trophies and some saves are stored per ID, so changing it hides earlier ones. Leave at 1000.</string></property>
           <property name="maximum"><number>2147483647</number></property>
          </widget>
         </item>
@@ -69,7 +69,7 @@
         </item>
         <item row="2" column="1">
          <widget class="QComboBox" name="comboBox_console_language">
-          <property name="toolTip"><string>Language</string></property>
+          <property name="toolTip"><string>System language reported to games and used for trophy text. A game only switches if it includes that language.</string></property>
          </widget>
         </item>
        </layout>
@@ -109,7 +109,7 @@
         </item>
         <item row="0" column="1">
          <widget class="QComboBox" name="comboBox_screen_resolution">
-          <property name="toolTip"><string>Window resolution</string></property>
+          <property name="toolTip"><string>Size of the game window. It does not change the resolution the game renders at; 3840x2160 also tells games that 4K output is available.</string></property>
          </widget>
         </item>
         <item row="1" column="0">
@@ -119,7 +119,7 @@
         </item>
         <item row="1" column="1">
          <widget class="QComboBox" name="comboBox_present_mode">
-          <property name="toolTip"><string>Vulkan swapchain presentation mode</string></property>
+          <property name="toolTip"><string>How frames reach the screen. Mailbox: no tearing, low latency (recommended). Fifo: classic V-Sync. Immediate: lowest latency but may tear.</string></property>
          </widget>
         </item>
         <item row="2" column="0">
@@ -129,7 +129,7 @@
         </item>
         <item row="2" column="1">
          <widget class="QSpinBox" name="spinBox_vblank_frequency">
-          <property name="toolTip"><string>Virtual display refresh rate used for frame pacing</string></property>
+          <property name="toolTip"><string>Refresh rate of the emulated display. Keep 60. 120 or more also unlocks 120 Hz modes in games that have them.</string></property>
           <property name="minimum"><number>30</number></property>
           <property name="maximum"><number>360</number></property>
           <property name="value"><number>60</number></property>
@@ -142,7 +142,7 @@
         </item>
         <item row="3" column="1">
          <widget class="QComboBox" name="comboBox_shader_optimization_type">
-          <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
+          <property name="toolTip"><string>Currently not used by the emulator.</string></property>
          </widget>
         </item>
         <item row="4" column="0">
@@ -152,42 +152,42 @@
         </item>
         <item row="4" column="1">
          <widget class="QComboBox" name="comboBox_gpu">
-          <property name="toolTip"><string>Graphics device used by the emulator</string></property>
+          <property name="toolTip"><string>Graphics card used by the emulator. Auto prefers a dedicated GPU.</string></property>
          </widget>
         </item>
         <item row="5" column="1">
          <widget class="QCheckBox" name="checkBox_fullscreen">
-          <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
+          <property name="toolTip"><string>Start in borderless fullscreen. F11 or Alt+Enter toggles it in game.</string></property>
           <property name="text"><string>Fullscreen</string></property>
          </widget>
         </item>
         <item row="6" column="1">
          <widget class="QCheckBox" name="checkBox_readback">
-          <property name="toolTip"><string>Read back writable linear images</string></property>
+          <property name="toolTip"><string>Copy images rendered by the GPU back to game memory. Can fix missing or wrong content in some games; costs performance.</string></property>
           <property name="text"><string>Enable readback</string></property>
          </widget>
         </item>
         <item row="7" column="1">
          <widget class="QCheckBox" name="checkBox_tessellation">
-          <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
+          <property name="toolTip"><string>Draw tessellated geometry (terrain, detailed models). When off, such draws are skipped. Experimental: may crash.</string></property>
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
         <item row="8" column="1">
          <widget class="QCheckBox" name="checkBox_hide_cursor">
-          <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
+          <property name="toolTip"><string>Hide the mouse cursor after 2 seconds without movement.</string></property>
           <property name="text"><string>Auto-hide cursor</string></property>
          </widget>
         </item>
         <item row="9" column="1">
          <widget class="QCheckBox" name="checkBox_skip_notice_screen">
-          <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
+          <property name="toolTip"><string>Ask games to skip startup logos and notices. Only some games honor it.</string></property>
           <property name="text"><string>Skip boot logos</string></property>
          </widget>
         </item>
         <item row="10" column="1">
          <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
-          <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
+          <property name="toolTip"><string>Synchronize textures that are also read as raw memory. Can fix missing textures or wrong transparency; may reduce performance.</string></property>
           <property name="text"><string>Accurate texture synchronization</string></property>
          </widget>
         </item>
@@ -200,8 +200,7 @@
        <layout class="QVBoxLayout" name="notificationsLayout">
         <item>
          <widget class="QCheckBox" name="checkBox_trophy_notifications">
-          <property name="toolTip"><string>Show trophy unlock notifications and play their sound.
-To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav with a WAV file and restart the game.</string></property>
+          <property name="toolTip"><string>Show a popup and play a sound when a trophy unlocks. Trophies are recorded either way.</string></property>
           <property name="text"><string>Enable trophy notifications</string></property>
           <property name="checked"><bool>true</bool></property>
          </widget>
@@ -219,27 +218,27 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         <property name="verticalSpacing"><number>6</number></property>
         <item row="0" column="0" colspan="2">
          <widget class="QCheckBox" name="checkBox_vulkan_validation">
-          <property name="toolTip"><string>Enable Vulkan validation layers</string></property>
+          <property name="toolTip"><string>Developers: check every Vulkan call (needs the Vulkan SDK). Very slow.</string></property>
           <property name="text"><string>Vulkan validation</string></property>
           <property name="checked"><bool>true</bool></property>
          </widget>
         </item>
         <item row="0" column="2" colspan="2">
          <widget class="QCheckBox" name="checkBox_shader_validation">
-          <property name="toolTip"><string>Validate SPIR-V binary</string></property>
+          <property name="toolTip"><string>Developers: validate every recompiled shader. The emulator stops if one fails, so leave it off to play.</string></property>
           <property name="text"><string>Shader validation</string></property>
           <property name="checked"><bool>true</bool></property>
          </widget>
         </item>
         <item row="1" column="0" colspan="2">
          <widget class="QCheckBox" name="checkBox_renderdoc_capture">
-          <property name="toolTip"><string>Enable RenderDoc capture</string></property>
+          <property name="toolTip"><string>Developers: load RenderDoc (must be installed); press F1 in game to capture a frame.</string></property>
           <property name="text"><string>RenderDoc capture</string></property>
          </widget>
         </item>
         <item row="1" column="2" colspan="2">
          <widget class="QCheckBox" name="checkBox_cmd_dump">
-          <property name="toolTip"><string>Dump command buffers</string></property>
+          <property name="toolTip"><string>Developers: write every GPU command buffer to text files. Slow and fills the disk quickly.</string></property>
           <property name="text"><string>Command buffer dump</string></property>
          </widget>
         </item>
@@ -250,7 +249,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
         <item row="2" column="1">
          <widget class="QComboBox" name="comboBox_shader_log_direction">
-          <property name="toolTip"><string>Dump shaders to file or console window. If enabled may decrease emulator performance</string></property>
+          <property name="toolTip"><string>Developers: log recompiled shaders. Output goes to the Printf log, so Printf output must not be Silent. Slows shader compilation.</string></property>
          </widget>
         </item>
         <item row="2" column="2">
@@ -260,7 +259,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
         <item row="2" column="3">
          <widget class="MandatoryLineEdit" name="lineEdit_shader_log_folder">
-          <property name="toolTip"><string>Specify directory to dump shaders</string></property>
+          <property name="toolTip"><string>Folder for shader binary dumps. Only used with the emulator's --graphics-debug-dump option.</string></property>
           <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
@@ -271,7 +270,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
         <item row="3" column="1">
          <widget class="QComboBox" name="comboBox_printf_direction">
-          <property name="toolTip"><string>Print logs to file or console window. If enabled may decrease emulator performance</string></property>
+          <property name="toolTip"><string>Where the emulator log goes: nowhere (fastest), a console window, or a file. Use File when reporting a bug.</string></property>
          </widget>
         </item>
         <item row="3" column="2">
@@ -281,13 +280,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
         <item row="3" column="3">
          <widget class="MandatoryLineEdit" name="lineEdit_printf_file">
-          <property name="toolTip"><string>Specify file to dump logs</string></property>
+          <property name="toolTip"><string>Log file name, relative to the emulator folder.</string></property>
           <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
         <item row="4" column="0">
          <widget class="QCheckBox" name="checkBox_profiler">
-          <property name="toolTip"><string>Enable the Tracy profiler. Profiling may decrease emulator performance</string></property>
+          <property name="toolTip"><string>Developers: start the Tracy profiler (connect to 127.0.0.1). Slows the emulator.</string></property>
           <property name="text"><string>Tracy profiler</string></property>
          </widget>
         </item>
@@ -298,7 +297,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
         <item row="4" column="3">
          <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
-          <property name="toolTip"><string>Specify directory to dump command buffers</string></property>
+          <property name="toolTip"><string>Folder for command buffer dumps, relative to the emulator folder.</string></property>
           <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
@@ -313,13 +312,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
-          <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
+          <property name="toolTip"><string>Rewrite AMD-only CPU instructions the host processor lacks. Turn on if a game crashes with an illegal instruction, mainly on Intel CPUs.</string></property>
           <property name="text"><string>AMD CPU patch (experimental)</string></property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="checkBox_red_zone_protection">
-          <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
+          <property name="toolTip"><string>Protect stack data that Windows exception handling can overwrite. Turn on only for games that crash randomly on Windows; loads slower.</string></property>
           <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>
          </widget>
         </item>
@@ -342,13 +341,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QHBoxLayout" name="controllerColorLayout">
         <item>
          <widget class="QPushButton" name="button_controller_color">
-          <property name="toolTip"><string>Choose and preview a fixed LED color. Bluetooth DualSense may take several seconds to update.</string></property>
+          <property name="toolTip"><string>Pick a fixed lightbar color. It overrides the color the game sets; Bluetooth controllers can take a few seconds to update.</string></property>
           <property name="text"><string>Custom</string></property>
          </widget>
         </item>
         <item>
          <widget class="QPushButton" name="button_controller_color_reset">
-          <property name="toolTip"><string>Let the game control the lightbar</string></property>
+          <property name="toolTip"><string>Let the game control the lightbar color.</string></property>
           <property name="text"><string>Default</string></property>
          </widget>
         </item>
@@ -363,7 +362,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QHBoxLayout" name="controllerVibrationLayout">
         <item>
          <widget class="QSlider" name="slider_controller_vibration">
-          <property name="toolTip"><string>Scale DualSense vibration over USB and Bluetooth</string></property>
+          <property name="toolTip"><string>Strength of DualSense vibration over USB and Bluetooth. 0% turns it off.</string></property>
           <property name="maximum"><number>100</number></property>
           <property name="value"><number>100</number></property>
           <property name="orientation"><enum>Qt::Horizontal</enum></property>
@@ -386,7 +385,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QHBoxLayout" name="controllerVolumeLayout">
         <item>
          <widget class="QSlider" name="slider_controller_volume">
-          <property name="toolTip"><string>Scale the DualSense speaker over USB and Bluetooth. 50% is the previous default; 100% adds 6 dB of gain.</string></property>
+          <property name="toolTip"><string>DualSense speaker volume. 50% is the normal level; 100% adds about 6 dB.</string></property>
           <property name="maximum"><number>100</number></property>
           <property name="value"><number>50</number></property>
           <property name="orientation"><enum>Qt::Horizontal</enum></property>
@@ -409,7 +408,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
      <widget class="QPushButton" name="clear_button">
        <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
        <property name="text"><string>Reset</string></property>
-       <property name="toolTip"><string>Restore default settings</string></property>
+       <property name="toolTip"><string>Put every setting on this page back to its default. In global settings this also empties the game folder list.</string></property>
       </widget>
      </item>
      <item>

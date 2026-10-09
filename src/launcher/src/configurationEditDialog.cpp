@@ -3,18 +3,22 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
+#include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
@@ -23,24 +27,31 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStackedWidget>
 #include <QStyle>
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
 
+#include <SDL3/SDL.h>
+
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
 #include <QVulkanWindow>
 #endif
 
+#include <algorithm>
+
 #include "ui_configuration_edit_dialog.h"
 
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
-constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
+// Renamed when the dialog moved to sections, so the old single-page size is not restored.
+constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "section_geometry";
 constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 400;
 
 static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
@@ -124,8 +135,12 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
     : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
       m_info(info) {
 	m_ui->setupUi(this);
-	setMinimumWidth(width());
 	InitGameDirectories();
+	InitRemotePlay();
+	BuildSections();
+	// The emulator does not read this setting yet; it is still saved, just not offered.
+	m_ui->label_shader_optimization->setVisible(false);
+	m_ui->comboBox_shader_optimization_type->setVisible(false);
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
 
@@ -175,6 +190,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 }
 
 QByteArray ConfigurationEditDialog::g_last_geometry;
+int        ConfigurationEditDialog::g_last_section = 0;
 
 ConfigurationEditDialog::~ConfigurationEditDialog() {
 	delete m_ui;
@@ -321,7 +337,8 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	group_layout->setSpacing(6);
 
 	m_game_dirs_list = new QListWidget(m_game_dirs_group);
-	m_game_dirs_list->setMinimumHeight(120);
+	m_game_dirs_list->setMinimumHeight(90);
+	m_game_dirs_list->setMaximumHeight(140);
 	m_game_dirs_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
 	group_layout->addWidget(m_game_dirs_list);
 
@@ -356,7 +373,261 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
+void ConfigurationEditDialog::InitRemotePlay() {
+	// Host: this PC runs Sunshine and streams the games in the library.
+	m_remote_host_group = new QGroupBox(tr("Share this PC's games (Sunshine)"), this);
+	auto* host_layout   = new QVBoxLayout(m_remote_host_group);
+	host_layout->setContentsMargins(8, 8, 8, 8);
+	host_layout->setSpacing(8);
+
+	m_share_games = new QCheckBox(tr("Share games with Sunshine"), m_remote_host_group);
+	m_share_games->setToolTip(
+	    tr("Keep a Sunshine apps file with every game in the list up to date, so Moonlight can "
+	       "start them on this PC. It is rewritten after every game scan."));
+	host_layout->addWidget(m_share_games);
+
+	auto* file_layout = new QHBoxLayout;
+	file_layout->setSpacing(8);
+	auto* file_label = new QLabel(tr("Apps file:"), m_remote_host_group);
+	file_layout->addWidget(file_label);
+	auto* apps_file =
+	    new QLineEdit(QDir::toNativeSeparators(RemotePlay::AppsFile()), m_remote_host_group);
+	apps_file->setReadOnly(true);
+	apps_file->setToolTip(tr("The Sunshine apps file the launcher writes. Sunshine reads it when "
+	                         "sunshine.conf contains the setting below."));
+	file_label->setToolTip(apps_file->toolTip());
+	file_layout->addWidget(apps_file, 1);
+	host_layout->addLayout(file_layout);
+
+	auto* host_buttons = new QHBoxLayout;
+	host_buttons->setSpacing(8);
+	auto* sync_button = new QPushButton(tr("Sync now"), m_remote_host_group);
+	sync_button->setToolTip(tr("Write the apps file now with the games currently in the list."));
+	host_buttons->addWidget(sync_button);
+	auto* copy_button = new QPushButton(tr("Copy Sunshine setting"), m_remote_host_group);
+	copy_button->setToolTip(tr("Copy the line for sunshine.conf to the clipboard:\n%1")
+	                            .arg(RemotePlay::SunshineSetting()));
+	host_buttons->addWidget(copy_button);
+	host_buttons->addStretch(1);
+	host_layout->addLayout(host_buttons);
+
+	m_sync_status = new QLabel(m_remote_host_group);
+	m_sync_status->setObjectName(QStringLiteral("remote_play_status"));
+	m_sync_status->setWordWrap(true);
+	m_sync_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	m_sync_status->setVisible(false);
+	host_layout->addWidget(m_sync_status);
+
+#if defined(_WIN32)
+	const auto sunshine_conf = QStringLiteral("C:\\Program Files\\Sunshine\\config\\sunshine.conf");
+#else
+	const auto sunshine_conf = QStringLiteral("~/.config/sunshine/sunshine.conf");
+#endif
+	auto* host_help = new QLabel(
+	    tr("1. Install Sunshine on this PC.\n"
+	       "2. Click Copy Sunshine setting and add the line to sunshine.conf (%1).\n"
+	       "3. Restart Sunshine. Restart it again if new games do not show up in Moonlight.\n"
+	       "To play over the internet, install Tailscale on this PC and on the device you play "
+	       "on.")
+	        .arg(sunshine_conf),
+	    m_remote_host_group);
+	host_help->setObjectName(QStringLiteral("remote_play_help"));
+	host_help->setWordWrap(true);
+	host_help->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	host_layout->addWidget(host_help);
+
+	connect(sync_button, &QPushButton::clicked, this, [this]() {
+		SetRemotePlayStatus(tr("Writing the apps file..."));
+		emit SyncRemotePlay();
+	});
+	connect(copy_button, &QPushButton::clicked, this, [this]() {
+		QGuiApplication::clipboard()->setText(RemotePlay::SunshineSetting());
+		SetRemotePlayStatus(tr("Copied \"%1\". Add it to sunshine.conf and restart Sunshine.")
+		                        .arg(RemotePlay::SunshineSetting()));
+	});
+
+	// Client: this device plays the games of a PC running Sunshine.
+	m_remote_client_group = new QGroupBox(tr("Play on your home PC (Moonlight)"), this);
+	auto* client_layout   = new QVBoxLayout(m_remote_client_group);
+	client_layout->setContentsMargins(8, 8, 8, 8);
+	client_layout->setSpacing(8);
+
+	auto* form = new QFormLayout;
+	form->setSpacing(8);
+	m_remote_host = new QLineEdit(m_remote_client_group);
+	m_remote_host->setPlaceholderText(tr("For example my-pc or 192.168.1.20"));
+	m_remote_host->setToolTip(tr("Hostname or IP address of the PC that runs Sunshine. Over the "
+	                             "internet, use its Tailscale name."));
+	form->addRow(tr("Home PC address:"), m_remote_host);
+	form->labelForField(m_remote_host)->setToolTip(m_remote_host->toolTip());
+
+	auto* moonlight_layout = new QHBoxLayout;
+	moonlight_layout->setSpacing(8);
+	m_moonlight_path = new QLineEdit(m_remote_client_group);
+	m_moonlight_path->setToolTip(tr("The Moonlight program on this device."));
+	moonlight_layout->addWidget(m_moonlight_path, 1);
+	auto* browse_button = new QPushButton(tr("Browse..."), m_remote_client_group);
+	browse_button->setToolTip(tr("Choose the Moonlight program."));
+	moonlight_layout->addWidget(browse_button);
+	form->addRow(tr("Moonlight app:"), moonlight_layout);
+	form->labelForField(moonlight_layout)->setToolTip(m_moonlight_path->toolTip());
+	client_layout->addLayout(form);
+
+	auto* client_buttons = new QHBoxLayout;
+	auto* pair_button    = new QPushButton(tr("Pair..."), m_remote_client_group);
+	pair_button->setToolTip(
+	    tr("Pair this device with your home PC. This is needed once, before the first game."));
+	client_buttons->addWidget(pair_button);
+	client_buttons->addStretch(1);
+	client_layout->addLayout(client_buttons);
+
+	auto* client_help = new QLabel(tr("Install Moonlight on this device and pair it once. Then "
+	                                  "click Home PC in the toolbar to see and play your PC's "
+	                                  "games."),
+	                               m_remote_client_group);
+	client_help->setObjectName(QStringLiteral("remote_play_help"));
+	client_help->setWordWrap(true);
+	client_layout->addWidget(client_help);
+
+	connect(browse_button, &QPushButton::clicked, this, [this]() {
+		const auto current = RemotePlay::MoonlightProgram(m_moonlight_path->text());
+#if defined(_WIN32)
+		const auto filter = tr("Programs (*.exe)");
+#else
+		const QString filter;
+#endif
+		const auto path = QFileDialog::getOpenFileName(this, tr("Select Moonlight"),
+		                                               QFileInfo(current).absolutePath(), filter);
+		if (!path.isEmpty()) {
+			m_moonlight_path->setText(QDir::toNativeSeparators(path));
+		}
+	});
+	connect(pair_button, &QPushButton::clicked, this, [this]() {
+		RemotePlay::Pair(this, m_moonlight_path->text(), m_remote_host->text().trimmed());
+	});
+
+	SetRemotePlayFields({});
+}
+
+void ConfigurationEditDialog::SetRemotePlayFields(const RemotePlay::Settings& settings) {
+	m_share_games->setChecked(settings.share_games);
+	m_remote_host->setText(settings.host);
+	m_moonlight_path->setText(QDir::toNativeSeparators(
+	    settings.moonlight.isEmpty() ? RemotePlay::DefaultMoonlight() : settings.moonlight));
+}
+
+void ConfigurationEditDialog::BuildSections() {
+	struct Section {
+		QString           title;
+		QString           hint;
+		QList<QGroupBox*> groups;
+	};
+	const QList<Section> sections = {
+	    {tr("General"),
+	     tr("The folders scanned for games, your console profile and notifications."),
+	     {m_game_dirs_group, m_ui->user_profile_group, m_ui->notifications_group}},
+	    {tr("Graphics"),
+	     tr("Window size, frame pacing and rendering accuracy."),
+	     {m_ui->graphics_group}},
+	    {tr("Audio & controller"),
+	     tr("Microphone, and the DualSense lightbar, vibration and speaker."),
+	     {m_ui->audio_group, m_ui->controller_group}},
+	    {tr("Compatibility"),
+	     tr("Workarounds for crashes on some host CPUs and on Windows."),
+	     {m_ui->compatibility_group}},
+	    {tr("Remote play"),
+	     tr("Stream the games on this PC with Sunshine, or play the games on your home PC with "
+	        "Moonlight."),
+	     {m_remote_host_group, m_remote_client_group}},
+	    {tr("Debugging"),
+	     tr("Tools for emulator developers. Most of them slow games down; leave them off to play."),
+	     {m_ui->debug_group}},
+	};
+
+	m_section_list = new QListWidget(this);
+	m_section_list->setObjectName(QStringLiteral("section_list"));
+	m_section_list->setFixedWidth(200);
+	m_section_list->setFrameShape(QFrame::NoFrame);
+	m_section_list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+	m_section_stack = new QStackedWidget(this);
+
+	for (const auto& section: sections) {
+		auto* page        = new QWidget;
+		auto* page_layout = new QVBoxLayout(page);
+		page_layout->setContentsMargins(4, 0, 12, 0);
+		page_layout->setSpacing(10);
+
+		auto* title = new QLabel(section.title, page);
+		title->setObjectName(QStringLiteral("section_title"));
+		page_layout->addWidget(title);
+
+		auto* hint = new QLabel(section.hint, page);
+		hint->setObjectName(QStringLiteral("section_hint"));
+		hint->setWordWrap(true);
+		page_layout->addWidget(hint);
+
+		for (auto* group: section.groups) {
+			// The .ui lays the groups out on one page; move them onto this section instead.
+			m_ui->sectionsLayout->removeWidget(group);
+			m_ui->gridLayout->removeWidget(group);
+			page_layout->addWidget(group);
+		}
+		page_layout->addStretch(1);
+
+		auto* scroll = new QScrollArea(m_section_stack);
+		scroll->setWidgetResizable(true);
+		scroll->setFrameShape(QFrame::NoFrame);
+		scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+		scroll->setWidget(page);
+		m_section_stack->addWidget(scroll);
+		m_section_list->addItem(section.title);
+		if (section.groups.contains(m_remote_host_group)) {
+			m_remote_play_section = m_section_list->count() - 1;
+		}
+	}
+	// Remote play settings are global; SetGlobalSettings() shows the section.
+	m_section_list->item(m_remote_play_section)->setHidden(true);
+
+	m_ui->gridLayout->removeItem(m_ui->sectionsLayout);
+	delete m_ui->sectionsLayout;
+	m_ui->sectionsLayout = nullptr;
+
+	auto* content = new QHBoxLayout;
+	content->setSpacing(16);
+	content->addWidget(m_section_list);
+	content->addWidget(m_section_stack, 1);
+	m_ui->gridLayout->addLayout(content, 0, 0, 1, 2);
+	m_ui->gridLayout->setRowStretch(0, 1);
+	m_ui->gridLayout->setContentsMargins(16, 16, 16, 12);
+	m_ui->gridLayout->setVerticalSpacing(14);
+	m_ui->buttonLayout->setSpacing(10);
+
+	connect(m_section_list, &QListWidget::currentRowChanged, this, [this](int row) {
+		m_section_stack->setCurrentIndex(row);
+		g_last_section = row;
+	});
+	const int last_section = std::clamp(g_last_section, 0, m_section_list->count() - 1);
+	m_section_list->setCurrentRow(m_section_list->item(last_section)->isHidden() ? 0
+	                                                                             : last_section);
+	// Remember a hidden section, so global settings open on it again.
+	g_last_section = last_section;
+
+	setMinimumSize(760, 520);
+	resize(900, 640);
+}
+
+void ConfigurationEditDialog::ShowSectionOf(const QWidget* widget) {
+	for (int index = 0; index < m_section_stack->count(); index++) {
+		if (m_section_stack->widget(index)->isAncestorOf(widget)) {
+			m_section_list->setCurrentRow(index);
+			return;
+		}
+	}
+}
+
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList&          dirs,
+                                                const RemotePlay::Settings& remote_play) {
 	m_global_settings = true;
 	auto* menu        = new QMenu(m_ui->settings_button);
 	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
@@ -372,6 +643,11 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
+	SetRemotePlayFields(remote_play);
+	m_section_list->item(m_remote_play_section)->setHidden(false);
+	if (g_last_section == m_remote_play_section) {
+		m_section_list->setCurrentRow(m_remote_play_section);
+	}
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
@@ -389,6 +665,29 @@ QStringList ConfigurationEditDialog::GetGameDirectories() const {
 	}
 
 	return dirs;
+}
+
+RemotePlay::Settings ConfigurationEditDialog::GetRemotePlaySettings() const {
+	RemotePlay::Settings settings;
+	settings.share_games = m_share_games->isChecked();
+	settings.host        = m_remote_host->text().trimmed();
+	settings.moonlight   = QDir::fromNativeSeparators(m_moonlight_path->text().trimmed());
+	// Keep following the default location unless the user chose another one.
+	if (settings.moonlight == RemotePlay::DefaultMoonlight()) {
+		settings.moonlight.clear();
+	}
+	return settings;
+}
+
+void ConfigurationEditDialog::SetRemotePlayStatus(const QString& text) {
+	m_sync_status->setText(text);
+	m_sync_status->setVisible(!text.isEmpty());
+}
+
+void ConfigurationEditDialog::ShowRemotePlay() {
+	if (!m_section_list->item(m_remote_play_section)->isHidden()) {
+		m_section_list->setCurrentRow(m_remote_play_section);
+	}
 }
 
 void ConfigurationEditDialog::AddGameDirectoryItem(const QString& dir) {
@@ -463,7 +762,9 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
-	if (MandatoryLineEdit::FindEmpty(this)) {
+	if (auto* empty = MandatoryLineEdit::FirstEmpty(this); empty != nullptr) {
+		ShowSectionOf(empty);
+		empty->setFocus();
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;
 	}
@@ -494,6 +795,7 @@ void ConfigurationEditDialog::clear() {
 		emit PreviewControllerColor({});
 		m_game_dirs_list->clear();
 		update_game_directory_buttons();
+		SetRemotePlayFields({});
 	}
 }
 

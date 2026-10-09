@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QStandardPaths>
 
 namespace Cheats {
 
@@ -44,12 +45,56 @@ bool IsSupportedTitleId(const QString& title_id) {
 	return pattern.match(title_id.trimmed().toUpper()).hasMatch();
 }
 
-QString PlanPath(const QString& title_id) {
+namespace {
+
+QString PlanFileName(const QString& title_id) {
+	return QStringLiteral("_Patches/%1.json").arg(title_id.trimmed().toUpper());
+}
+
+// Cheats used to live next to the launcher, which is read-only for system installs and part of
+// the signed bundle on macOS. Only read that location for files saved by older versions.
+QString LegacyPlanPath(const QString& title_id) {
+	return QDir(QCoreApplication::applicationDirPath()).filePath(PlanFileName(title_id));
+}
+
+} // namespace
+
+QString WritablePlanPath(const QString& title_id) {
 	if (!IsSupportedTitleId(title_id)) {
 		return {};
 	}
-	return QDir(QCoreApplication::applicationDirPath())
-	    .filePath(QStringLiteral("_Patches/%1.json").arg(title_id.trimmed().toUpper()));
+	const auto data_dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+	return data_dir.isEmpty() ? LegacyPlanPath(title_id)
+	                          : QDir(data_dir).filePath(PlanFileName(title_id));
+}
+
+QString PlanPath(const QString& title_id) {
+	const auto path = WritablePlanPath(title_id);
+	if (path.isEmpty() || QFileInfo::exists(path)) {
+		return path;
+	}
+	const auto legacy = LegacyPlanPath(title_id);
+	return QFileInfo::exists(legacy) ? legacy : path;
+}
+
+QString SavePlan(const QString& title_id, const QJsonDocument& document,
+                 const QByteArray& expected_data) {
+	const auto path   = WritablePlanPath(title_id);
+	const auto source = PlanPath(title_id);
+	if (path.isEmpty() || source == path) {
+		return SaveDocument(path, document, expected_data);
+	}
+	// Moving a legacy file: check it still holds what the dialog loaded, then write the new
+	// location, which does not exist yet. The legacy file is left alone; the new one wins.
+	QFile legacy(source);
+	if (!legacy.open(QIODevice::ReadOnly)) {
+		return Tr("Could not read cheat file: %1").arg(legacy.errorString());
+	}
+	if (legacy.readAll() != expected_data) {
+		return Tr("Cheat file changed; reload the dialog.");
+	}
+	legacy.close();
+	return SaveDocument(path, document, {});
 }
 
 QString ParseDocument(const QByteArray& data, QJsonDocument* document) {

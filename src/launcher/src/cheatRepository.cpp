@@ -5,6 +5,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QTimer>
+#include <QVersionNumber>
 
 #include <algorithm>
 #include <utility>
@@ -158,6 +159,13 @@ void CheatRepository::Load(const QString& title_id) {
 			            if (--m_pending == 0) {
 				            std::sort(m_files.begin(), m_files.end(),
 				                      [](const RemoteFile& left, const RemoteFile& right) {
+					                      // Compare numerically so 1.10 sorts above 1.9.
+					                      const int version_order = QVersionNumber::compare(
+					                          QVersionNumber::fromString(left.version),
+					                          QVersionNumber::fromString(right.version));
+					                      if (version_order != 0) {
+						                      return version_order > 0;
+					                      }
 					                      if (left.version != right.version) {
 						                      return left.version > right.version;
 					                      }

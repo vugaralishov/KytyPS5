@@ -7,6 +7,9 @@
 #include <QObject>
 #include <QString>
 
+class QNetworkAccessManager;
+class QNetworkReply;
+
 struct CompatibilityEntry {
 	Configuration::GameStatus status = Configuration::GameStatus::Unknown;
 	QString                   comment;
@@ -30,9 +33,13 @@ signals:
 
 private:
 	void Save() const;
+	void StartDownload();
+	void DownloadFinished(QNetworkReply* reply);
 
 	QMap<QString, CompatibilityEntry> m_entries;
-	bool                              m_local = false;
+	QNetworkAccessManager*            m_network = nullptr;
+	int                               m_attempt = 0;
+	bool                              m_local   = false;
 };
 
 #endif // COMPATIBILITY_DATABASE_H

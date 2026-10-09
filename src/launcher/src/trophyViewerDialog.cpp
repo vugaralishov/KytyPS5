@@ -355,6 +355,8 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 		row->addWidget(art);
 		const auto name = !game->name.isEmpty() ? game->name : game->title_id;
 		auto* text = new QLabel(QStringLiteral("%1\n%2").arg(name, game->title_id), row_widget);
+		// The game name comes from the game's param.json.
+		text->setTextFormat(Qt::PlainText);
 		text->setStyleSheet(QStringLiteral("font-size: 18px;"));
 		row->addWidget(text, 1);
 
@@ -457,6 +459,8 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			header->addWidget(art);
 		}
 		auto* title = new QLabel(QString::fromStdString(package.title), page);
+		// The title comes from the game's trophy package.
+		title->setTextFormat(Qt::PlainText);
 		title->setStyleSheet(QStringLiteral("font-size: 28px;"));
 		header->addWidget(title, 1);
 		const auto make_stat = [page](const QString& label, const QString& value) {
